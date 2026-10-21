@@ -1,0 +1,11 @@
+[package]
+name = "corecheck"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rubato = "=5.0.1"
+
+# Standalone research sketch: keep it out of any parent Cargo workspace.
+[workspace]

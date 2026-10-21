@@ -1,0 +1,21 @@
+#![allow(dead_code, clippy::missing_safety_doc)]
+pub mod gpu_lock;
+pub mod device;
+pub mod wgc_rate;
+pub mod power;
+pub mod qpc;
+pub mod vp_fallback;
+pub mod pipe;
+pub mod hotkey;
+pub mod gpu_timer;
+pub mod job;
+pub mod single_instance;
+pub mod audio;
+pub mod pdh;
+pub mod drag;
+pub mod misc;
+pub mod wgc;
+pub mod crash;
+pub mod shaders;
+pub mod logging;
+pub mod input;

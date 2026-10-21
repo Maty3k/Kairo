@@ -1,0 +1,12 @@
+[package]
+name = "kwcapcheck"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+windows-capture = "=2.0.1"
+windows = { version = "=0.62.2", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Foundation"] }
+
+# Standalone research sketch: keep it out of any parent Cargo workspace.
+[workspace]

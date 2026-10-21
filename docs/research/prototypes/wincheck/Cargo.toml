@@ -1,0 +1,45 @@
+[package]
+name = "wincheck"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+crossbeam-channel = "0.5.17"
+rtrb = "0.3.5"
+bytemuck = "1.25.2"
+windows-future = "=0.3.2"
+wasapi = "=0.26.0"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7.20", features = ["codec"] }
+crash-handler = "0.8.1"
+minidumper = "0.11.0"
+sentry = { version = "0.49.3", default-features = false, features = ["backtrace", "contexts", "panic", "debug-images", "reqwest", "native-tls"] }
+ulid = "3.0.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json", "registry"] }
+tracing-appender = "0.2.5"
+file-rotate = "0.8.0"
+
+[dependencies.windows]
+version = "=0.62.2"
+features = [
+  "Foundation", "Foundation_Metadata",
+  "Graphics", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11",
+  "Security_Authorization_AppCapabilityAccess",
+  "Wdk_Graphics_Direct3D",
+  "Win32_Foundation", "Win32_Devices_Display",
+  "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Security", "Win32_Security_Authorization",
+  "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Kernel",
+  "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Performance", "Win32_System_Registry",
+  "Win32_System_Threading", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
+  "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+]
+
+# Standalone research sketch: keep it out of any parent Cargo workspace.
+[workspace]
