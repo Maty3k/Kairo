@@ -1,0 +1,6 @@
+# The pinned toolchain (docs/PLAN.md §2.11). rustup installs it on first use; CI runs
+# `rustup toolchain install`, which reads this file. Rust 1.99.1 was released on 2026-10-15.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

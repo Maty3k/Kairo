@@ -6,3 +6,8 @@
 
 # Private notes that must never reach the public repo (e.g. trademark research)
 .private/
+
+# Rust build output (cargo, cargo-xwin), here and in docs/research/prototypes/*. Its dep-info and
+# fingerprint files hold absolute paths with the Mac's account name, and "pc sync" must neither ship
+# it nor make "git clean" on the PC delete the PC's build cache. Cargo.lock stays tracked.
+target/

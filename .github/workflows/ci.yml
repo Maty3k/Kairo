@@ -1,0 +1,224 @@
+# Kairo CI (docs/PLAN.md §3.3). GitHub-hosted runners only: never a self-hosted runner, because
+# fork pull requests could then run code on the owner's PC. No secrets are used in any job.
+# Third-party actions are pinned to full commit SHAs (looked up with the GitHub API on
+# 2026-10-21); the tag each SHA was cut from is noted beside it. Every cargo command that resolves
+# dependencies passes --locked: the committed Cargo.lock is the only source of versions
+# (docs/PLAN.md §2.11).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+
+jobs:
+  linux:
+    name: Linux (fmt, clippy, kairo-core tests, house rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # kairo-core plus the binaries' non-Windows stubs.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test kairo-core
+        run: cargo test -p kairo-core --locked
+
+      - name: House rules (forbidden APIs, sockets outside kairo-net)
+        run: |
+          set -euo pipefail
+          # docs/PLAN.md §2.10 and Appendix A: nothing inside other processes, no synthetic
+          # input, no hooks, no game handles beyond PROCESS_QUERY_LIMITED_INFORMATION, no module
+          # lists, no debugging other processes, no background raw input. Still allowed:
+          # GetAsyncKeyState, Toolhelp process and thread snapshots, MiniDumpWriteDump of a child.
+          forbidden='CreateRemoteThread|WriteProcessMemory|ReadProcessMemory|VirtualAllocEx|NtWriteVirtualMemory|NtReadVirtualMemory|PROCESS_VM_(OPERATION|READ|WRITE)|SendInput|keybd_event|mouse_event|SetWindowsHookEx|WINEVENT_INCONTEXT|PROCESS_ALL_ACCESS|PROCESS_CREATE_THREAD|PROCESS_DUP_HANDLE|TH32CS_SNAPMODULE|Module32(First|Next)|EnumProcessModules|SetThreadContext|NtQueueApcThread|DebugActiveProcess|DEBUG_PROCESS|RIDEV_INPUTSINK'
+          if grep -rnE --include='*.rs' "$forbidden" crates; then
+            echo "::error::Forbidden API (house rules, docs/PLAN.md Appendix A)"
+            exit 1
+          fi
+          # docs/PLAN.md §2.10: only crates/kairo-net opens sockets.
+          sockets='std::net|TcpStream|TcpListener|UdpSocket|WSAStartup|Networking_WinSock|\b(reqwest|hyper|ureq)(::|[[:space:]]*=)'
+          if grep -rnE --include='*.rs' --include='Cargo.toml' --exclude-dir=kairo-net "$sockets" crates; then
+            echo "::error::Network code outside crates/kairo-net (docs/PLAN.md §2.10)"
+            exit 1
+          fi
+          echo "House rules: ok"
+
+      # Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI code page.
+      - name: PowerShell scripts are ASCII
+        run: |
+          set -euo pipefail
+          if LC_ALL=C grep -rnP --include='*.ps1' '[^\x00-\x7F]' tools; then
+            echo "::error::Non-ASCII characters in a .ps1 file (see .editorconfig)"
+            exit 1
+          fi
+
+      - name: shellcheck (tools/mac)
+        run: shellcheck tools/mac/pc tools/mac/keychain-askpass tools/mac/*.sh
+
+  windows:
+    name: Windows (build, clippy, tests)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # New advisories appear without any change here: report them, but do not block merges.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    env:
+      CARGO_DENY_VERSION: 0.20.2
+      # cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz: the release's .sha256 file and GitHub's
+      # asset digest agree on this SHA-256. (cargo-deny-action downloads it without any check.)
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Install cargo-deny (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/$name.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/$name.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" --strip-components=1 "$name/cargo-deny"
+
+      # The same arguments cargo-deny-action passes by default, with deny.toml.
+      - name: cargo-deny
+        run: '"$RUNNER_TEMP/cargo-deny" --log-level warn --manifest-path ./Cargo.toml --all-features check ${{ matrix.checks }}'
+
+  powershell:
+    name: PowerShell scripts (parse 5.1 and 7, bootstrap -ReportOnly, doctor)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nothing else checks tools/**/*.ps1 before the owner runs the bootstrap on the PC.
+      - name: Parse tools/**/*.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Path tools -Recurse -Filter *.ps1) {
+            $t = $null; $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e)
+            foreach ($x in $e) { Write-Host "::error file=$($f.FullName),line=$($x.Extent.StartLineNumber)::$($x.Message)"; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+      - name: Parse tools/**/*.ps1 (PowerShell 7)
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Path tools -Recurse -Filter *.ps1) {
+            $t = $null; $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e)
+            foreach ($x in $e) { Write-Host "::error file=$($f.FullName),line=$($x.Extent.StartLineNumber)::$($x.Message)"; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+      # Read-only; this also compiles the bootstrap's Add-Type C# block. Both scripts run from
+      # RUNNER_TEMP: in the checkout, rust-toolchain.toml would make rustup download the toolchain.
+      - name: bootstrap.ps1 -ReportOnly prints valid JSON
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\tools\pc\bootstrap.ps1" -ReportOnly
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $null = ($out -join "`n") | ConvertFrom-Json
+
+      # Read-only (no -TestPresentMon). Exit 0 or 1 is fine on a runner; 2 means the doctor crashed.
+      - name: doctor.ps1 runs and prints valid JSON
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\tools\pc\doctor.ps1" -Compress
+          $code = $LASTEXITCODE
+          $null = ($out -join "`n") | ConvertFrom-Json
+          if ($code -ge 2) { exit 1 }
+          exit 0
+
+  gitleaks:
+    name: gitleaks (secret scan, full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # gitleaks_8.30.1_linux_x64.tar.gz: the release's checksums file and GitHub's asset digest
+      # agree on this SHA-256.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Check out (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan
+        run: '"$RUNNER_TEMP/gitleaks" git --no-banner --redact --verbose --exit-code 1 .'

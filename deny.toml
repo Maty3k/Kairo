@@ -1,0 +1,59 @@
+# cargo-deny 0.20.2 (run by EmbarkStudios/cargo-deny-action v2.1.1 in .github/workflows/ci.yml).
+# Licence policy: docs/PLAN.md §2.11 (decision 32): permissive licences only; GPL, AGPL and
+# non-free code are denied. LGPL is allowed later only for the FFmpeg DLLs, never for crates.
+
+[graph]
+# Kairo ships on Windows; the Mac and Linux run kairo-core, the stubs and the UI mock.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+# This list is the policy, not an inventory: licences nobody uses yet are fine.
+unused-allowed-license = "allow"
+confidence-threshold = 0.93
+exceptions = []
+# Expected later, each by ADR: WTFPL (ffmpeg-next, ffmpeg-sys-next) and MPL-2.0 (option-ext via
+# dirs) as per-crate exceptions; the FFmpeg DLLs are LGPL-3.0 and are not crates.
+
+[licenses.private]
+# Kairo's own crates are GPL-3.0-or-later and unpublished (publish = false).
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Rejected in docs/PLAN.md §2.11 and the cookbook §1 ("Not used").
+deny = [
+    { crate = "windows-capture", reason = "Kairo has its own WGC module (docs/PLAN.md §2.2)" },
+    { crate = "global-hotkey", reason = "hotkeys use RegisterHotKey directly (docs/PLAN.md §2.5)" },
+    { crate = "auto-launch", reason = "rejected; autostart is a quoted HKCU Run value (docs/PLAN.md §2.1)" },
+    { crate = "sentry-rust-minidump", reason = "deprecated; use crash-handler + minidumper (docs/PLAN.md §2.9)" },
+    { crate = "tauri-plugin-updater", reason = "updates live in the engine's control process (docs/PLAN.md §2.1)" },
+    { crate = "ez-ffmpeg", reason = "pulls a second FFmpeg sys crate (cookbook §1)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

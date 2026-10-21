@@ -1,0 +1,4 @@
+# Clippy 0.1.99 (Rust 1.99.1). The workspace denies unwrap_used and expect_used (Cargo.toml);
+# tests may still use them. CI runs clippy with -D warnings.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

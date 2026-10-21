@@ -1,0 +1,931 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# tools/pc/doctor.ps1 - health check of the Kairo dev PC (milestone M0). Prints ONE JSON object on stdout.
+# Project: https://github.com/Maty3k/Kairo
+#
+# Run it over SSH with "tools/mac/pc doctor" (PowerShell 7; Windows PowerShell 5.1 works too), after the first sync:
+#   & C:\kairo\src\tools\pc\doctor.ps1                   # read-only checks
+#   & C:\kairo\src\tools\pc\doctor.ps1 -TestPresentMon   # also proves PresentMon starts with your limited token
+#   & C:\kairo\src\tools\pc\doctor.ps1 -Compress         # the same JSON on one line
+# With Windows PowerShell 5.1 add -ExecutionPolicy Bypass: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...
+#
+# Exit code (when run as a file): 0 = green, 1 = problems (listed in "problems"), 2 = the doctor itself failed.
+# Everything is read-only except -TestPresentMon: it registers a temporary task \Kairo\DoctorPresentMon (S4U logon,
+# limited token, no window on your desktop), runs PresentMon for 2 seconds, deletes the task and the CSV again, and
+# skips itself while C:\kairo\state\watch.json says you are busy.
+#
+# Names and checks mirror tools/pc/bootstrap.ps1; keep the two in step. Windows PowerShell 5.1 syntax, ASCII only.
+
+[CmdletBinding()]
+param(
+    [switch] $TestPresentMon,
+    [switch] $Compress
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# ---- M0 contract names (docs/milestones/M0.md) ------------------------------------------------------------------
+$DoctorVersion = 'm0-2026-10-21'
+$KairoRoot     = 'C:\kairo'
+$SrcDir        = 'C:\kairo\src'
+$BinDir        = 'C:\kairo\bin'
+$JobsDir       = 'C:\kairo\jobs'
+$LogsDir       = 'C:\kairo\logs'
+$ToolsDir      = 'C:\kairo\tools'
+$StateDir      = 'C:\kairo\state'
+$CurrentBin    = 'C:\kairo\bin\current'
+$DevrunExe     = 'C:\kairo\bin\current\kairo-devrun.exe'
+$JobFile       = 'C:\kairo\jobs\next.json'
+$TaskPath      = '\Kairo\'
+
+# ---- Shared with bootstrap.ps1 and uninstall-dev.ps1 --------------------------------------------------------------
+$KeyTag            = 'kairo-mac'
+$FirewallRuleName  = 'Kairo-SSH-In-TCP'
+$SshdBlockBegin    = '# BEGIN Kairo (tools/pc/bootstrap.ps1)'
+$SidAdministrators = 'S-1-5-32-544'
+$SidSystem         = 'S-1-5-18'
+$SidUsers          = 'S-1-5-32-545'
+$SidOwnerRights    = 'S-1-3-4'
+$SidPerfLogUsers   = 'S-1-5-32-559'
+$GitConfigFile     = 'C:\kairo\tools\gitconfig'
+$CargoGuardDir     = Join-Path $env:SystemDrive '.cargo'
+$RightsFull        = 2032127   # 0x1F01FF
+$RightsModify      = 1245631   # 0x1301BF
+$RightsRead        = 1179817   # 0x1200A9
+$SshDefaultRule    = 'OpenSSH-Server-In-TCP'
+$SshdExe           = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+$SshDir            = Join-Path $env:ProgramData 'ssh'
+$SshdConfigPath    = Join-Path $SshDir 'sshd_config'
+$AdminKeysPath     = Join-Path $SshDir 'administrators_authorized_keys'
+$HostKeyPubPath    = Join-Path $SshDir 'ssh_host_ed25519_key.pub'
+$SshShellExe       = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$SshShellOption    = '/d /c'
+$SshShellArguments = '/d'
+$PwshExe           = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+$WhoamiExe         = Join-Path $env:SystemRoot 'System32\whoami.exe'
+$RustToolchain     = '1.99.1'
+$NodeMajor         = 24
+$VsCompMsvc        = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+$VsCompSdk         = 'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+$SdkVersion        = '10.0.26100.0'
+$FfmpegDir         = 'C:\kairo\tools\ffmpeg'
+$FfmpegSha256      = 'c39750c8dfe849e4389843e5f4af51e8062a6d6a3e8b74c1fd7e469594ef68e2'
+$PresentMonDir     = 'C:\kairo\tools\presentmon'
+$PresentMonFile    = 'PresentMon-2.6.0-x64.exe'
+$PresentMonSha256  = 'b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af'
+$SacPolicyOn       = '0283ac0f-fff1-49ae-ada1-8a933130cad6'   # learn.microsoft.com "Inbox App Control policies"
+$SacPolicyEval     = '1283ac0f-fff1-49ae-ada1-8a933130cad6'
+
+# What PLAN M0 exit 4 asks FFmpeg to list (names as printed by 'ffmpeg -encoders' and 'ffmpeg -filters').
+$WantEncoders = @('h264_amf', 'hevc_amf', 'av1_amf', 'h264_mf', 'aac_mf')
+$WantFilters  = @('gfxcapture', 'ddagrab')
+
+# Task Scheduler result codes that mean "still running" and "has not run yet".
+$TaskRunning  = 267009   # 0x41301 SCHED_S_TASK_RUNNING
+$TaskNeverRan = 267011   # 0x41303 SCHED_S_TASK_HAS_NOT_RUN
+
+$Doc = [ordered]@{
+    schema         = 1
+    doctor_version = $DoctorVersion
+    generated_utc  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    ok             = $false
+    problems       = New-Object System.Collections.ArrayList
+    warnings       = New-Object System.Collections.ArrayList
+}
+
+# =============================================================================================================
+# Helpers
+# =============================================================================================================
+function Add-Problem([string] $Text) { [void] $Doc.problems.Add($Text) }
+function Add-Concern([string] $Text) { [void] $Doc.warnings.Add($Text) }
+
+function Invoke-Native {
+    # Runs a program and returns its exit code and output (stdout and stderr) as text.
+    param([Parameter(Mandatory = $true)] [string] $FilePath, [string[]] $ArgumentList = @())
+    if (-not (Get-Command -Name $FilePath -ErrorAction SilentlyContinue)) { throw ('Program not found: {0}' -f $FilePath) }
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string] $_ })
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    return New-Object psobject -Property @{ ExitCode = $code; Lines = $lines; Text = (($lines -join "`n").Trim()) }
+}
+
+function Get-FirstLine($Result, [string] $Pattern = '.') {
+    foreach ($line in @($Result.Lines)) { if ($line -match $Pattern) { return $line.Trim() } }
+    return $null
+}
+
+function Invoke-Section([string] $SectionName, [scriptblock] $SectionBody) {
+    try {
+        $Doc[$SectionName] = & $SectionBody
+    } catch {
+        $message = $_.Exception.Message
+        $Doc[$SectionName] = [ordered]@{ error = $message }
+        Add-Problem ('{0}: the check itself failed: {1}' -f $SectionName, $message)
+    }
+}
+
+function Test-IsElevated {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function ConvertTo-Sid([string] $Account) {
+    if ($Account -match '^S-1-\d+(-\d+)+$') { return $Account }   # Task Scheduler sometimes stores the SID itself
+    try {
+        return (New-Object System.Security.Principal.NTAccount($Account)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $null
+    }
+}
+
+function Get-KeyFingerprint([string] $Base64) {
+    try {
+        $sha = New-Object System.Security.Cryptography.SHA256Managed
+        return 'SHA256:' + [Convert]::ToBase64String($sha.ComputeHash([Convert]::FromBase64String($Base64))).TrimEnd('=')
+    } catch {
+        return $null
+    }
+}
+
+function Format-Utc($When) {
+    if ($null -eq $When) { return $null }
+    $d = [datetime] $When
+    if ($d.Year -lt 2000) { return $null }   # Task Scheduler reports 1999-11-30 for "never"
+    return $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function Get-GitExe {
+    $machine = Join-Path $env:ProgramFiles 'Git\cmd\git.exe'
+    if (Test-Path -LiteralPath $machine) { return $machine }
+    $cmd = Get-Command -Name 'git.exe' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+function Get-VsInstancePath([string[]] $VswhereArgs, [string] $Property = 'installationPath') {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) { return $null }
+    $r = Invoke-Native -FilePath $vswhere -ArgumentList ($VswhereArgs + @('-latest', '-property', $Property, '-nologo'))
+    if ($r.ExitCode -ne 0) { return $null }
+    foreach ($line in $r.Lines) { if ($line.Trim()) { return $line.Trim() } }
+    return $null
+}
+
+function Test-GroupMemberSam([string] $GroupSid, [string] $MemberSid) {
+    # Membership in the local account database (a fresh SSH logon also shows it in its token, see token_has_group).
+    try {
+        $groupName = (New-Object System.Security.Principal.SecurityIdentifier($GroupSid)).Translate([System.Security.Principal.NTAccount]).Value
+        $groupName = $groupName.Substring($groupName.IndexOf('\') + 1)
+        $group = [ADSI] ('WinNT://./{0},group' -f $groupName)
+        foreach ($m in @($group.psbase.Invoke('Members'))) {
+            $bytes = $m.GetType().InvokeMember('objectSid', 'GetProperty', $null, $m, $null)
+            if ((New-Object System.Security.Principal.SecurityIdentifier($bytes, 0)).Value -eq $MemberSid) { return $true }
+        }
+        return $false
+    } catch {
+        $members = @(Get-LocalGroupMember -SID $GroupSid -ErrorAction Stop)
+        foreach ($m in $members) { if ($m.SID -and $m.SID.Value -eq $MemberSid) { return $true } }
+        return $false
+    }
+}
+
+function Get-FileRights($Rule) {
+    # Same as bootstrap.ps1: the access mask with generic rights mapped to file rights.
+    $m = [int64] ([int] $Rule.FileSystemRights)
+    if ($m -lt 0) { $m += 4294967296 }
+    if (($m -band 268435456) -ne 0) { $m = $m -bor 2032127 }
+    if (($m -band 2147483648) -ne 0) { $m = $m -bor 1179785 }
+    if (($m -band 1073741824) -ne 0) { $m = $m -bor 1179926 }
+    if (($m -band 536870912) -ne 0) { $m = $m -bor 1179808 }
+    return ($m -band 2032127)
+}
+
+function Test-FolderAcl {
+    # Same as bootstrap.ps1: a real folder owned by Administrators whose explicit entries are exactly $Explicit.
+    param([string] $Path, [hashtable] $Explicit, [switch] $Protected)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $SidAdministrators) { return $false }
+    if ([bool] $acl.AreAccessRulesProtected -ne [bool] $Protected) { return $false }
+    $coverage = @{}
+    foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        $sid = $rule.IdentityReference.Value
+        if (-not $Explicit.ContainsKey($sid)) { return $false }
+        if ([string] $rule.AccessControlType -ne 'Allow') { return $false }
+        if ((Get-FileRights $rule) -ne $Explicit[$sid]) { return $false }
+        if (-not $coverage.ContainsKey($sid)) { $coverage[$sid] = @{ Here = $false; Down = $false } }
+        $propagation = [int] $rule.PropagationFlags
+        if (($propagation -band 2) -eq 0) { $coverage[$sid].Here = $true }
+        $inherit = [int] $rule.InheritanceFlags
+        if ((($inherit -band 3) -eq 3) -and (($propagation -band 1) -eq 0)) { $coverage[$sid].Down = $true }
+    }
+    foreach ($sid in @($Explicit.Keys)) {
+        if (-not $coverage.ContainsKey($sid)) { return $false }
+        if (-not ($coverage[$sid].Here -and $coverage[$sid].Down)) { return $false }
+    }
+    return $true
+}
+
+function Test-KairoAcl([string] $OwnerSid) {
+    # Same layout as bootstrap.ps1: C:\kairo protected and owned by Administrators; Administrators and SYSTEM full
+    # control, you and OWNER RIGHTS read and run; logs and state add Modify for you; nothing else anywhere.
+    $root = @{}
+    $root[$SidAdministrators] = $RightsFull
+    $root[$SidSystem] = $RightsFull
+    $root[$OwnerSid] = $RightsRead
+    $root[$SidOwnerRights] = $RightsRead
+    if (-not (Test-FolderAcl -Path $KairoRoot -Explicit $root -Protected)) { return $false }
+    foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
+        if (-not (Test-FolderAcl -Path $d -Explicit @{})) { return $false }
+    }
+    $writable = @{}
+    $writable[$OwnerSid] = $RightsModify
+    foreach ($d in @($LogsDir, $StateDir)) {
+        if (-not (Test-FolderAcl -Path $d -Explicit $writable)) { return $false }
+    }
+    return $true
+}
+
+function Test-AdminOnlyFile([string] $Path) {
+    # True if only Administrators and SYSTEM (and TrustedInstaller) can change the file: no other entry grants a
+    # write right, and a file owned by someone else carries an OWNER RIGHTS entry, so its owner cannot rewrite
+    # its permissions. TODO(verify) on the PC: files the elevated bootstrap created inherit that entry.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $acl = Get-Acl -LiteralPath $Path
+    $admins = @($SidAdministrators, $SidSystem, 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $writeBits = 852310   # write data, append, write EA, delete child, write attributes, DELETE, WRITE_DAC, WRITE_OWNER
+    $hasOwnerRights = $false
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        if ([string] $rule.AccessControlType -ne 'Allow') { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($sid -eq $SidOwnerRights) { $hasOwnerRights = $true }
+        if (($admins -notcontains $sid) -and (((Get-FileRights $rule) -band $writeBits) -ne 0)) { return $false }
+    }
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    return (($admins -contains $owner) -or $hasOwnerRights)
+}
+
+function Test-PrivateIPv4([string] $Address) {
+    # Same as bootstrap.ps1: 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16.
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref] $ip)) { return $false }
+    $b = $ip.GetAddressBytes()
+    if ($b.Length -ne 4) { return $false }
+    return ($b[0] -eq 10) -or (($b[0] -eq 172) -and ($b[1] -ge 16) -and ($b[1] -le 31)) -or (($b[0] -eq 192) -and ($b[1] -eq 168))
+}
+
+function Get-SshInterface {
+    # Same as bootstrap.ps1: physical adapters on a Private network whose IPv4 addresses are all private.
+    $physical = @{}
+    foreach ($a in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue)) { $physical[[int] $a.ifIndex] = $a }
+    $list = New-Object System.Collections.ArrayList
+    foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+        $adapter = $physical[[int] $p.InterfaceIndex]
+        if (-not $adapter) { continue }
+        $ips = @(Get-NetIPAddress -InterfaceIndex $p.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '169.254.*' } | ForEach-Object { [string] $_.IPAddress })
+        $public = @($ips | Where-Object { -not (Test-PrivateIPv4 $_) })
+        $qualifies = ([string] $p.NetworkCategory -eq 'Private') -and ($ips.Count -gt 0) -and ($public.Count -eq 0)
+        [void] $list.Add([ordered]@{ alias = [string] $adapter.Name; category = [string] $p.NetworkCategory; qualifies = $qualifies })
+    }
+    return @($list)
+}
+
+function Get-HostKeyFingerprint {
+    # Same as bootstrap.ps1: what ssh-keygen -lf prints for the PC's ed25519 host key.
+    if (-not (Test-Path -LiteralPath $HostKeyPubPath)) { return $null }
+    try {
+        $parts = @(([string] (Get-Content -LiteralPath $HostKeyPubPath -Raw)).Trim() -split '\s+')
+        if ($parts.Count -lt 2 -or $parts[0] -cne 'ssh-ed25519') { return $null }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        return 'SHA256:' + [Convert]::ToBase64String($sha.ComputeHash([Convert]::FromBase64String($parts[1]))).TrimEnd('=')
+    } catch {
+        return $null
+    }
+}
+
+function Read-WatchState {
+    # C:\kairo\state\watch.json, written every second by the watch agent (M0 contract).
+    $path = Join-Path $StateDir 'watch.json'
+    $res = [ordered]@{ present = $false; fresh = $false; age_s = $null; busy = $null; last_input_ms_ago = $null; foreground_fullscreen = $null }
+    if (-not (Test-Path -LiteralPath $path)) { return $res }
+    $res.present = $true
+    $j = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $ts = $j.ts_utc
+    if ($ts -isnot [datetime]) {
+        # PowerShell 7 turns ISO dates into [datetime] by itself; 5.1 leaves a string.
+        $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+        $ts = [datetime]::Parse([string] $ts, [System.Globalization.CultureInfo]::InvariantCulture, $styles)
+    }
+    $res.age_s = [math]::Round(((Get-Date).ToUniversalTime() - $ts.ToUniversalTime()).TotalSeconds, 1)
+    $res.fresh = ($res.age_s -lt 10)
+    $res.busy = [bool] $j.busy
+    $res.last_input_ms_ago = $j.last_input_ms_ago
+    $res.foreground_fullscreen = $j.foreground_fullscreen
+    return $res
+}
+
+function Get-SmartAppControl {
+    # Read-only; mirrors bootstrap.ps1.
+    $res = [ordered]@{ state = 'unknown'; source = 'none'; citool = $null; registry_value = $null; registry_meaning = $null; defender_value = $null }
+    $citool = Join-Path $env:SystemRoot 'System32\CiTool.exe'
+    if (Test-Path -LiteralPath $citool) {
+        try {
+            $r = Invoke-Native -FilePath $citool -ArgumentList @('-lp', '-json')
+            if ($r.ExitCode -eq 0) {
+                $json = ($r.Lines -join "`n") | ConvertFrom-Json
+                $enforced = @($json.Policies | Where-Object { [string] $_.IsEnforced -eq 'True' } |
+                    ForEach-Object { ([string] $_.PolicyID).Trim('{', '}', ' ').ToLowerInvariant() })
+                if ($enforced -contains $SacPolicyOn) { $res.citool = 'on' }
+                elseif ($enforced -contains $SacPolicyEval) { $res.citool = 'evaluation' }
+                else { $res.citool = 'off' }
+            }
+        } catch {
+            $res.citool = $null
+        }
+    }
+    try {
+        # TODO(verify): meaning of 1 and 2 (sources disagree); compare with the CiTool result on the PC.
+        $v = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name 'VerifiedAndReputablePolicyState' -ErrorAction Stop).VerifiedAndReputablePolicyState
+        $res.registry_value = [int] $v
+        if ([int] $v -eq 0) { $res.registry_meaning = 'off' }
+        elseif ([int] $v -eq 1) { $res.registry_meaning = 'on' }
+        elseif ([int] $v -eq 2) { $res.registry_meaning = 'evaluation' }
+    } catch {
+        $res.registry_value = $null
+    }
+    try {
+        # TODO(verify): undocumented property; read only if present.
+        $mp = Get-MpComputerStatus -ErrorAction Stop
+        if ($mp.PSObject.Properties['SmartAppControlState']) { $res.defender_value = [string] $mp.SmartAppControlState }
+    } catch {
+        $res.defender_value = $null
+    }
+    if ($res.citool) { $res.state = $res.citool; $res.source = 'CiTool policy list' }
+    elseif ($res.registry_meaning) { $res.state = $res.registry_meaning; $res.source = 'registry VerifiedAndReputablePolicyState (mapping unverified)' }
+    return $res
+}
+
+function Test-PresentMonUnelevated {
+    # Proves that PresentMon can start its ETW session with your limited token, as PLAN M0 exit 4 asks. An S4U task
+    # gets a fresh token from the account database (so it already reflects Performance Log Users) and runs without a
+    # window on your desktop. TODO(verify) on the PC: S4U with a Microsoft-account-linked user.
+    $res = [ordered]@{ status = 'not-run'; detail = ''; exit_code = $null; output = $null }
+    if (-not $IsElevated) {
+        $res.status = 'skipped'
+        $res.detail = 'Needs an elevated doctor run (a normal SSH session) to create the temporary test task.'
+        return $res
+    }
+    $exe = Join-Path $PresentMonDir $PresentMonFile
+    if (-not (Test-Path -LiteralPath $exe)) { $res.status = 'skipped'; $res.detail = 'PresentMon is missing.'; return $res }
+    $watch = Read-WatchState
+    if ($watch.fresh -and $watch.busy) { $res.status = 'skipped'; $res.detail = 'watch.json says the owner is busy.'; return $res }
+
+    $name = 'DoctorPresentMon'
+    $csv = Join-Path $LogsDir 'doctor-presentmon.csv'
+    $log = Join-Path $LogsDir 'doctor-presentmon.log'
+    foreach ($f in @($csv, $log)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+    # Paths have no spaces, so cmd.exe needs no quotes here.
+    $cmdArgs = '/d /c {0} --session_name KairoDoctor --stop_existing_session --timed 2 --terminate_after_timed --no_console_stats --output_file {1} > {2} 2>&1' -f $exe, $csv, $log
+    $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $cmdArgs -WorkingDirectory $LogsDir
+    $principal = New-ScheduledTaskPrincipal -UserId $Me.Name -LogonType S4U -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    try {
+        $null = Register-ScheduledTask -TaskPath $TaskPath -TaskName $name -Action $action -Principal $principal -Settings $settings -Description 'Kairo doctor: temporary PresentMon test (deleted right after).' -Force
+        $started = Get-Date
+        Start-ScheduledTask -TaskPath $TaskPath -TaskName $name
+        $deadline = $started.AddSeconds(45)
+        $info = $null
+        do {
+            Start-Sleep -Milliseconds 500
+            $info = Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $name
+            $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $name
+            $ran = ($info.LastRunTime -ge $started.AddSeconds(-2))
+            $finished = $ran -and ([string] $task.State -ne 'Running') -and ($info.LastTaskResult -ne $TaskRunning) -and ($info.LastTaskResult -ne $TaskNeverRan)
+        } while (-not $finished -and (Get-Date) -lt $deadline)
+        $res.exit_code = $info.LastTaskResult
+        $text = ''
+        if (Test-Path -LiteralPath $log) { $text = [string] (Get-Content -LiteralPath $log -Raw) }
+        $res.output = (@($text -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 6) -join ' | '
+        $csvOk = (Test-Path -LiteralPath $csv) -and ((Get-Item -LiteralPath $csv).Length -gt 0)
+        if (-not $finished) {
+            $res.status = 'failed'
+            $res.detail = 'The test task did not finish within 45 seconds.'
+        } elseif ($info.LastTaskResult -eq 0 -and $csvOk) {
+            $res.status = 'passed'
+            $res.detail = 'PresentMon recorded 2 seconds with a limited token.'
+        } elseif ($text -match '(?i)access denied|Performance Log Users') {
+            $res.status = 'failed'
+            $res.detail = 'Access denied: the account is not (yet) in Performance Log Users.'
+        } else {
+            $res.status = 'failed'
+            $res.detail = ('PresentMon exit code {0}.' -f $info.LastTaskResult)
+        }
+    } catch {
+        $res.status = 'error'
+        $res.detail = ('Could not run the test task: {0}' -f $_.Exception.Message)
+    } finally {
+        try { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false -ErrorAction Stop } catch { }
+        # The CSV lists every program that drew frames in those 2 seconds; nothing needs it, so it goes.
+        if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv -Force -ErrorAction SilentlyContinue }
+    }
+    return $res
+}
+
+# =============================================================================================================
+# Checks
+# =============================================================================================================
+$IsElevated = Test-IsElevated
+$Me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$MeSid = $Me.User.Value
+
+function Invoke-Doctor {
+    Invoke-Section 'pc' {
+        $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        if ([string] $ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Add-Problem ('PowerShell runs in {0} mode' -f $ExecutionContext.SessionState.LanguageMode) }
+        if (-not $IsElevated) { Add-Concern 'The doctor is not elevated, so the sshd, key file and Smart App Control checks are partial.' }
+        [ordered]@{
+            name            = $env:COMPUTERNAME
+            user            = $Me.Name
+            user_sid        = $MeSid
+            elevated        = $IsElevated
+            in_ssh          = [bool] ($env:SSH_CONNECTION -or $env:SSH_CLIENT)
+            powershell      = ('{0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
+            language_mode   = [string] $ExecutionContext.SessionState.LanguageMode
+            windows_version = [string] $cv.DisplayVersion
+            windows_build   = ('{0}.{1}' -f $cv.CurrentBuild, $cv.UBR)
+        }
+    }
+
+    Invoke-Section 'toolchain' {
+        $t = [ordered]@{}
+
+        $git = Get-GitExe
+        $t.git = $null
+        if ($git) { $t.git = Get-FirstLine (Invoke-Native -FilePath $git -ArgumentList @('--version')) '^git version' } else { Add-Problem 'Git is missing' }
+
+        $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+        $rustup = Join-Path $cargoBin 'rustup.exe'
+        $t.rustup = $null; $t.rust_active = $null; $t.rustc = $null; $t.cargo = $null
+        if (Test-Path -LiteralPath $rustup) {
+            $t.rustup = Get-FirstLine (Invoke-Native -FilePath $rustup -ArgumentList @('--version')) '^rustup '
+            $t.rust_active = Get-FirstLine (Invoke-Native -FilePath $rustup -ArgumentList @('show', 'active-toolchain'))
+            $t.rustc = Get-FirstLine (Invoke-Native -FilePath (Join-Path $cargoBin 'rustc.exe') -ArgumentList @('--version')) '^rustc '
+            $t.cargo = Get-FirstLine (Invoke-Native -FilePath (Join-Path $cargoBin 'cargo.exe') -ArgumentList @('--version')) '^cargo '
+            if (-not ([string] $t.rustc).StartsWith('rustc ' + $RustToolchain)) { Add-Problem ('rustc is "{0}", expected {1}' -f $t.rustc, $RustToolchain) }
+        } else {
+            Add-Problem 'rustup is missing'
+        }
+
+        $vs = Get-VsInstancePath @('-products', '*', '-requires', $VsCompMsvc, $VsCompSdk)
+        $t.msvc = [ordered]@{ install_path = $vs; installation_version = $null; vc_tools_version = $null; cl_exe = $false }
+        if ($vs) {
+            $t.msvc.installation_version = Get-VsInstancePath @('-products', '*', '-requires', $VsCompMsvc, $VsCompSdk) 'installationVersion'
+            $verFile = Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+            if (Test-Path -LiteralPath $verFile) {
+                $vcVer = ([string] (Get-Content -LiteralPath $verFile -Raw)).Trim()
+                $t.msvc.vc_tools_version = $vcVer
+                $t.msvc.cl_exe = Test-Path -LiteralPath (Join-Path $vs ('VC\Tools\MSVC\{0}\bin\Hostx64\x64\cl.exe' -f $vcVer))
+            }
+            if (-not $t.msvc.cl_exe) { Add-Problem 'cl.exe (MSVC x64) was not found in the Build Tools' }
+        } else {
+            Add-Problem 'Visual Studio Build Tools with the MSVC x64 tools and the Windows 11 SDK are missing'
+        }
+
+        $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+        $sdks = @()
+        if (Test-Path -LiteralPath $kits) { $sdks = @(Get-ChildItem -LiteralPath $kits -Directory | Where-Object { $_.Name -like '10.0.*' } | ForEach-Object { $_.Name }) }
+        $t.windows_sdks = $sdks
+        if ($sdks -notcontains $SdkVersion) { Add-Problem ('Windows SDK {0} is missing' -f $SdkVersion) }
+
+        $llvmBin = Join-Path $env:ProgramFiles 'LLVM\bin'
+        $libclang = Test-Path -LiteralPath (Join-Path $llvmBin 'libclang.dll')
+        $t.llvm = [ordered]@{ libclang = $libclang; clang = $null; libclang_path_env = [Environment]::GetEnvironmentVariable('LIBCLANG_PATH', 'Machine') }
+        if ($libclang) {
+            $t.llvm.clang = Get-FirstLine (Invoke-Native -FilePath (Join-Path $llvmBin 'clang.exe') -ArgumentList @('--version'))
+            if ($t.llvm.libclang_path_env -ne $llvmBin) { Add-Problem ('LIBCLANG_PATH is "{0}", expected {1}' -f $t.llvm.libclang_path_env, $llvmBin) }
+        } else {
+            Add-Problem 'libclang.dll (LLVM) is missing'
+        }
+
+        $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+        $node = Join-Path $nodeDir 'node.exe'
+        $t.node = $null; $t.corepack = $null; $t.pnpm = $null
+        if (Test-Path -LiteralPath $node) {
+            $t.node = Get-FirstLine (Invoke-Native -FilePath $node -ArgumentList @('--version')) '^v\d'
+            if (-not ([string] $t.node).StartsWith(('v{0}.' -f $NodeMajor))) { Add-Problem ('Node.js is {0}, expected {1}.x' -f $t.node, $NodeMajor) }
+            $corepack = Join-Path $nodeDir 'corepack.cmd'
+            if (Test-Path -LiteralPath $corepack) { $t.corepack = Get-FirstLine (Invoke-Native -FilePath $corepack -ArgumentList @('--version')) '\d+\.\d+' }
+            $pnpm = Join-Path $nodeDir 'pnpm.cmd'
+            if (Test-Path -LiteralPath $pnpm) {
+                $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
+                $t.pnpm = Get-FirstLine (Invoke-Native -FilePath $pnpm -ArgumentList @('--version')) '^\d+\.\d+\.\d+'
+            }
+            if (-not $t.pnpm) { Add-Problem 'pnpm (through corepack) does not answer' }
+        } else {
+            Add-Problem ('Node.js {0} is missing' -f $NodeMajor)
+        }
+
+        $t.pwsh = $null
+        if (Test-Path -LiteralPath $PwshExe) { $t.pwsh = (Get-Item -LiteralPath $PwshExe).VersionInfo.ProductVersion } else { Add-Problem 'PowerShell 7 (MSI) is missing' }
+        $t.pwsh_telemetry_optout = [Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')
+        if ($t.pwsh_telemetry_optout -ne '1') { Add-Concern 'POWERSHELL_TELEMETRY_OPTOUT is not 1 machine-wide, so PowerShell 7 sends startup telemetry' }
+
+        $t.ffmpeg_dir_env = [Environment]::GetEnvironmentVariable('FFMPEG_DIR', 'Machine')
+        if ($t.ffmpeg_dir_env -ne $FfmpegDir) { Add-Problem ('FFMPEG_DIR is "{0}", expected {1}' -f $t.ffmpeg_dir_env, $FfmpegDir) }
+        $t
+    }
+
+    Invoke-Section 'ffmpeg' {
+        $exe = Join-Path $FfmpegDir 'bin\ffmpeg.exe'
+        $res = [ordered]@{ path = $exe; present = (Test-Path -LiteralPath $exe); pin_ok = $false; dev_files = $false; version = $null; encoders = [ordered]@{}; filters = [ordered]@{} }
+        $marker = Join-Path $FfmpegDir 'KAIRO-PIN.json'
+        if (Test-Path -LiteralPath $marker) {
+            $pin = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+            $res.pin_ok = ([string] $pin.sha256 -eq $FfmpegSha256)
+        }
+        $res.dev_files = (Test-Path -LiteralPath (Join-Path $FfmpegDir 'include\libavcodec\avcodec.h')) -and (Test-Path -LiteralPath (Join-Path $FfmpegDir 'lib\avcodec.lib'))
+        if (-not $res.present) { Add-Problem ('FFmpeg is missing at {0}' -f $exe); return $res }
+        if (-not $res.pin_ok) { Add-Problem 'FFmpeg is not the pinned build (KAIRO-PIN.json missing or different)' }
+        if (-not $res.dev_files) { Add-Problem 'FFmpeg include\ or lib\ files are missing' }
+        $res.version = Get-FirstLine (Invoke-Native -FilePath $exe -ArgumentList @('-hide_banner', '-version')) '^ffmpeg version'
+        $enc = Invoke-Native -FilePath $exe -ArgumentList @('-hide_banner', '-encoders')
+        foreach ($n in $WantEncoders) {
+            $res.encoders[$n] = ($enc.Text -match ('(?m)^\s*[A-Za-z.|]{1,6}\s+' + [regex]::Escape($n) + '\s'))
+            if (-not $res.encoders[$n]) { Add-Problem ('FFmpeg lacks the encoder {0}' -f $n) }
+        }
+        $fil = Invoke-Native -FilePath $exe -ArgumentList @('-hide_banner', '-filters')
+        foreach ($n in $WantFilters) {
+            $res.filters[$n] = ($fil.Text -match ('(?m)^\s*[A-Za-z.|]{1,6}\s+' + [regex]::Escape($n) + '\s'))
+            if (-not $res.filters[$n]) { Add-Problem ('FFmpeg lacks the filter {0}' -f $n) }
+        }
+        $res
+    }
+
+    Invoke-Section 'presentmon' {
+        $exe = Join-Path $PresentMonDir $PresentMonFile
+        $res = [ordered]@{ path = $exe; present = (Test-Path -LiteralPath $exe); sha256_ok = $false; group_member = $null; token_has_group = $null; unelevated_test = $null }
+        if ($res.present) {
+            $res.sha256_ok = ((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant() -eq $PresentMonSha256)
+            if (-not $res.sha256_ok) { Add-Problem 'PresentMon does not match its pinned SHA-256' }
+        } else {
+            Add-Problem 'PresentMon is missing'
+        }
+        $res.group_member = Test-GroupMemberSam -GroupSid $SidPerfLogUsers -MemberSid $MeSid
+        if (-not $res.group_member) { Add-Problem ('{0} is not in Performance Log Users' -f $Me.Name) }
+        $groups = Invoke-Native -FilePath $WhoamiExe -ArgumentList @('/groups', '/fo', 'csv', '/nh')
+        $res.token_has_group = ($groups.Text -match [regex]::Escape($SidPerfLogUsers))
+        if ($res.group_member -and -not $res.token_has_group) { Add-Concern 'This session does not carry Performance Log Users yet; sign out and back in.' }
+        if ($TestPresentMon) {
+            $res.unelevated_test = Test-PresentMonUnelevated
+            if ($res.unelevated_test.status -eq 'failed' -or $res.unelevated_test.status -eq 'error') { Add-Problem ('Unelevated PresentMon test: ' + $res.unelevated_test.detail) }
+            elseif ($res.unelevated_test.status -eq 'skipped') { Add-Concern ('Unelevated PresentMon test skipped: ' + $res.unelevated_test.detail) }
+        } else {
+            $res.unelevated_test = [ordered]@{ status = 'not-run'; detail = 'Run the doctor with -TestPresentMon to prove it (M0 exit 4).' }
+        }
+        $res
+    }
+
+    Invoke-Section 'tasks' {
+        $expected = @{ Run = ('run --job ' + $JobFile); Ensure = 'ensure'; Engine = 'engine' }
+        $out = [ordered]@{}
+        foreach ($name in @('Run', 'Ensure', 'Engine')) {
+            $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $name -ErrorAction SilentlyContinue
+            if (-not $t) {
+                $out[$name] = [ordered]@{ exists = $false }
+                Add-Problem ('Task \Kairo\{0} is missing' -f $name)
+                continue
+            }
+            $info = Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $name -ErrorAction SilentlyContinue
+            $action = @($t.Actions)[0]
+            $mismatches = @()
+            $userSid = ConvertTo-Sid ([string] $t.Principal.UserId)
+            if ($userSid -ne $MeSid) { $mismatches += ('runs as {0}, not as {1}' -f $t.Principal.UserId, $Me.Name) }
+            if ([string] $t.Principal.LogonType -ne 'Interactive') { $mismatches += ('logon type {0}' -f $t.Principal.LogonType) }
+            if ([string] $t.Principal.RunLevel -ne 'Limited') { $mismatches += ('run level {0}' -f $t.Principal.RunLevel) }
+            if ([int] $t.Settings.Priority -ne 4) { $mismatches += ('priority {0}' -f $t.Settings.Priority) }
+            if ([string] $t.Settings.ExecutionTimeLimit -ne 'PT0S') { $mismatches += ('time limit {0}' -f $t.Settings.ExecutionTimeLimit) }
+            if ([string] $t.Settings.MultipleInstances -ne 'IgnoreNew') { $mismatches += ('multiple instances {0}' -f $t.Settings.MultipleInstances) }
+            if ([string] $action.Execute -ne $DevrunExe) { $mismatches += ('runs {0}' -f $action.Execute) }
+            if ([string] $action.Arguments -ne $expected[$name]) { $mismatches += ('arguments "{0}"' -f $action.Arguments) }
+            $triggers = @()
+            foreach ($tr in @($t.Triggers)) {
+                $triggers += [ordered]@{
+                    type                = [string] $tr.CimClass.CimClassName
+                    enabled             = [bool] $tr.Enabled
+                    user                = [string] $tr.UserId
+                    start               = [string] $tr.StartBoundary
+                    repetition_interval = [string] $tr.Repetition.Interval
+                    repetition_duration = [string] $tr.Repetition.Duration
+                }
+            }
+            if ($name -eq 'Ensure') {
+                if (@($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count -lt 1) { $mismatches += 'no logon trigger' }
+                $repeat = @($t.Triggers | Where-Object { $_.Repetition -and [string] $_.Repetition.Interval -eq 'PT1M' })
+                if ($repeat.Count -lt 1) { $mismatches += 'no 1-minute repetition' }
+                foreach ($r in $repeat) { if ([string] $r.Repetition.Duration) { $mismatches += ('repeats only for {0}' -f $r.Repetition.Duration) } }
+            }
+            $entry = [ordered]@{
+                exists               = $true
+                ok                   = ($mismatches.Count -eq 0)
+                mismatches           = $mismatches
+                state                = [string] $t.State
+                user                 = [string] $t.Principal.UserId
+                logon_type           = [string] $t.Principal.LogonType
+                run_level            = [string] $t.Principal.RunLevel
+                priority             = $t.Settings.Priority
+                execution_time_limit = [string] $t.Settings.ExecutionTimeLimit
+                multiple_instances   = [string] $t.Settings.MultipleInstances
+                execute              = [string] $action.Execute
+                arguments            = [string] $action.Arguments
+                working_directory    = [string] $action.WorkingDirectory
+                triggers             = $triggers
+                last_run_utc         = $null
+                last_result          = $null
+                next_run_utc         = $null
+            }
+            if ($info) {
+                $entry.last_run_utc = Format-Utc $info.LastRunTime
+                $entry.last_result = $info.LastTaskResult
+                $entry.next_run_utc = Format-Utc $info.NextRunTime
+            }
+            if ($mismatches.Count -gt 0) { Add-Problem ('Task \Kairo\{0}: {1}' -f $name, ($mismatches -join '; ')) }
+            $out[$name] = $entry
+        }
+        if (-not (Test-Path -LiteralPath $DevrunExe)) { Add-Concern ('{0} does not exist yet (no deploy), so the tasks cannot start.' -f $DevrunExe) }
+        $out
+    }
+
+    Invoke-Section 'sshd' {
+        $res = [ordered]@{}
+        $svc = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
+        $res.service = [ordered]@{ exists = [bool] $svc; status = $null; start_type = $null }
+        if ($svc) {
+            $res.service.status = [string] $svc.Status
+            $res.service.start_type = [string] $svc.StartType
+            if ($res.service.status -ne 'Running') { Add-Problem ('sshd is {0}' -f $res.service.status) }
+            if ($res.service.start_type -ne 'Automatic') { Add-Problem ('sshd starts {0}, not Automatic' -f $res.service.start_type) }
+        } else {
+            Add-Problem 'The sshd service is missing'
+        }
+
+        # cmd.exe /d /c (bootstrap.ps1, docs/milestones/M0.md): no profile or AutoRun runs in elevated sessions.
+        $openSsh = $null
+        try { $openSsh = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\OpenSSH' -ErrorAction Stop } catch { $openSsh = $null }
+        $shell = $null; $option = $null; $shellArgs = $null
+        if ($openSsh) {
+            if ($openSsh.PSObject.Properties['DefaultShell']) { $shell = [string] $openSsh.DefaultShell }
+            if ($openSsh.PSObject.Properties['DefaultShellCommandOption']) { $option = [string] $openSsh.DefaultShellCommandOption }
+            if ($openSsh.PSObject.Properties['DefaultShellArguments']) { $shellArgs = [string] $openSsh.DefaultShellArguments }
+        }
+        $res.default_shell = [ordered]@{ value = $shell; command_option = $option; arguments = $shellArgs; exists = ($shell -and (Test-Path -LiteralPath $shell)) }
+        if ($shell -ne $SshShellExe) { Add-Problem ('The SSH DefaultShell is "{0}", expected {1}' -f $shell, $SshShellExe) }
+        if ($option -cne $SshShellOption) { Add-Problem ('The SSH DefaultShellCommandOption is "{0}", expected "{1}" (no AutoRun)' -f $option, $SshShellOption) }
+        if ($shellArgs -cne $SshShellArguments) { Add-Concern ('The SSH DefaultShellArguments is "{0}", expected "{1}" for interactive logins' -f $shellArgs, $SshShellArguments) }
+        $res.host_key_fingerprint = Get-HostKeyFingerprint
+        if (-not $res.host_key_fingerprint) { Add-Problem ('The SSH host key {0} is missing' -f $HostKeyPubPath) }
+
+        if (-not $IsElevated) {
+            $res.note = 'Run the doctor elevated (a normal SSH session) for the config, key file and firewall checks.'
+            return $res
+        }
+
+        $effective = @{}
+        $sshdTest = Invoke-Native -FilePath $SshdExe -ArgumentList @('-T')
+        foreach ($line in $sshdTest.Lines) { if ($line -match '^(\S+)\s+(.*)$') { $effective[$Matches[1].ToLowerInvariant()] = $Matches[2].Trim() } }
+        $kbd = $effective['kbdinteractiveauthentication']
+        if ($null -eq $kbd) { $kbd = $effective['challengeresponseauthentication'] }   # older OpenSSH (bootstrap.ps1)
+        $res.effective = [ordered]@{
+            exit_code                    = $sshdTest.ExitCode
+            passwordauthentication       = $effective['passwordauthentication']
+            kbdinteractiveauthentication = $kbd
+            pubkeyauthentication         = $effective['pubkeyauthentication']
+        }
+        if ($sshdTest.ExitCode -ne 0) { Add-Problem ('sshd -T failed: {0}' -f $sshdTest.Text) }
+        if ($effective['passwordauthentication'] -ne 'no') { Add-Problem 'sshd allows passwords' }
+        if ($effective['pubkeyauthentication'] -ne 'yes') { Add-Problem 'sshd does not allow keys' }
+        if ($kbd -ne 'no') { Add-Problem 'sshd allows keyboard-interactive logins' }
+
+        $config = ''
+        if (Test-Path -LiteralPath $SshdConfigPath) { $config = [System.IO.File]::ReadAllText($SshdConfigPath) }
+        $res.config_has_kairo_block = $config.Contains($SshdBlockBegin)
+        $res.config_has_admin_match = ($config -match '(?m)^\s*Match\s+Group\s+administrators\s*$')
+        if (-not $res.config_has_kairo_block) { Add-Problem 'sshd_config lacks the Kairo block' }
+        if (-not $res.config_has_admin_match) { Add-Problem 'sshd_config lacks "Match Group administrators"' }
+
+        $keys = [ordered]@{ exists = (Test-Path -LiteralPath $AdminKeysPath); kairo_keys = 0; other_keys = 0; fingerprints = @(); acl_protected = $null; acl_sids = @(); owner_sid = $null }
+        if ($keys.exists) {
+            foreach ($line in @(Get-Content -LiteralPath $AdminKeysPath)) {
+                $keyLine = ([string] $line).Trim()
+                if (-not $keyLine -or $keyLine.StartsWith('#')) { continue }
+                if ($keyLine -match ('\s' + [regex]::Escape($KeyTag) + '$')) {
+                    $keys.kairo_keys = $keys.kairo_keys + 1
+                    $parts = @($keyLine -split '\s+')
+                    if ($parts.Count -ge 2) { $keys.fingerprints += (Get-KeyFingerprint $parts[1]) }
+                } else {
+                    $keys.other_keys = $keys.other_keys + 1
+                }
+            }
+            $acl = Get-Acl -LiteralPath $AdminKeysPath
+            $keys.acl_protected = $acl.AreAccessRulesProtected
+            $keys.acl_sids = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            $keys.owner_sid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            $extra = @($keys.acl_sids | Where-Object { $_ -ne $SidAdministrators -and $_ -ne $SidSystem })
+            if (-not $keys.acl_protected -or $extra.Count -gt 0) { Add-Problem 'administrators_authorized_keys allows access beyond Administrators and SYSTEM' }
+            if ($keys.kairo_keys -ne 1) { Add-Problem ('administrators_authorized_keys has {0} Kairo keys, expected 1' -f $keys.kairo_keys) }
+            if ($keys.other_keys -gt 0) { Add-Concern ('administrators_authorized_keys has {0} other key(s)' -f $keys.other_keys) }
+        } else {
+            Add-Problem 'administrators_authorized_keys is missing'
+        }
+        $res.keys_file = $keys
+
+        $fw = [ordered]@{ kairo_rule = $null; qualifying_interfaces = @(); default_rule_enabled = $null; other_open_rules = @() }
+        $fw.qualifying_interfaces = @(Get-SshInterface | Where-Object { $_.qualifies } | ForEach-Object { $_.alias })
+        $rule = Get-NetFirewallRule -Name $FirewallRuleName -ErrorAction SilentlyContinue
+        if ($rule) {
+            $addr = $rule | Get-NetFirewallAddressFilter
+            $port = $rule | Get-NetFirewallPortFilter
+            $app = $rule | Get-NetFirewallApplicationFilter
+            $nic = $rule | Get-NetFirewallInterfaceFilter
+            $fw.kairo_rule = [ordered]@{
+                enabled         = [string] $rule.Enabled
+                profile         = [string] $rule.Profile
+                direction       = [string] $rule.Direction
+                action          = [string] $rule.Action
+                protocol        = [string] $port.Protocol
+                local_port      = (@($port.LocalPort) -join ',')
+                remote_address  = (@($addr.RemoteAddress) -join ',')
+                program         = [string] $app.Program
+                interface_alias = @($nic.InterfaceAlias | ForEach-Object { [string] $_ })
+            }
+            $ruleOk = ($fw.kairo_rule.profile -eq 'Private') -and ($fw.kairo_rule.action -eq 'Allow') -and ($fw.kairo_rule.direction -eq 'Inbound')
+            if ($ruleOk) { $ruleOk = ($fw.kairo_rule.protocol -eq 'TCP') -and ($fw.kairo_rule.local_port -eq '22') -and ($fw.kairo_rule.remote_address -eq 'LocalSubnet') }
+            if ($ruleOk) { $ruleOk = ([Environment]::ExpandEnvironmentVariables($fw.kairo_rule.program) -eq $SshdExe) }
+            if (-not $ruleOk) { Add-Problem ('Firewall rule {0} differs from sshd.exe / TCP 22 / Private / LocalSubnet' -f $FirewallRuleName) }
+            if ($fw.kairo_rule.enabled -ne 'True') {
+                Add-Problem ('Firewall rule {0} is switched off (no wired or Wi-Fi adapter on a Private network with a home-network address when the bootstrap ran); fix the network, then run the bootstrap again' -f $FirewallRuleName)
+            } else {
+                $aliases = @($fw.kairo_rule.interface_alias)
+                if ($aliases.Count -eq 0 -or $aliases -contains 'Any') { Add-Problem ('Firewall rule {0} is not limited to the home-network adapters' -f $FirewallRuleName) }
+                $outside = @($aliases | Where-Object { $fw.qualifying_interfaces -notcontains $_ })
+                if ($outside.Count -gt 0) { Add-Problem ('Firewall rule {0} opens SSH on adapters that no longer qualify ({1}); run the bootstrap again' -f $FirewallRuleName, ($outside -join ', ')) }
+                $missing = @($fw.qualifying_interfaces | Where-Object { $aliases -notcontains $_ })
+                if ($missing.Count -gt 0) { Add-Concern ('SSH is not open on {0}; run the bootstrap again if the Mac uses that adapter' -f ($missing -join ', ')) }
+            }
+        } else {
+            Add-Problem ('Firewall rule {0} is missing' -f $FirewallRuleName)
+        }
+        $default = Get-NetFirewallRule -Name $SshDefaultRule -ErrorAction SilentlyContinue
+        if ($default) { $fw.default_rule_enabled = ([string] $default.Enabled -eq 'True') }
+        $portFilters = @{}
+        foreach ($pf in @(Get-NetFirewallPortFilter -All -ErrorAction SilentlyContinue)) { $portFilters[[string] $pf.InstanceID] = $pf }
+        $appFilters = @{}
+        foreach ($af in @(Get-NetFirewallApplicationFilter -All -ErrorAction SilentlyContinue)) { $appFilters[[string] $af.InstanceID] = $af }
+        foreach ($r in @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -ErrorAction SilentlyContinue)) {
+            if ($r.Name -eq $FirewallRuleName) { continue }
+            $pf = $portFilters[[string] $r.InstanceID]
+            $af = $appFilters[[string] $r.InstanceID]
+            $hit = ($pf -and ([string] $pf.Protocol -eq 'TCP') -and (@($pf.LocalPort) -contains '22')) -or ($af -and ([string] $af.Program -match '(?i)\\sshd\.exe$'))
+            if ($hit) { $fw.other_open_rules += [ordered]@{ name = [string] $r.Name; display_name = [string] $r.DisplayName; profile = [string] $r.Profile } }
+        }
+        if ($fw.other_open_rules.Count -gt 0) { Add-Problem ('Other firewall rules still open SSH: ' + ((@($fw.other_open_rules) | ForEach-Object { $_.name }) -join ', ')) }
+        $res.firewall = $fw
+        $res
+    }
+
+    Invoke-Section 'smart_app_control' {
+        $sac = Get-SmartAppControl
+        if ($sac.state -eq 'on') { Add-Problem 'Smart App Control is On: it blocks unsigned builds and FFmpeg (SETUP.md step 6, Q3)' }
+        elseif ($sac.state -eq 'evaluation') { Add-Concern 'Smart App Control is in Evaluation and may switch itself On (SETUP.md step 6)' }
+        elseif ($sac.state -eq 'unknown') { Add-Concern 'Smart App Control state is unknown' }
+        $sac
+    }
+
+    Invoke-Section 'disk' {
+        $d = New-Object System.IO.DriveInfo('C')
+        $free = [uint64] $d.AvailableFreeSpace
+        if ($free -lt 20GB) { Add-Problem ('Only {0:N1} GB free on C:' -f ($free / 1GB)) }
+        elseif ($free -lt 40GB) { Add-Concern ('{0:N1} GB free on C:' -f ($free / 1GB)) }
+        [ordered]@{ drive = 'C:'; free_bytes = $free; total_bytes = [uint64] $d.TotalSize; free_gb = [math]::Round($free / 1GB, 1) }
+    }
+
+    Invoke-Section 'kairo' {
+        $res = [ordered]@{ folders = [ordered]@{}; acl_ok = $null; current = $null; builds = @(); src = $null }
+        foreach ($d in @($KairoRoot, $SrcDir, $BinDir, $JobsDir, $LogsDir, $ToolsDir, $StateDir)) {
+            $res.folders[$d] = (Test-Path -LiteralPath $d)
+            if (-not $res.folders[$d]) { Add-Problem ('{0} is missing' -f $d) }
+        }
+        $res.acl_ok = Test-KairoAcl $MeSid
+        if (-not $res.acl_ok) { Add-Problem 'C:\kairo permissions differ from the M0 layout (Administrators and SYSTEM full control and owner; you read, and write only logs and state): run the bootstrap again' }
+
+        # The admin-only Git settings of the SSH sessions, and files elevated sessions run or trust.
+        $res.git_config = [ordered]@{ path = $GitConfigFile; present = (Test-Path -LiteralPath $GitConfigFile); safe_directory = $false; admin_only = $false }
+        if ($res.git_config.present) {
+            $res.git_config.safe_directory = ([System.IO.File]::ReadAllText($GitConfigFile) -match '(?m)^\s*directory\s*=\s*C:/kairo/src\s*$')
+            $res.git_config.admin_only = Test-AdminOnlyFile $GitConfigFile
+            if (-not $res.git_config.safe_directory) { Add-Problem ('{0} does not mark C:/kairo/src as safe' -f $GitConfigFile) }
+            if (-not $res.git_config.admin_only) { Add-Problem ('{0} can be changed by more than Administrators and SYSTEM' -f $GitConfigFile) }
+        } else {
+            Add-Problem ('{0} is missing (the bootstrap writes it)' -f $GitConfigFile)
+        }
+        $ffmpegExe = Join-Path $FfmpegDir 'bin\ffmpeg.exe'
+        if ((Test-Path -LiteralPath $ffmpegExe) -and -not (Test-AdminOnlyFile $ffmpegExe)) { Add-Problem ('{0} can be changed by more than Administrators and SYSTEM' -f $ffmpegExe) }
+
+        # cargo reads .cargo\config* from every parent folder of C:\kairo\src (bootstrap.ps1, Initialize-CargoGuard).
+        $guard = [ordered]@{ path = $CargoGuardDir; ok = $false; configs = @() }
+        $guardRules = @{}
+        $guardRules[$SidAdministrators] = $RightsFull
+        $guardRules[$SidSystem] = $RightsFull
+        $guardRules[$SidUsers] = $RightsRead
+        $guard.ok = Test-FolderAcl -Path $CargoGuardDir -Explicit $guardRules -Protected
+        foreach ($dir in @($CargoGuardDir, (Join-Path $KairoRoot '.cargo'))) {
+            if (Test-Path -LiteralPath $dir) {
+                $guard.configs += @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'config*' } | ForEach-Object { $_.FullName })
+            }
+        }
+        if (-not $guard.ok) { Add-Problem 'C:\.cargo is missing or others can change it (the bootstrap makes it admin-only)' }
+        if ($guard.configs.Count -gt 0) { Add-Problem ('Cargo config files that elevated builds would read: ' + ($guard.configs -join ', ')) }
+        $res.cargo_guard = $guard
+
+        $current = [ordered]@{ exists = (Test-Path -LiteralPath $CurrentBin); junction = $false; target = $null }
+        if ($current.exists) {
+            $item = Get-Item -LiteralPath $CurrentBin -Force
+            $current.junction = (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($item.PSObject.Properties['Target']) { $current.target = (@($item.Target) -join ';') }
+            if (-not $current.junction) { Add-Problem ('{0} is not a junction' -f $CurrentBin) }
+        }
+        $res.current = $current
+        if (Test-Path -LiteralPath $BinDir) {
+            $res.builds = @(Get-ChildItem -LiteralPath $BinDir -Directory -Force | Where-Object { $_.Name -ne 'current' } | Sort-Object LastWriteTime -Descending | ForEach-Object { $_.Name })
+            if ($res.builds.Count -gt 3) { Add-Concern ('{0} builds in C:\kairo\bin; the contract keeps 3' -f $res.builds.Count) }
+        }
+
+        $git = Get-GitExe
+        if ($git -and (Test-Path -LiteralPath (Join-Path $SrcDir '.git'))) {
+            $branch = (Invoke-Native -FilePath $git -ArgumentList @('-C', $SrcDir, 'symbolic-ref', '-q', 'HEAD')).Text
+            $deny = (Invoke-Native -FilePath $git -ArgumentList @('-C', $SrcDir, 'config', '--get', 'receive.denyCurrentBranch')).Text
+            $head = Invoke-Native -FilePath $git -ArgumentList @('-C', $SrcDir, 'rev-parse', '--short', 'HEAD')
+            $dirty = Invoke-Native -FilePath $git -ArgumentList @('-C', $SrcDir, 'status', '--porcelain', '--untracked-files=no')
+            $res.src = [ordered]@{
+                head_ref                  = $branch
+                head_commit               = $(if ($head.ExitCode -eq 0) { $head.Text } else { $null })
+                receive_deny_current      = $deny
+                tracked_files_clean       = ($dirty.ExitCode -eq 0 -and -not $dirty.Text)
+            }
+            if ($branch -ne 'refs/heads/snapshot') { Add-Problem ('C:\kairo\src is on "{0}", not snapshot' -f $branch) }
+            if ($deny -ne 'updateInstead') { Add-Problem ('receive.denyCurrentBranch is "{0}", not updateInstead' -f $deny) }
+            if ($dirty.ExitCode -eq 0 -and $dirty.Text) { Add-Concern 'C:\kairo\src has modified tracked files, so the next push will be refused' }
+        } else {
+            Add-Problem 'C:\kairo\src is not a Git repository'
+        }
+        $res
+    }
+
+    Invoke-Section 'watch' {
+        $w = Read-WatchState
+        if (-not $w.present) { Add-Concern 'watch.json does not exist yet (the watch agent comes with kairo-devrun)' }
+        elseif (-not $w.fresh) { Add-Concern ('watch.json is {0} s old; the watch agent may not be running' -f $w.age_s) }
+        $w
+    }
+
+    Invoke-Section 'network' {
+        $profiles = @()
+        foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+            $ips = @(Get-NetIPAddress -InterfaceIndex $p.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -notlike '169.254.*' } | ForEach-Object { [string] $_.IPAddress })
+            $profiles += [ordered]@{ interface = [string] $p.InterfaceAlias; category = [string] $p.NetworkCategory; ipv4 = $ips }
+        }
+        if (@($profiles | Where-Object { $_.category -eq 'Private' }).Count -eq 0) { Add-Problem 'No network is set to Private, so the SSH rule does not apply' }
+        [ordered]@{ profiles = $profiles }
+    }
+}
+
+# Git here reads the admin-only settings of the SSH sessions, never your own .gitconfig (which could make an elevated
+# "git status" run a command). A missing file just means no global settings.
+$savedGitConfig = $env:GIT_CONFIG_GLOBAL
+$env:GIT_CONFIG_GLOBAL = $GitConfigFile
+$exitCode = 0
+try {
+    Invoke-Doctor
+    $Doc.ok = ($Doc.problems.Count -eq 0)
+    if (-not $Doc.ok) { $exitCode = 1 }
+} catch {
+    Add-Problem ('The doctor failed: {0}' -f $_.Exception.Message)
+    $Doc.ok = $false
+    $exitCode = 2
+} finally {
+    $env:GIT_CONFIG_GLOBAL = $savedGitConfig
+}
+$Doc.problems = @($Doc.problems)
+$Doc.warnings = @($Doc.warnings)
+if ($Compress) { ConvertTo-Json -InputObject $Doc -Depth 8 -Compress } else { ConvertTo-Json -InputObject $Doc -Depth 8 }
+if ($PSCommandPath) { exit $exitCode }

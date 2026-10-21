@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# tools/mac/keychain-askpass: the SSH_ASKPASS helper that unlocks ~/.ssh/kairo_pc (docs/PLAN.md
+# section 3.1). It prints the key's passphrase from the login Keychain item that
+# tools/mac/ssh-setup.sh made (service "Kairo SSH key", account = the key's path), so ssh-add can
+# load the key into ssh-agent without a prompt. tools/mac/ssh-setup.sh and tools/mac/pc call it;
+# never run it by hand, because it prints a secret.
+#
+# Why not Apple's own "ssh-add --apple-use-keychain": on macOS 26.3.1 (OpenSSH_10.2p1) it loads
+# the key but stores no passphrase from Claude's sessions, whether it comes from SSH_ASKPASS or
+# a terminal (tested 2026-10-22), so the Kairo tools keep their own Keychain item.
+#
+# KAIRO_PC_KEY: the key's path (default ~/.ssh/kairo_pc).
+# KAIRO_ASKPASS_STAMP: an empty file. The helper answers once, then fails, so ssh-add gives up
+# instead of asking again forever if the stored passphrase were ever wrong.
+
+if [ -n "${KAIRO_ASKPASS_STAMP:-}" ]; then
+    [ -s "$KAIRO_ASKPASS_STAMP" ] && exit 1
+    printf 1 >"$KAIRO_ASKPASS_STAMP" || exit 1
+fi
+exec /usr/bin/security find-generic-password -s 'Kairo SSH key' -a "${KAIRO_PC_KEY:-$HOME/.ssh/kairo_pc}" -w

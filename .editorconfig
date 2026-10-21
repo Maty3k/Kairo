@@ -1,0 +1,33 @@
+# EditorConfig (https://editorconfig.org, spec: https://spec.editorconfig.org).
+# Shared editor defaults for Kairo. Formatters and CI checks (rustfmt, the UI's formatter) have the final say.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Web UI, data and configuration files
+[*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,css,html,svg,yml,yaml}]
+indent_size = 2
+
+# Markdown: two trailing spaces are a hard line break
+[*.md]
+trim_trailing_whitespace = false
+
+# Patches (e.g. the FFmpeg diff): whitespace is part of the content
+[*.{diff,patch}]
+trim_trailing_whitespace = false
+
+# PowerShell: keep these files ASCII-only. Windows PowerShell 5.1, which runs the bootstrap,
+# reads a script saved without a BOM in the legacy ANSI code page, so any non-ASCII character
+# would be garbled. Plain ASCII reads the same in 5.1 and in PowerShell 7. LF line endings are fine.
+[*.{ps1,psm1,psd1}]
+indent_size = 4
+
+# Windows batch files need CRLF line endings
+[*.{cmd,bat}]
+end_of_line = crlf

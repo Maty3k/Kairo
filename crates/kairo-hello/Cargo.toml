@@ -1,0 +1,30 @@
+[package]
+name = "kairo-hello"
+description = "M0 hello probe: a test window that logs key presses and answers on a named pipe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kairo-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",              # HWND, HANDLE, HLOCAL, errors
+    "Win32_Graphics_Gdi",            # painting and fonts; MonitorFromPoint; WNDCLASSW needs it
+    "Win32_Security",                # tokens, SECURITY_ATTRIBUTES
+    "Win32_Security_Authorization",  # SDDL to security descriptor, SID to string
+    "Win32_Storage_FileSystem",      # PIPE_ACCESS_DUPLEX, FILE_FLAG_FIRST_PIPE_INSTANCE
+    "Win32_System_IO",               # ConnectNamedPipe takes an OVERLAPPED pointer
+    "Win32_System_LibraryLoader",    # GetModuleHandleW
+    "Win32_System_Performance",      # QueryPerformanceCounter/Frequency
+    "Win32_System_Pipes",            # CreateNamedPipeW, ConnectNamedPipe
+    "Win32_System_Threading",        # GetCurrentProcess, OpenProcessToken
+    "Win32_UI_WindowsAndMessaging",  # the window and its message loop
+] }
+
+[lints]
+workspace = true

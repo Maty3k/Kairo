@@ -1,0 +1,776 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# tools/mac/pc: drive Kairo's Windows dev PC from the Mac over SSH (docs/PLAN.md section 3.1, M0).
+# Run "tools/mac/pc help" for the verbs. Contact: https://github.com/Maty3k/Kairo
+#
+# House rules (CLAUDE.md; docs/PLAN.md Appendix A): run "pc status" first. BUSY means the owner
+# may be playing, so work on the Mac. Every verb except status, doctor and ssh checks the busy
+# state on the PC itself and refuses unless --force, which needs the owner's OK in this session.
+#
+# How it works: a remote verb pipes "prelude + tools/mac/remote/lib.ps1 + <verb>.ps1" over ssh
+# into '"C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -NonInteractive ... -EncodedCommand
+# <stub.ps1 as Base64>'. The PC's SSH shell is cmd.exe /d /c (tools/pc/bootstrap.ps1), which runs
+# that line as plain text: only the quoted pwsh path and Base64 reach it, so nothing is re-parsed
+# by bash, ssh or cmd, and no profile or AutoRun runs in the elevated session.
+# Arguments travel inside the script as PowerShell literals that are validated here first, so an
+# id or a path cannot inject commands. The script's last "@@KAIRO-EXIT <n>" line carries the exit
+# code back. Git for "pc sync" goes through the same encoding (see git_ssh_transport).
+#
+# Written for macOS's /bin/bash 3.2: no associative arrays, mapfile, ${var,,} or ;& in case.
+
+set -u
+set -o pipefail
+export LC_ALL=C
+
+PC_HOST=${KAIRO_PC:-kairo-pc}
+DEFAULT_PC_PWSH='C:\Program Files\PowerShell\7\pwsh.exe'   # the MSI's path (tools/pc/bootstrap.ps1)
+PC_PWSH=${KAIRO_PC_PWSH:-$DEFAULT_PC_PWSH}
+KEY_FILE=${KAIRO_PC_KEY:-$HOME/.ssh/kairo_pc}
+SSH=/usr/bin/ssh                # Apple's OpenSSH and its ssh-agent
+SCP=/usr/bin/scp
+PC_SRC_GIT='C:/kairo/src'       # the clone, as git and scp spell it
+# TODO(verify): Win32-OpenSSH's SFTP server takes C:/... as an absolute path (its realpath() does).
+PC_BUNDLE_SCP='C:/kairo/src/.git/kairo-sync.bundle'
+PC_BUNDLE_WIN='C:\kairo\src\.git\kairo-sync.bundle'
+MAX_UNTRACKED_BYTES=$((50 * 1024 * 1024))
+TMP_BASE=${TMPDIR:-/tmp}
+TMP_BASE=${TMP_BASE%/}
+NL='
+'
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd -P) || exit 1
+SELF="$SELF_DIR/$(basename "$0")"
+REMOTE_DIR="$SELF_DIR/remote"
+JOBS_DIR="$SELF_DIR/jobs"
+REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd -P) || exit 1
+
+# Command-line options win over every ~/.ssh/config entry, so an earlier "Host *" block with
+# StrictHostKeyChecking no or accept-new cannot make pc trust an unknown or changed host key.
+SSH_OPTS=(-T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$KEY_FILE"
+    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+SCP_OPTS=(-q -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$KEY_FILE" -o ConnectTimeout=10)
+MAX_REMOTE_COMMAND=8000   # cmd.exe takes at most 8191 characters per command line
+
+# ------------------------------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------------------------------
+say() { printf '%s\n' "$*"; }
+err() { printf 'pc: %s\n' "$*" >&2; }
+die() {
+    err "$1"
+    exit "${2:-1}"
+}
+usage_error() {
+    err "$1"
+    err "see: tools/mac/pc help"
+    exit 2
+}
+
+TEMP_PATHS=''
+# shellcheck disable=SC2317,SC2329 # called by the EXIT trap below
+cleanup() {
+    local path
+    local IFS="$NL"
+    for path in $TEMP_PATHS; do
+        [ -n "$path" ] && rm -rf "$path"
+    done
+}
+trap cleanup EXIT
+make_temp() { # make_temp file|dir -> prints the new path and registers it for cleanup
+    local path
+    if [ "$1" = dir ]; then
+        path=$(mktemp -d "$TMP_BASE/kairo-pc.XXXXXX") || return 1
+    else
+        path=$(mktemp "$TMP_BASE/kairo-pc.XXXXXX") || return 1
+    fi
+    printf '%s\n' "$path"
+}
+register_temp() { TEMP_PATHS="$TEMP_PATHS$1$NL"; }
+
+is_uint() { # whole number with at most 6 digits
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 6 ]
+}
+is_job_id() { # ^[A-Za-z0-9_-]{1,64}$ (crates/kairo-core/src/job.rs)
+    case "$1" in '' | *[!A-Za-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 64 ]
+}
+is_build_id() { # <yyyyMMdd>-<HHmmss>-<7 to 40 lowercase hex digits>
+    case "$1" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-*) ;;
+    *) return 1 ;;
+    esac
+    local hex=${1:16}
+    case "$hex" in '' | *[!0-9a-f]*) return 1 ;; esac
+    [ "${#hex}" -ge 7 ] && [ "${#hex}" -le 40 ]
+}
+is_package() { # a cargo package name
+    case "$1" in '' | -* | *[!A-Za-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 64 ]
+}
+is_pipe_name() { # NAME or \\.\pipe\NAME with NAME in [A-Za-z0-9._-]{1,200} (kairo-core hello.rs)
+    local name=$1
+    # shellcheck disable=SC1003 # the backslashes are literal: '\\.\pipe\'
+    case "$name" in '\\.\pipe\'*) name=${name#'\\.\pipe\'} ;; esac
+    case "$name" in '' | *[!A-Za-z0-9._-]*) return 1 ;; esac
+    [ "${#name}" -le 200 ]
+}
+need_value() { # need_value <option> <number of remaining args>
+    [ "$2" -ge 2 ] || usage_error "$1 needs a value"
+}
+
+# Sanity checks on the configuration itself.
+case "$PC_HOST" in '' | -* | *[!A-Za-z0-9._@-]*) die "KAIRO_PC must be an ssh host alias such as kairo-pc" 2 ;; esac
+# It is quoted on the PC's cmd.exe command line, so it may hold spaces but none of " % ^ & | < > !
+case "$PC_PWSH" in '' | -* | *[!A-Za-z0-9._:\\/\ -]*) die "KAIRO_PC_PWSH must be the path of pwsh.exe (letters, digits, spaces, . _ : \\ / -)" 2 ;; esac
+case "$SELF" in *"'"* | *[![:print:]]*) die "the path of this script must not contain quotes or unusual characters: $SELF" 2 ;; esac
+
+# ------------------------------------------------------------------------------------------
+# Running PowerShell on the PC
+# ------------------------------------------------------------------------------------------
+ps_encode() { # stdin: PowerShell source -> stdout: Base64 of UTF-16LE, without comment lines
+    grep -v '^[[:space:]]*#' | /usr/bin/iconv -f UTF-8 -t UTF-16LE | /usr/bin/base64 | tr -d '\n'
+}
+# TODO(verify) in M0: sshd runs '"cmd.exe" /d /c "<this line>"' (Win32-OpenSSH w32-doexec.c), and
+# cmd hands pwsh the inherited stdin and stdout unchanged (and, for sync, git too). This follows
+# from the Win32-OpenSSH source and cmd's documented quote rule (more than two quotes: the outer
+# pair is stripped), but has not run on the PC yet.
+# TODO(verify): Microsoft Defender does not object to "pwsh -EncodedCommand" started by sshd.
+remote_command() { # the command line the PC's SSH shell (cmd.exe /d /c) runs; fails if too long
+    local line
+    line=$(printf '"%s" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand %s' "$PC_PWSH" "$1")
+    if [ "${#line}" -gt "$MAX_REMOTE_COMMAND" ]; then
+        err "internal: the remote command has ${#line} characters; cmd.exe takes at most 8191"
+        return 1
+    fi
+    printf '%s' "$line"
+}
+
+ensure_agent_key() {
+    # Load the key into ssh-agent, so BatchMode ssh never needs to ask for its passphrase:
+    # tools/mac/keychain-askpass answers ssh-add once from the Keychain item that
+    # tools/mac/ssh-setup.sh made.
+    [ -f "$KEY_FILE" ] && [ -f "$KEY_FILE.pub" ] || return 0
+    local fingerprint loaded stamp
+    fingerprint=$(/usr/bin/ssh-keygen -lf "$KEY_FILE.pub" 2>/dev/null | awk '{print $2}')
+    [ -n "$fingerprint" ] || return 0
+    loaded=$(/usr/bin/ssh-add -l 2>/dev/null)
+    case "$loaded" in *"$fingerprint"*) return 0 ;; esac
+    stamp=$(mktemp "$TMP_BASE/kairo-askpass.XXXXXX") || return 0
+    if ! KAIRO_PC_KEY="$KEY_FILE" KAIRO_ASKPASS_STAMP="$stamp" SSH_ASKPASS="$SELF_DIR/keychain-askpass" \
+        SSH_ASKPASS_REQUIRE=force /usr/bin/ssh-add -q "$KEY_FILE" </dev/null >/dev/null 2>&1; then
+        err "note: could not load $KEY_FILE into ssh-agent with its passphrase from the Keychain (is the login Keychain unlocked?); tools/mac/ssh-setup.sh retries"
+    fi
+    rm -f "$stamp"
+}
+
+ssh_failed_hint() {
+    err "ssh could not reach '$PC_HOST' (exit 255). Check that the PC is on and on the same network."
+    err "First connection? Pin the PC's host key: tools/mac/ssh-setup.sh <pc-ip> <windows-user> <SHA256:fingerprint>,"
+    err "with the 'Host key' line of the bootstrap's DONE screen (--trust-on-first-use only if that line is missing)"
+}
+
+PRELUDE=''
+pre_reset() { PRELUDE="\$Pc = @{}$NL"; }
+pre_safe() { # values become PowerShell single-quoted literals: printable ASCII, no quote
+    case "$1" in *"'"* | *[![:print:]]*) return 1 ;; esac
+    return 0
+}
+pre_str() {
+    pre_safe "$2" || die "internal: unsafe value for $1"
+    PRELUDE="$PRELUDE\$Pc['$1'] = '$2'$NL"
+}
+pre_int() {
+    is_uint "$2" || die "internal: $1 must be a whole number"
+    PRELUDE="$PRELUDE\$Pc['$1'] = $2$NL"
+}
+pre_bool() {
+    if [ "$2" = 1 ]; then
+        PRELUDE="$PRELUDE\$Pc['$1'] = \$true$NL"
+    else
+        PRELUDE="$PRELUDE\$Pc['$1'] = \$false$NL"
+    fi
+}
+pre_list() { # pre_list <name> [values...]
+    local name=$1 items='' value
+    shift
+    for value in "$@"; do
+        pre_safe "$value" || die "internal: unsafe value for $name"
+        items="$items'$value',"
+    done
+    PRELUDE="$PRELUDE\$Pc['$name'] = @(${items%,})$NL"
+}
+
+KV_FILE=''
+run_ps() { # run_ps <verb>: run remote/<verb>.ps1 with $PRELUDE; streams its output; returns its exit code
+    local script="$REMOTE_DIR/$1.ps1" encoded command status_file rc ssh_rc
+    [ -f "$script" ] || die "missing $script"
+    encoded=$(ps_encode <"$REMOTE_DIR/stub.ps1") || die "could not encode $REMOTE_DIR/stub.ps1"
+    command=$(remote_command "$encoded") || exit 2
+    status_file=$(make_temp file) || die "mktemp failed"
+    register_temp "$status_file"
+    KV_FILE=$(make_temp file) || die "mktemp failed"
+    register_temp "$KV_FILE"
+    ensure_agent_key
+    {
+        printf '%s' "$PRELUDE"
+        cat "$REMOTE_DIR/lib.ps1" "$script"
+    } | "$SSH" "${SSH_OPTS[@]}" "$PC_HOST" "$command" |
+        awk -v status_file="$status_file" -v kv_file="$KV_FILE" '
+            BEGIN { code = "" }
+            # No escape sequence from the PC (job output, logs) reaches the terminal.
+            { sub(/\r$/, ""); gsub(/[[:cntrl:]]/, " ") }
+            # The last marker wins: the remote scripts print the real one last, after any
+            # untrusted output that might imitate it (lib.ps1 also indents all log lines).
+            /^@@KAIRO-EXIT [0-9]+$/ { code = $2; next }
+            /^@@KV / { print substr($0, 6) > kv_file; next }
+            { print; fflush() }
+            END { print code > status_file }'
+    ssh_rc=${PIPESTATUS[1]}
+    rc=$(cat "$status_file" 2>/dev/null)
+    if [ -z "$rc" ]; then
+        if [ "$ssh_rc" = 255 ]; then
+            ssh_failed_hint
+            return 255
+        fi
+        err "the remote script ended without reporting a result (ssh exit $ssh_rc)"
+        err "is PowerShell 7 installed on the PC at '$PC_PWSH'?"
+        return 1
+    fi
+    return "$rc"
+}
+kv_get() { # value of the last "@@KV key=value" line for this key from the last run_ps
+    sed -n "s/^$1=//p" "$KV_FILE" | tail -n 1
+}
+
+# Git's ssh program for "pc sync" (git push with GIT_SSH_VARIANT=simple calls "pc <host> <cmd>").
+# Instead of letting the PC's shell parse "git-receive-pack 'C:/kairo/src'" (Git for Windows keeps
+# git-receive-pack off PATH, and cmd.exe would keep the single quotes), run git's service through
+# the same Base64 encoding as everything else.
+git_ssh_transport() {
+    [ $# -eq 2 ] || {
+        err "git transport: expected <host> <command>, got $# arguments"
+        return 2
+    }
+    local host=$1 command=$2 service encoded line
+    [ "$host" = "$PC_HOST" ] || {
+        err "git transport: unexpected host '$host'"
+        return 2
+    }
+    case "$command" in
+    "git-receive-pack '$PC_SRC_GIT'") service=receive-pack ;;
+    "git-upload-pack '$PC_SRC_GIT'") service=upload-pack ;;
+    *)
+        err "git transport: refusing remote command: $command"
+        return 2
+        ;;
+    esac
+    encoded=$(sed -e "s|GIT_SERVICE|$service|g" -e "s|GIT_REPO|$PC_SRC_GIT|g" "$REMOTE_DIR/git-service.ps1" | ps_encode) || return 1
+    line=$(remote_command "$encoded") || return 1
+    ensure_agent_key
+    exec "$SSH" "${SSH_OPTS[@]}" "$host" "$line"
+}
+
+# ------------------------------------------------------------------------------------------
+# Verbs
+# ------------------------------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+usage: tools/mac/pc <verb> [options]
+
+Drives Kairo's Windows dev PC (ssh alias kairo-pc). Run "status" first; BUSY means the owner may be
+playing, so work on the Mac. Verbs that do something on the PC refuse when it is busy (exit 3) or
+when its state is unknown (exit 4); --force overrides that, only with the owner's OK this session.
+
+  status [--json]          Is the owner at the PC? Reads C:\kairo\state\watch.json; also shows the
+                           \Kairo tasks and the current build. Never refuses. Exit 0 IDLE, 3 BUSY,
+                           4 UNKNOWN.
+  doctor [--local] [--test-presentmon] [--compress]
+                           Run tools\pc\doctor.ps1 on the PC (the copy synced to C:\kairo\src;
+                           --local sends the Mac's working-tree copy) and print its JSON report.
+                           --test-presentmon also proves PresentMon starts unelevated (the doctor
+                           skips that while the owner is busy). Never refuses.
+  sync [--bundle] [--allow-large] [--force]
+                           Send a snapshot of this working tree (index + changes + untracked files
+                           that are not ignored) to C:\kairo\src, branch 'snapshot'. Your branches,
+                           index and stash are not touched. Uses git push (updateInstead) and falls
+                           back to git bundle + scp; --bundle skips the push.
+  build [-p PACKAGE]... [--tail N] [--force]
+                           cargo build --release (--workspace unless -p) in C:\kairo\src at below-
+                           normal priority; stops if the owner becomes active (unless --force).
+  deploy [--force]         Copy the last successful build to C:\kairo\bin\<build-id>, point
+                           C:\kairo\bin\current at it, restart the watch agent, keep 3 builds.
+  rollback [BUILD-ID] [--force]
+                           Point C:\kairo\bin\current at the previous (or the named) build.
+  run JOB [--no-wait | --wait SECONDS] [--tail N] [--force]
+                           JOB is a job file or a preset in tools/mac/jobs (e.g. hello). Writes
+                           C:\kairo\jobs\next.json, starts \Kairo\Run, waits for the result
+                           (default: max_seconds + 30 s) and prints it with the job's output.
+  logs [ID] [--tail N] [--force]
+                           List the newest job and build results, or show one id's result and logs.
+  cli ping|keys [--pipe NAME] [--force]
+                           Run kairo-cli on the PC (it talks to kairo-hello over its named pipe).
+  ssh                      Interactive shell on the PC (cmd.exe; type pwsh for PowerShell 7), for
+                           people (not while the owner plays).
+  help                     This text.
+
+Exit codes: 0 ok, 1 failed, 2 usage or bad input, 3 refused: PC busy, 4 refused: busy state unknown,
+            5 job still running when the wait ended, 6 job stopped by kairo-devrun (time limit or
+            owner input), 255 ssh could not connect.
+Environment: KAIRO_PC (ssh alias, default kairo-pc), KAIRO_PC_KEY (default ~/.ssh/kairo_pc),
+             KAIRO_PC_PWSH (PowerShell 7 on the PC, default
+             C:\Program Files\PowerShell\7\pwsh.exe).
+EOF
+}
+
+cmd_status() {
+    local json=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --json) json=1 ;;
+        *) usage_error "status: unknown option $1" ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool Json "$json"
+    run_ps status
+}
+
+cmd_doctor() {
+    local use_local=0 presentmon=0 compress=0 file encoded
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --local) use_local=1 ;;
+        --test-presentmon) presentmon=1 ;;
+        --compress) compress=1 ;;
+        *) usage_error "doctor: unknown option $1" ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool TestPresentMon "$presentmon"
+    pre_bool Compress "$compress"
+    if [ "$use_local" = 1 ]; then
+        file="$REPO_ROOT/tools/pc/doctor.ps1"
+        [ -f "$file" ] || die "there is no $file on the Mac"
+        encoded=$(/usr/bin/base64 <"$file" | tr -d '\n') || die "could not read $file"
+        [ -n "$encoded" ] || die "$file is empty"
+        pre_str LocalB64 "$encoded"
+    fi
+    run_ps run-doctor
+}
+
+# --- sync ---------------------------------------------------------------------------------
+SNAP_SHA=''
+SNAP_DESC=''
+
+check_untracked_sizes() { # refuse to ship big untracked files by accident (clips, dumps, archives)
+    local allow=$1 file size big=''
+    while IFS= read -r -d '' file; do
+        [ -f "$file" ] || continue
+        size=$(stat -f %z "$file" 2>/dev/null) || continue
+        if [ "$size" -gt "$MAX_UNTRACKED_BYTES" ]; then
+            big="$big  $file ($((size / 1048576)) MiB)$NL"
+        fi
+    done < <(git ls-files --others --exclude-standard -z)
+    [ -n "$big" ] || return 0
+    if [ "$allow" = 1 ]; then
+        err "sending large untracked files (--allow-large):$NL$big"
+    else
+        die "refusing to send untracked files over 50 MiB; add them to .gitignore or use --allow-large:$NL$big"
+    fi
+}
+
+make_snapshot() {
+    # A commit of index + working tree + untracked files that are not ignored, built in a copy of
+    # the index. It is a loose object only: no branch, ref, index or stash entry changes.
+    # Author and date are fixed, so an unchanged tree gives the same commit id every time.
+    local tmp index real_index tree head date changed
+    tmp=$(make_temp dir) || return 1
+    register_temp "$tmp"
+    index="$tmp/index"
+    real_index=$(git rev-parse --git-path index) || return 1
+    case "$real_index" in /*) ;; *) real_index="$REPO_ROOT/$real_index" ;; esac
+    if [ -f "$real_index" ]; then
+        cp "$real_index" "$index" || return 1
+    fi
+    GIT_INDEX_FILE="$index" git add -A -- . || return 1
+    tree=$(GIT_INDEX_FILE="$index" git write-tree) || return 1
+    if head=$(git rev-parse --verify -q 'HEAD^{commit}'); then
+        if [ "$(git rev-parse "$head^{tree}")" = "$tree" ]; then
+            SNAP_SHA=$head
+            SNAP_DESC="HEAD $(git rev-parse --short=12 HEAD), no uncommitted changes"
+            return 0
+        fi
+        date="$(git log -1 --format=%ct "$head") +0000"
+        SNAP_SHA=$(GIT_AUTHOR_NAME='Kairo pc sync' GIT_AUTHOR_EMAIL='pc-sync@kairo.invalid' GIT_AUTHOR_DATE="$date" \
+            GIT_COMMITTER_NAME='Kairo pc sync' GIT_COMMITTER_EMAIL='pc-sync@kairo.invalid' GIT_COMMITTER_DATE="$date" \
+            git commit-tree --no-gpg-sign "$tree" -p "$head" -m "pc-sync snapshot: $head plus uncommitted changes") || return 1
+        changed=$(git diff --name-only "$head" "$SNAP_SHA" | wc -l | tr -d ' ')
+        SNAP_DESC="HEAD $(git rev-parse --short=12 HEAD) + $changed changed file(s)"
+    else
+        date='1700000000 +0000'
+        SNAP_SHA=$(GIT_AUTHOR_NAME='Kairo pc sync' GIT_AUTHOR_EMAIL='pc-sync@kairo.invalid' GIT_AUTHOR_DATE="$date" \
+            GIT_COMMITTER_NAME='Kairo pc sync' GIT_COMMITTER_EMAIL='pc-sync@kairo.invalid' GIT_COMMITTER_DATE="$date" \
+            git commit-tree --no-gpg-sign "$tree" -m "pc-sync snapshot (no commits yet)") || return 1
+        SNAP_DESC="no commits yet"
+    fi
+}
+
+git_push_snapshot() {
+    # updateInstead on the PC checks the pushed commit out, provided its working tree is clean.
+    GIT_SSH_COMMAND="'$SELF'" GIT_SSH_VARIANT=simple KAIRO_PC_GIT_SSH=1 GIT_TERMINAL_PROMPT=0 \
+        git push --no-verify --no-follow-tags --no-signed --no-recurse-submodules \
+        "$PC_HOST:$PC_SRC_GIT" "+$1:refs/heads/snapshot"
+}
+
+send_bundle() { # send_bundle <sha> <PC head or empty>: git bundle + scp (the fallback)
+    local sha=$1 pc_head=$2 tmp objects exclude=''
+    tmp=$(make_temp dir) || return 1
+    register_temp "$tmp"
+    # A throwaway bare repository that borrows this repository's objects, so the bundle can
+    # name the snapshot without creating any ref here.
+    objects="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/objects" || return 1
+    git init -q --bare --template= "$tmp/repo" || return 1
+    printf '%s\n' "$objects" >"$tmp/repo/objects/info/alternates" || return 1
+    git -C "$tmp/repo" update-ref refs/heads/snapshot "$sha" || return 1
+    if [ -n "$pc_head" ] && git -C "$tmp/repo" cat-file -e "$pc_head^{commit}" 2>/dev/null; then
+        exclude="^$pc_head"
+    fi
+    if [ -n "$exclude" ]; then
+        git -C "$tmp/repo" bundle create -q "$tmp/kairo-sync.bundle" refs/heads/snapshot "$exclude" || return 1
+    else
+        git -C "$tmp/repo" bundle create -q "$tmp/kairo-sync.bundle" refs/heads/snapshot || return 1
+    fi
+    say "sending a git bundle ($(($(stat -f %z "$tmp/kairo-sync.bundle") / 1024)) KiB) with scp"
+    ensure_agent_key
+    "$SCP" "${SCP_OPTS[@]}" "$tmp/kairo-sync.bundle" "$PC_HOST:$PC_BUNDLE_SCP" || {
+        err "scp of the bundle to $PC_HOST:$PC_BUNDLE_SCP failed"
+        return 1
+    }
+}
+
+cmd_sync() {
+    local force=0 mode=auto allow_large=0 pc_head pc_branch pc_dirty pc_deny method='' short rc
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        --bundle) mode=bundle ;;
+        --allow-large) allow_large=1 ;;
+        *) usage_error "sync: unknown option $1" ;;
+        esac
+        shift
+    done
+    cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$REPO_ROOT is not a git working tree"
+
+    check_untracked_sizes "$allow_large"
+    make_snapshot || die "could not build the snapshot commit"
+    short=$(printf '%s' "$SNAP_SHA" | cut -c1-12)
+    say "snapshot $short ($SNAP_DESC)"
+
+    pre_reset
+    pre_bool Force "$force"
+    run_ps sync-pre
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    pc_head=$(kv_get head)
+    pc_branch=$(kv_get branch)
+    pc_dirty=$(kv_get dirty)
+    pc_deny=$(kv_get deny)
+
+    if [ "$pc_head" = "$SNAP_SHA" ] && [ "$pc_branch" = refs/heads/snapshot ] && [ "$pc_dirty" = 0 ]; then
+        say "C:\\kairo\\src is already at $short on branch snapshot with a clean tree: nothing to send"
+        return 0
+    fi
+
+    pre_reset
+    pre_str Sha "$SNAP_SHA"
+    if [ "$pc_head" = "$SNAP_SHA" ]; then
+        say "the PC already has $short; resetting its working tree"
+        method=reset
+    else
+        if [ "$mode" = auto ] && [ "$pc_dirty" = 1 ]; then
+            say "C:\\kairo\\src has local changes, which updateInstead refuses to overwrite; using the bundle"
+            mode=bundle
+        fi
+        if [ "$mode" = auto ] && [ "$pc_deny" != updateInstead ]; then
+            say "C:\\kairo\\src does not have receive.denyCurrentBranch=updateInstead ('$pc_deny'); using the bundle"
+            mode=bundle
+        fi
+        if [ "$mode" = auto ]; then
+            if git_push_snapshot "$SNAP_SHA"; then
+                method=push
+            else
+                err "git push to the PC failed; falling back to git bundle + scp"
+            fi
+        fi
+        if [ -z "$method" ]; then
+            send_bundle "$SNAP_SHA" "$pc_head" || die "the bundle fallback failed too"
+            pre_str Bundle "$PC_BUNDLE_WIN"
+            method=bundle
+        fi
+    fi
+    run_ps sync-apply
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    say "synced $short to $PC_HOST:C:\\kairo\\src (branch snapshot) via $method"
+}
+
+# --- build, deploy, rollback --------------------------------------------------------------
+cmd_build() {
+    local force=0 tail='' packages=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        -p | --package)
+            need_value "$1" $#
+            is_package "$2" || usage_error "build: not a package name: $2"
+            packages[${#packages[@]}]=$2
+            shift
+            ;;
+        --tail)
+            need_value "$1" $#
+            is_uint "$2" || usage_error "build: --tail needs a number"
+            tail=$2
+            shift
+            ;;
+        *) usage_error "build: unknown option $1" ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool Force "$force"
+    [ -z "$tail" ] || pre_int Tail "$tail"
+    pre_list Packages ${packages[@]+"${packages[@]}"}
+    run_ps build
+}
+
+cmd_deploy() {
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        *) usage_error "deploy: unknown option $1" ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool Force "$force"
+    run_ps deploy
+}
+
+cmd_rollback() {
+    local force=0 to=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        -*) usage_error "rollback: unknown option $1" ;;
+        *)
+            [ -z "$to" ] || usage_error "rollback: name at most one build"
+            is_build_id "$1" || usage_error "rollback: not a build id (yyyyMMdd-HHmmss-<commit>): $1"
+            to=$1
+            ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool Force "$force"
+    [ -z "$to" ] || pre_str To "$to"
+    run_ps rollback
+}
+
+# --- run ----------------------------------------------------------------------------------
+JOB_ID=''
+JOB_MAX=''
+
+# Mirrors crates/kairo-core/src/job.rs, so a bad job fails here before anything is sent.
+# shellcheck disable=SC2016 # a jq program: its $extra must not expand
+JQ_JOB_CHECK='
+def fail(m): error("job: " + m);
+if type != "object" then fail("must be a JSON object") else . end
+| (keys - ["id", "cmd", "cwd", "max_seconds", "abort_on_input", "window"]) as $extra
+| if ($extra | length) > 0 then fail("unknown field(s) " + ($extra | join(", ")) + " (kairo-devrun rejects them)") else . end
+| if (has("id") and has("cmd") and has("max_seconds")) | not then fail("id, cmd and max_seconds are required") else . end
+| if (.id | type) != "string" or (.id | test("\\A[A-Za-z0-9_-]{1,64}\\z") | not) then fail("id must match ^[A-Za-z0-9_-]{1,64}$") else . end
+| if (.cmd | type) != "array" or (.cmd | length) == 0 or ([.cmd[] | type] | unique) != ["string"] then fail("cmd must be a non-empty list of strings") else . end
+| if .cmd[0] == "" then fail("cmd starts with an empty program") else . end
+| if ([.cmd[] | explode | any(. < 32)] | any) then fail("cmd entries must not contain control characters") else . end
+| if (.max_seconds | type) != "number" or .max_seconds != (.max_seconds | floor) or .max_seconds < 1 or .max_seconds > 86400 then fail("max_seconds must be a whole number from 1 to 86400") else . end
+| if has("cwd") and .cwd != null and ((.cwd | type) != "string" or .cwd == "" or (.cwd | explode | any(. < 32))) then fail("cwd must be null or a folder") else . end
+| if has("abort_on_input") and (.abort_on_input | type) != "boolean" then fail("abort_on_input must be true or false") else . end
+| if has("window") and .window != "visible" and .window != "hidden" then fail("window must be \"visible\" or \"hidden\"") else . end
+| "\(.id) \(.max_seconds)"
+'
+
+resolve_job() { # a job file path, or a preset name from tools/mac/jobs
+    if [ -f "$1" ]; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+    if is_job_id "$1" && [ -f "$JOBS_DIR/$1.json" ]; then
+        printf '%s\n' "$JOBS_DIR/$1.json"
+        return 0
+    fi
+    local presets='' preset
+    for preset in "$JOBS_DIR"/*.json; do
+        [ -f "$preset" ] || continue
+        preset=${preset##*/}
+        presets="$presets${presets:+ }${preset%.json}"
+    done
+    err "run: no job file '$1' and no such preset (presets: ${presets:-none})"
+    return 1
+}
+
+check_job_file() {
+    local file=$1 size out
+    size=$(stat -f %z "$file" 2>/dev/null) || die "cannot read $file"
+    [ "$size" -le 65536 ] || die "the job file is larger than 64 KiB: $file" 2
+    if [ ! -x /usr/bin/jq ]; then
+        err "note: /usr/bin/jq is missing, so the job is only checked on the PC"
+        JOB_ID='?'
+        return 0
+    fi
+    out=$(/usr/bin/jq -r "$JQ_JOB_CHECK" "$file" 2>&1) || die "$(printf '%s' "$out" | sed 's/^jq: error (at [^)]*): //') ($file)" 2
+    JOB_ID=${out%% *}
+    JOB_MAX=${out#* }
+    is_job_id "$JOB_ID" || die "job: bad id in $file" 2
+}
+
+cmd_run() {
+    local force=0 wait='' no_wait=0 tail='' spec='' file encoded
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        --no-wait) no_wait=1 ;;
+        --wait)
+            need_value "$1" $#
+            is_uint "$2" || usage_error "run: --wait needs a number of seconds"
+            wait=$2
+            shift
+            ;;
+        --tail)
+            need_value "$1" $#
+            is_uint "$2" || usage_error "run: --tail needs a number"
+            tail=$2
+            shift
+            ;;
+        -*) usage_error "run: unknown option $1" ;;
+        *)
+            [ -z "$spec" ] || usage_error "run: name one job"
+            spec=$1
+            ;;
+        esac
+        shift
+    done
+    [ -n "$spec" ] || usage_error "run: name a job file or a preset (e.g. hello)"
+    file=$(resolve_job "$spec") || exit 2
+    check_job_file "$file"
+    encoded=$(/usr/bin/base64 <"$file" | tr -d '\n') || die "cannot read $file"
+    pre_reset
+    pre_bool Force "$force"
+    pre_str JobB64 "$encoded"
+    if [ "$no_wait" = 1 ]; then
+        pre_int Wait 0
+    elif [ -n "$wait" ]; then
+        pre_int Wait "$wait"
+    fi
+    [ -z "$tail" ] || pre_int Tail "$tail"
+    say "job $JOB_ID from ${file#"$REPO_ROOT"/}${JOB_MAX:+ (max_seconds $JOB_MAX)}"
+    run_ps run
+}
+
+# --- logs, cli, ssh ------------------------------------------------------------------------
+cmd_logs() {
+    local force=0 tail='' id=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        --tail)
+            need_value "$1" $#
+            is_uint "$2" || usage_error "logs: --tail needs a number"
+            tail=$2
+            shift
+            ;;
+        -*) usage_error "logs: unknown option $1" ;;
+        *)
+            [ -z "$id" ] || usage_error "logs: name one id"
+            is_job_id "$1" || usage_error "logs: an id matches ^[A-Za-z0-9_-]{1,64}$: $1"
+            id=$1
+            ;;
+        esac
+        shift
+    done
+    pre_reset
+    pre_bool Force "$force"
+    [ -z "$id" ] || pre_str Id "$id"
+    [ -z "$tail" ] || pre_int Tail "$tail"
+    run_ps logs
+}
+
+cmd_cli() {
+    local force=0 sub='' pipe=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        --pipe)
+            need_value "$1" $#
+            is_pipe_name "$2" || usage_error "cli: not a pipe name: $2"
+            pipe=$2
+            shift
+            ;;
+        ping | keys)
+            [ -z "$sub" ] || usage_error "cli: name one command"
+            sub=$1
+            ;;
+        *) usage_error "cli: unknown argument $1 (use ping or keys)" ;;
+        esac
+        shift
+    done
+    [ -n "$sub" ] || usage_error "cli: name a command: ping or keys"
+    pre_reset
+    pre_bool Force "$force"
+    if [ -n "$pipe" ]; then
+        pre_list CliArgs "$sub" --pipe "$pipe"
+    else
+        pre_list CliArgs "$sub"
+    fi
+    run_ps cli
+}
+
+cmd_ssh() {
+    [ $# -eq 0 ] || usage_error "ssh takes no arguments; use the verbs for scripted work"
+    ensure_agent_key
+    exec "$SSH" -t -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$KEY_FILE" "$PC_HOST"
+}
+
+# ------------------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------------------
+if [ "${KAIRO_PC_GIT_SSH:-}" = 1 ]; then
+    git_ssh_transport "$@"
+    exit $?
+fi
+
+[ $# -gt 0 ] || {
+    usage
+    exit 2
+}
+verb=$1
+shift
+case "$verb" in
+status) cmd_status "$@" ;;
+doctor) cmd_doctor "$@" ;;
+sync) cmd_sync "$@" ;;
+build) cmd_build "$@" ;;
+deploy) cmd_deploy "$@" ;;
+rollback) cmd_rollback "$@" ;;
+run) cmd_run "$@" ;;
+logs) cmd_logs "$@" ;;
+cli) cmd_cli "$@" ;;
+ssh) cmd_ssh "$@" ;;
+help | -h | --help) usage ;;
+*) usage_error "unknown verb: $verb" ;;
+esac
+exit $?

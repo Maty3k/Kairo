@@ -1,0 +1,46 @@
+# Kairo workspace (docs/PLAN.md §2.11; layout: docs/research/15-implementation-cookbook.md §1).
+# M0 crates: kairo-core (shared contract, tested everywhere) and the PC-side dev-loop tools.
+# The research prototypes under docs/research/prototypes/ are standalone and not members.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/kairo-core",
+    "crates/kairo-devrun",
+    "crates/kairo-hello",
+    "crates/kairo-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Maty3k/Kairo"
+publish = false
+
+# Exact pins (docs/PLAN.md §2.11 and Appendix A). Crates use them with `workspace = true`,
+# which cargo-deny also requires. Checked on crates.io on 2026-10-21; all MIT OR Apache-2.0.
+[workspace.dependencies]
+kairo-core = { path = "crates/kairo-core" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+# Each crate enables only the Win32 features it uses.
+windows = "=0.62.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# House rules (docs/PLAN.md §2.11, Appendix A): `// SAFETY:` on every unsafe block and
+# no unwrap on runtime paths. clippy.toml still allows unwrap and expect in tests.
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.dev]
+# docs/PLAN.md §3.1: smaller debug info for the 8 GB Mac and faster PC builds.
+debug = "line-tables-only"
