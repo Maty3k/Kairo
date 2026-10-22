@@ -336,6 +336,16 @@ function Invoke-Git([string[]]$GitArgs) {
     return (Invoke-Native -Exe $GitExe -Arguments $GitArgs)
 }
 
+$IcaclsExe = Join-Path $env:SystemRoot 'System32\icacls.exe'
+
+function Set-AdminOwner([string]$Path) {
+    # Administrators own everything in C:\kairo that elevated sessions run or trust (docs/milestones/M0.md):
+    # depending on a Windows policy, new files of an elevated session belong to the owner's account instead,
+    # and an owner can always rewrite a file's permissions.
+    $r = Invoke-Native -Exe $IcaclsExe -Arguments @($Path, '/setowner', '*S-1-5-32-544', '/T', '/C', '/Q')
+    if ($r.Code -ne 0) { Fail ('could not make Administrators the owner of ' + $Path + ': ' + $r.Text) }
+}
+
 function Get-FirstLine($Result) {
     if ($Result.Code -ne 0 -or $Result.Lines.Count -eq 0) { return '' }
     return ([string]$Result.Lines[0]).Trim()

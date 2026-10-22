@@ -46,7 +46,6 @@ $SshdBlockBegin    = '# BEGIN Kairo (tools/pc/bootstrap.ps1)'
 $SidAdministrators = 'S-1-5-32-544'
 $SidSystem         = 'S-1-5-18'
 $SidUsers          = 'S-1-5-32-545'
-$SidOwnerRights    = 'S-1-3-4'
 $SidPerfLogUsers   = 'S-1-5-32-559'
 $GitConfigFile     = 'C:\kairo\tools\gitconfig'
 $CargoGuardDir     = Join-Path $env:SystemDrive '.cargo'
@@ -263,7 +262,6 @@ function Get-KairoAclProblem([string] $OwnerSid) {
     $root[$SidAdministrators] = $RightsFull
     $root[$SidSystem] = $RightsFull
     $root[$OwnerSid] = $RightsRead
-    $root[$SidOwnerRights] = $RightsRead
     $problem = Get-FolderAclProblem -Path $KairoRoot -Explicit $root -Protected
     if ($problem) { return $problem }
     foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
@@ -282,22 +280,18 @@ function Get-KairoAclProblem([string] $OwnerSid) {
 function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
 
 function Test-AdminOnlyFile([string] $Path) {
-    # True if only Administrators and SYSTEM (and TrustedInstaller) can change the file: no other entry grants a
-    # write right, and a file owned by someone else carries an OWNER RIGHTS entry, so its owner cannot rewrite
-    # its permissions. TODO(verify) on the PC: files the elevated bootstrap created inherit that entry.
+    # True if only Administrators and SYSTEM (and TrustedInstaller) can change the file: one of them owns it (an
+    # owner can always rewrite a file's permissions), and no other entry grants a write right.
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $acl = Get-Acl -LiteralPath $Path
     $admins = @($SidAdministrators, $SidSystem, 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $writeBits = 852310   # write data, append, write EA, delete child, write attributes, DELETE, WRITE_DAC, WRITE_OWNER
-    $hasOwnerRights = $false
     foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
         if ([string] $rule.AccessControlType -ne 'Allow') { continue }
         $sid = $rule.IdentityReference.Value
-        if ($sid -eq $SidOwnerRights) { $hasOwnerRights = $true }
         if (($admins -notcontains $sid) -and (((Get-FileRights $rule) -band $writeBits) -ne 0)) { return $false }
     }
-    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    return (($admins -contains $owner) -or $hasOwnerRights)
+    return ($admins -contains $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value)
 }
 
 function Test-PrivateIPv4([string] $Address) {

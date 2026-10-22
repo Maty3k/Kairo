@@ -130,6 +130,29 @@ jobs:
           if ($code -eq 0) { throw 'a login without a key succeeded' }
           if ($methods.Count -eq 0 -or @($methods | Where-Object { $_ -ne 'publickey' }).Count -gt 0) { throw ('sshd offers more than publickey: {0}' -f ($methods -join ' | ')) }
 
+      - name: Administrators own C:\kairo (all but logs and state)
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($p in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\src\.git\config', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\tools', 'C:\kairo\tools\gitconfig', 'C:\kairo\tools\ffmpeg\bin\ffmpeg.exe') {
+            $owner = (Get-Acl -LiteralPath $p).Owner
+            Write-Host "$p -> $owner"
+            if ($owner -ne 'BUILTIN\Administrators') { Write-Host "::error::$p is owned by $owner"; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+      # The owner's PC after the first bootstrap version: an OWNER RIGHTS entry on C:\kairo (which
+      # .NET cannot see), and, on Windows 11, files of elevated windows that belong to the user.
+      - name: Make the tree look like the owner's PC after the first bootstrap version
+        shell: powershell
+        run: |
+          icacls C:\kairo /grant '*S-1-3-4:(OI)(CI)RX'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig /setowner $env:USERNAME
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo
+          Write-Host ('gitconfig owner: ' + (Get-Acl C:\kairo\tools\gitconfig).Owner)
+
       - name: Bootstrap, second run (everything already in place)
         shell: powershell
         working-directory: ${{ runner.temp }}
@@ -140,6 +163,8 @@ jobs:
           $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
           $bad = @($r.steps | Where-Object { -not $_.ok })
           foreach ($s in $bad) { Write-Host "::error::second run: $($s.step): $($s.detail)" }
+          $owner = (Get-Acl C:\kairo\tools\gitconfig).Owner
+          if ($owner -ne 'BUILTIN\Administrators') { Write-Host "::error::second run left gitconfig owned by $owner"; exit 1 }
           if ($bad.Count -gt 0) { exit 1 }
 
       - name: doctor.ps1 after the bootstrap

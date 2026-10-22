@@ -76,7 +76,6 @@ $SshdBlockEnd      = '# END Kairo'
 $SidAdministrators = 'S-1-5-32-544'
 $SidSystem         = 'S-1-5-18'
 $SidUsers          = 'S-1-5-32-545'
-$SidOwnerRights    = 'S-1-3-4'        # OWNER RIGHTS: replaces an owner's implicit READ_CONTROL and WRITE_DAC
 $SidPerfLogUsers   = 'S-1-5-32-559'
 # Git settings for Claude's elevated SSH sessions (GIT_CONFIG_GLOBAL in tools/mac/remote), in a folder only
 # administrators can change: those sessions never read your own .gitconfig.
@@ -1075,8 +1074,7 @@ function Initialize-KairoTree([string] $OwnerSid) {
     # C:\kairo (docs/milestones/M0.md): Administrators and SYSTEM have full control and own everything; you can
     # read and run it all, but your own programs (kairo-devrun, kairo-hello, the watch agent) write only in logs
     # and state. So nothing running as you can change what Claude's elevated SSH sessions run or trust (builds,
-    # scripts, Git settings, FFmpeg). The OWNER RIGHTS entry stops a file's owner from rewriting its permissions,
-    # which matters because UAC makes you the owner of files this elevated window creates.
+    # scripts, Git settings, FFmpeg). Set-KairoOwnership keeps Administrators the owner of what later steps add.
     $existed = Test-Path -LiteralPath $KairoRoot
     if ($existed) {
         if (Test-KairoAcl $OwnerSid) {
@@ -1106,7 +1104,7 @@ function Initialize-KairoTree([string] $OwnerSid) {
     } else {
         # Created with its final permissions in one call: inheriting from C:\ would give every signed-in user
         # Modify on it until icacls ran.
-        $sddl = 'D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;{0})(A;OICI;0x1200a9;;;{1})' -f $OwnerSid, $SidOwnerRights
+        $sddl = 'D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;{0})' -f $OwnerSid
         $security = New-Object System.Security.AccessControl.DirectorySecurity
         $security.SetSecurityDescriptorSddlForm($sddl)
         $null = [System.IO.Directory]::CreateDirectory($KairoRoot, $security)
@@ -1118,8 +1116,8 @@ function Initialize-KairoTree([string] $OwnerSid) {
     }
     Invoke-Icacls @($KairoRoot, '/inheritance:r',
         '/grant:r', ('*{0}:(OI)(CI)F' -f $SidAdministrators), '/grant:r', ('*{0}:(OI)(CI)F' -f $SidSystem),
-        '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/grant:r', ('*{0}:(OI)(CI)RX' -f $SidOwnerRights), '/C', '/Q')
-    $allowed = @($SidAdministrators, $SidSystem, $OwnerSid, $SidOwnerRights)
+        '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/C', '/Q')
+    $allowed = @($SidAdministrators, $SidSystem, $OwnerSid)
     $acl = Get-Acl -LiteralPath $KairoRoot
     foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
         $sid = $rule.IdentityReference.Value
@@ -1146,7 +1144,6 @@ function Get-KairoAclProblem([string] $OwnerSid) {
     $root[$SidAdministrators] = $RightsFull
     $root[$SidSystem] = $RightsFull
     $root[$OwnerSid] = $RightsRead
-    $root[$SidOwnerRights] = $RightsRead
     $problem = Get-FolderAclProblem -Path $KairoRoot -Explicit $root -Protected
     if ($problem) { return $problem }
     foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
@@ -1163,6 +1160,28 @@ function Get-KairoAclProblem([string] $OwnerSid) {
 }
 
 function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
+
+function Set-KairoOwnership {
+    # Administrators own everything in C:\kairo but logs and state (docs/milestones/M0.md). Depending on a Windows
+    # policy, files an elevated window creates belong to Administrators or to your account, and an owner can always
+    # rewrite a file's permissions; so this runs after the steps that add files (Git settings, the code folder,
+    # FFmpeg, PresentMon). icacls /T follows links, so only while C:\kairo has none but bin\current.
+    $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
+    if ($links.Count -gt 0) {
+        throw ('C:\kairo contains links that may point outside it ({0}), so the owner was left as it is. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '))
+    }
+    Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/C', '/Q')
+    foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
+        Invoke-Icacls @($d, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
+    }
+    # icacls fails on any file it could not change; these spot checks cover what the doctor checks too.
+    foreach ($p in @($KairoRoot, $SrcDir, $BinDir, $JobsDir, $ToolsDir, $GitConfigFile)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $owner = (Get-Acl -LiteralPath $p).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne $SidAdministrators) { throw ('{0} is still owned by {1}, not Administrators.' -f $p, (Resolve-SidName $owner)) }
+    }
+    return 'Administrators own C:\kairo and everything in src, bin, jobs and tools'
+}
 
 function Install-Git {
     if (Get-GitExe) { return ('already installed: ' + (Invoke-Native -FilePath (Get-GitExe) -ArgumentList @('--version')).Text) }
@@ -2136,6 +2155,7 @@ function Invoke-Bootstrap {
         Invoke-Step 'Download FFmpeg 9.0.2 LGPL (BtbN, SHA-256 checked)' { Assert-KairoTree; Install-Ffmpeg }
         Invoke-Step 'Download PresentMon 2.6.0 (SHA-256 checked)' { Assert-KairoTree; Install-PresentMon }
         Invoke-Step 'Set LIBCLANG_PATH and FFMPEG_DIR' { Set-BuildEnvironment }
+        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs and state)' { Assert-KairoTree; Set-KairoOwnership }
 
         # ---- 4. Report -----------------------------------------------------------------------------------------
         Write-Title 'Write C:\kairo\state\bootstrap-report.json'

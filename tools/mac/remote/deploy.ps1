@@ -60,6 +60,8 @@ $info = [ordered]@{
     files         = @($files | ForEach-Object { $_.Name })
 }
 Write-TextFileAtomic (Join-Path $destination 'build.json') ($info | ConvertTo-Json -Compress -Depth 4)
+# Elevated sessions run kairo-cli.exe from here, so your own programs must not be able to change it.
+Set-AdminOwner $destination
 
 $previous = Get-CurrentBuildId
 Set-CurrentBuild $id
