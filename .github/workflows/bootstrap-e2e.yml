@@ -129,6 +129,8 @@ jobs:
           Write-Host ('offered without a key: {0}' -f ($methods -join ' | '))
           if ($code -eq 0) { throw 'a login without a key succeeded' }
           if ($methods.Count -eq 0 -or @($methods | Where-Object { $_ -ne 'publickey' }).Count -gt 0) { throw ('sshd offers more than publickey: {0}' -f ($methods -join ' | ')) }
+          # The refused login above is the expected outcome; its exit code is not this step's.
+          exit 0
 
       - name: Administrators own C:\kairo (all but logs and state)
         shell: powershell
