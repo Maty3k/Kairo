@@ -145,6 +145,14 @@ function ConvertTo-Sid([string] $Account) {
     }
 }
 
+function Resolve-SidName([string] $Sid) {
+    try {
+        return (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    } catch {
+        return $Sid
+    }
+}
+
 function Get-KeyFingerprint([string] $Base64) {
     try {
         $sha = New-Object System.Security.Cryptography.SHA256Managed
@@ -207,53 +215,71 @@ function Get-FileRights($Rule) {
     return ($m -band 2032127)
 }
 
-function Test-FolderAcl {
-    # Same as bootstrap.ps1: a real folder owned by Administrators whose explicit entries are exactly $Explicit.
+function Get-FolderAclProblem {
+    # '' if $Path is a real folder (not a link) owned by Administrators whose explicit entries are exactly
+    # $Explicit (SID -> access mask, each for the folder and everything below it); otherwise the first difference,
+    # in words. With -Protected nothing is inherited from the parent; without it the folder inherits and may add
+    # only the entries in $Explicit.
     param([string] $Path, [hashtable] $Explicit, [switch] $Protected)
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return ('{0} is missing' -f $Path) }
     $item = Get-Item -LiteralPath $Path -Force
-    if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return ('{0} is a link' -f $Path) }
     $acl = Get-Acl -LiteralPath $Path
-    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $SidAdministrators) { return $false }
-    if ([bool] $acl.AreAccessRulesProtected -ne [bool] $Protected) { return $false }
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne $SidAdministrators) { return ('{0} is owned by {1}, not Administrators' -f $Path, (Resolve-SidName $owner)) }
+    if ([bool] $acl.AreAccessRulesProtected -ne [bool] $Protected) {
+        if ($Protected) { return ('{0} inherits permissions from its parent folder' -f $Path) }
+        return ('{0} does not inherit the permissions of its parent folder' -f $Path)
+    }
     $coverage = @{}
     foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
         $sid = $rule.IdentityReference.Value
-        if (-not $Explicit.ContainsKey($sid)) { return $false }
-        if ([string] $rule.AccessControlType -ne 'Allow') { return $false }
-        if ((Get-FileRights $rule) -ne $Explicit[$sid]) { return $false }
+        $rights = Get-FileRights $rule
+        $entry = '{0}: {1} {2} 0x{3:X} ({4}; {5})' -f $Path, $rule.AccessControlType, (Resolve-SidName $sid), $rights, $rule.InheritanceFlags, $rule.PropagationFlags
+        if ((-not $Explicit.ContainsKey($sid)) -or ([string] $rule.AccessControlType -ne 'Allow')) { return ('unexpected entry ' + $entry) }
+        if ($rights -ne $Explicit[$sid]) { return ('entry {0}, expected 0x{1:X}' -f $entry, $Explicit[$sid]) }
         if (-not $coverage.ContainsKey($sid)) { $coverage[$sid] = @{ Here = $false; Down = $false } }
         $propagation = [int] $rule.PropagationFlags
-        if (($propagation -band 2) -eq 0) { $coverage[$sid].Here = $true }
+        if (($propagation -band 2) -eq 0) { $coverage[$sid].Here = $true }                  # not InheritOnly
         $inherit = [int] $rule.InheritanceFlags
         if ((($inherit -band 3) -eq 3) -and (($propagation -band 1) -eq 0)) { $coverage[$sid].Down = $true }
     }
     foreach ($sid in @($Explicit.Keys)) {
-        if (-not $coverage.ContainsKey($sid)) { return $false }
-        if (-not ($coverage[$sid].Here -and $coverage[$sid].Down)) { return $false }
+        if (-not $coverage.ContainsKey($sid)) { return ('{0}: no entry for {1}' -f $Path, (Resolve-SidName $sid)) }
+        if (-not ($coverage[$sid].Here -and $coverage[$sid].Down)) { return ('{0}: the entry for {1} does not cover the folder and everything in it' -f $Path, (Resolve-SidName $sid)) }
     }
-    return $true
+    return ''
 }
 
-function Test-KairoAcl([string] $OwnerSid) {
-    # Same layout as bootstrap.ps1: C:\kairo protected and owned by Administrators; Administrators and SYSTEM full
-    # control, you and OWNER RIGHTS read and run; logs and state add Modify for you; nothing else anywhere.
+function Test-FolderAcl {
+    param([string] $Path, [hashtable] $Explicit, [switch] $Protected)
+    return ((Get-FolderAclProblem -Path $Path -Explicit $Explicit -Protected:$Protected) -eq '')
+}
+
+function Get-KairoAclProblem([string] $OwnerSid) {
+    # '' if C:\kairo has the layout Initialize-KairoTree makes (bootstrap.ps1 and doctor.ps1 check the same);
+    # otherwise the first difference.
     $root = @{}
     $root[$SidAdministrators] = $RightsFull
     $root[$SidSystem] = $RightsFull
     $root[$OwnerSid] = $RightsRead
     $root[$SidOwnerRights] = $RightsRead
-    if (-not (Test-FolderAcl -Path $KairoRoot -Explicit $root -Protected)) { return $false }
+    $problem = Get-FolderAclProblem -Path $KairoRoot -Explicit $root -Protected
+    if ($problem) { return $problem }
     foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
-        if (-not (Test-FolderAcl -Path $d -Explicit @{})) { return $false }
+        $problem = Get-FolderAclProblem -Path $d -Explicit @{}
+        if ($problem) { return $problem }
     }
     $writable = @{}
     $writable[$OwnerSid] = $RightsModify
     foreach ($d in @($LogsDir, $StateDir)) {
-        if (-not (Test-FolderAcl -Path $d -Explicit $writable)) { return $false }
+        $problem = Get-FolderAclProblem -Path $d -Explicit $writable
+        if ($problem) { return $problem }
     }
-    return $true
+    return ''
 }
+
+function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
 
 function Test-AdminOnlyFile([string] $Path) {
     # True if only Administrators and SYSTEM (and TrustedInstaller) can change the file: no other entry grants a
@@ -819,13 +845,14 @@ function Invoke-Doctor {
     }
 
     Invoke-Section 'kairo' {
-        $res = [ordered]@{ folders = [ordered]@{}; acl_ok = $null; current = $null; builds = @(); src = $null }
+        $res = [ordered]@{ folders = [ordered]@{}; acl_ok = $null; acl_problem = $null; current = $null; builds = @(); src = $null }
         foreach ($d in @($KairoRoot, $SrcDir, $BinDir, $JobsDir, $LogsDir, $ToolsDir, $StateDir)) {
             $res.folders[$d] = (Test-Path -LiteralPath $d)
             if (-not $res.folders[$d]) { Add-Problem ('{0} is missing' -f $d) }
         }
-        $res.acl_ok = Test-KairoAcl $MeSid
-        if (-not $res.acl_ok) { Add-Problem 'C:\kairo permissions differ from the M0 layout (Administrators and SYSTEM full control and owner; you read, and write only logs and state): run the bootstrap again' }
+        $res.acl_problem = Get-KairoAclProblem $MeSid
+        $res.acl_ok = ($res.acl_problem -eq '')
+        if (-not $res.acl_ok) { Add-Problem ('C:\kairo permissions differ from the M0 layout (Administrators and SYSTEM full control and owner; you read, and write only logs and state): {0}. Run the bootstrap again' -f $res.acl_problem) }
 
         # The admin-only Git settings of the SSH sessions, and files elevated sessions run or trust.
         $res.git_config = [ordered]@{ path = $GitConfigFile; present = (Test-Path -LiteralPath $GitConfigFile); safe_directory = $false; admin_only = $false }
