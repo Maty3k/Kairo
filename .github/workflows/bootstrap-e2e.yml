@@ -37,14 +37,31 @@ jobs:
         with:
           persist-credentials: false
 
-      # The runner image has no winget, and the bootstrap stops without it. Microsoft's own module
-      # (PowerShell Gallery, pinned) installs it; 1.29.380 is also the owner's winget version.
+      # The runner image has no working winget, and the bootstrap stops without it. This installs
+      # Microsoft's own release v1.29.380 (also the owner's version) and its dependencies; the
+      # SHA-256 values are the GitHub release asset digests. (Repair-WinGetPackageManager fails on
+      # this image: the App Installer bundle it finds has no x64 package.)
       - name: Install winget
         shell: pwsh
         run: |
-          Install-PSResource -Name Microsoft.WinGet.Client -Version 1.29.380 -Repository PSGallery -TrustRepository -Quiet
-          Import-Module Microsoft.WinGet.Client
-          Repair-WinGetPackageManager -AllUsers -Force -Latest
+          $ProgressPreference = 'SilentlyContinue'
+          $base = 'https://github.com/microsoft/winget-cli/releases/download/v1.29.380'
+          $dir = Join-Path $env:RUNNER_TEMP 'winget'
+          $null = New-Item -ItemType Directory -Force -Path $dir
+          $files = [ordered]@{
+            'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle' = '65dea9c01ce08ee7b763366b27c0e651f97db857c11ca9b9c301826c10092f2e'
+            'DesktopAppInstaller_Dependencies.zip'                   = 'ba875afe9d190f61218985ac0292a99d1db710bf93e13c68944ca9d89f0d82d1'
+          }
+          foreach ($name in $files.Keys) {
+            & "$env:SystemRoot\System32\curl.exe" -fsSL --retry 3 -o "$dir\$name" "$base/$name"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "$dir\$name").Hash.ToLowerInvariant()
+            if ($hash -ne $files[$name]) { throw "wrong SHA-256 for ${name}: $hash" }
+          }
+          Expand-Archive -LiteralPath "$dir\DesktopAppInstaller_Dependencies.zip" -DestinationPath "$dir\deps"
+          $deps = @(Get-ChildItem -LiteralPath "$dir\deps" -Recurse -Include *.appx, *.msix | Where-Object { $_.FullName -match '(?i)x64' } | ForEach-Object FullName)
+          Write-Host ('dependencies: ' + ($deps -join ', '))
+          Add-AppxPackage -Path "$dir\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -DependencyPath $deps -ForceApplicationShutdown -ForceUpdateFromAnyVersion
           $winget = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
           & $winget --version
           if ($LASTEXITCODE -ne 0) { throw 'winget does not run' }
