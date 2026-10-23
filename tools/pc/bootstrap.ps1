@@ -53,7 +53,7 @@ $ProgressPreference = 'SilentlyContinue'
 # =============================================================================================================
 # Names from the M0 contract (docs/milestones/M0.md). Change them there first, then everywhere.
 # =============================================================================================================
-$BootstrapVersion = 'm0-2026-10-21'
+$BootstrapVersion = 'm0-2026-10-23'
 $KairoRoot  = 'C:\kairo'
 $SrcDir     = 'C:\kairo\src'
 $BinDir     = 'C:\kairo\bin'
@@ -132,6 +132,10 @@ $VsCompSdk  = 'Microsoft.VisualStudio.Component.Windows11SDK.26100'      # "Wind
 $VsProductBuildTools = 'Microsoft.VisualStudio.Product.BuildTools'
 # --override replaces winget's own switches, so it repeats --wait (bootstrapper waits for the install).
 $VsOverride = '--passive --wait --norestart --nocache --add {0} --add {1} --add {2}' -f $VsWorkload, $VsCompMsvc, $VsCompSdk
+# Visual Studio's optional usage data (its Customer Experience Improvement Program). The Build Tools don't follow
+# Windows' Diagnostics & feedback setting; Microsoft documents this policy value instead, and OptIn = 0 stops only
+# the optional data (learn.microsoft.com, "Visual Studio Customer Experience Improvement Program").
+$VsSqmPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM'
 
 # Rust (static.rust-lang.org/dist/channel-rust-1.99.1.toml, dated 2026-10-15; PLAN section 2.11 pin).
 # With -y rustup-init only warns when it cannot see Visual Studio; it never installs VS Community by itself.
@@ -191,6 +195,7 @@ $Ctx = @{
     SshdRestartPending = $false
     SshLeftOff         = $false   # a failed SSH step stopped sshd and set it to Manual (fail closed)
     TreeOk             = $false   # C:\kairo has the permissions of the M0 contract; later steps write into it only then
+    VsUsageOff         = $false   # Visual Studio's optional usage data is off; the Build Tools install waits for it
     DisabledRules      = @()
     FirewallInterfaces = @()
     SshdBackup         = $null
@@ -1216,9 +1221,21 @@ function Install-Pwsh {
     return ('PowerShell ' + (Get-Item -LiteralPath $PwshExe).VersionInfo.ProductVersion + '; telemetry off')
 }
 
+function Set-VsUsageDataOff {
+    # The owner agreed to this on 2026-10-23. Its step runs before the Build Tools step, so the installer follows it.
+    if (-not (Test-Path -LiteralPath $VsSqmPolicyKey)) { $null = New-Item -Path $VsSqmPolicyKey -Force }
+    $null = New-ItemProperty -Path $VsSqmPolicyKey -Name 'OptIn' -Value 0 -PropertyType DWord -Force
+    $read = (Get-ItemProperty -LiteralPath $VsSqmPolicyKey -Name 'OptIn').OptIn
+    if ($read -ne 0) { throw ('OptIn reads back as {0}, not 0.' -f $read) }
+    $Ctx.VsUsageOff = $true
+    return ('OptIn = 0 under {0}' -f $VsSqmPolicyKey)
+}
+
 function Install-BuildTools {
     $have = Get-VsCppPath
     if ($have) { return ('already installed: ' + $have) }
+    # The owner agreed to the install with Visual Studio's optional usage data off, so it never runs with it on.
+    if (-not $Ctx.VsUsageOff) { throw 'Not installed: Visual Studio''s optional usage data could not be switched off (see the step before). Tell Claude.' }
     Write-Note 'This is the longest step (often 10 to 25 minutes). A Visual Studio Installer window shows the progress.'
     $res = Install-WingetPackage -Id 'Microsoft.VisualStudio.BuildTools' -Override $VsOverride
     $have = Get-VsCppPath
@@ -1978,10 +1995,13 @@ function Show-Plan($Facts, $State, $OwnerInfo, $KeyInfo) {
     if (-not $State.PerfGroup) { Write-Note ('- Add {0} to the "Performance Log Users" group (lets PresentMon run without admin).' -f $OwnerInfo.Name) }
     Write-Note '- Create C:\kairo with an empty code folder C:\kairo\src. Administrators and SYSTEM have full control;'
     Write-Note '  you can read everything, and your own programs can write only C:\kairo\logs and C:\kairo\state.'
+    Write-Note '  The last step makes Administrators the owner of C:\kairo and of everything in it but logs and state.'
     Write-Note '- Create an empty C:\.cargo that only administrators can change, so no other program can plant a'
     Write-Note '  Cargo setting there that Claude''s builds would read.'
     Write-Note '- Set three system variables: LIBCLANG_PATH and FFMPEG_DIR for builds, and'
     Write-Note '  POWERSHELL_TELEMETRY_OPTOUT=1, which turns PowerShell 7''s telemetry off.'
+    Write-Note '- Switch off Visual Studio''s optional usage data (OptIn = 0 under'
+    Write-Note '  HKLM\SOFTWARE\Policies\Microsoft\VisualStudio\SQM); Windows'' privacy settings don''t cover it.'
     Write-Note '- Create three scheduled tasks in the folder "Kairo" (Run, Ensure, Engine). They do nothing until'
     Write-Note '  Claude installs Kairo''s test programs; Ensure checks once a minute and exits at once.'
     Write-Line ''
@@ -2015,6 +2035,12 @@ function Show-Done($Report) {
         foreach ($f in $failed) { Write-Host ('   - {0}: {1}' -f $f.step, $f.detail) -ForegroundColor Yellow }
         Write-Host ' Tell Claude; most problems can be fixed over SSH. Running the same command again is safe.' -ForegroundColor Yellow
     }
+    # The ATTENTION lines scrolled away during the installs; some need action even when every step passed.
+    $notes = @($Ctx.Notes)
+    if ($notes.Count -gt 0) {
+        Write-Host ' Warnings from earlier in the run (ATTENTION):' -ForegroundColor Yellow
+        foreach ($n in $notes) { Write-Host ('   - {0}' -f $n) -ForegroundColor Yellow }
+    }
     $hostKey = [string] $Report.ssh.host_key_fingerprint
     if (-not $hostKey) { $hostKey = '(missing: SSH is not set up yet)' }
     Write-Line ''
@@ -2031,8 +2057,8 @@ function Show-Done($Report) {
     if (-not $sacState) { $sacState = 'unknown' }
     Write-Line (' Smart App Control is: {0}. Tell Claude what Start > "Smart App Control" shows too (SETUP.md step 6).' -f $sacState)
     if ($ips.Count -eq 0) {
-        Write-Line ' No Private network was found: set your connection to Private (SETUP.md step 2), then tell'
-        Write-Line ' Claude the IPv4 address shown in Settings > Network & internet > your connection.'
+        Write-Line ' No Private network was found: set your connection to Private (SETUP.md step 2), then run the'
+        Write-Line ' same command again. SSH only opens on networks that were Private when the setup ran.'
     }
     if ($Ctx.Transcript) { Write-Line (' The full log is in {0}' -f $Ctx.Transcript) }
     Write-Line ''
@@ -2153,6 +2179,7 @@ function Invoke-Bootstrap {
             'all three registered for ' + $ownerInfo.Name
         }
         Invoke-Step 'Create C:\.cargo for administrators only (keeps Cargo settings away from builds)' { Initialize-CargoGuard }
+        Invoke-Step 'Switch off Visual Studio''s optional usage data (Windows'' privacy settings don''t cover it)' { Set-VsUsageDataOff }
         Invoke-Step 'Install Visual Studio Build Tools 2026 (C++ tools, Windows 11 SDK)' { Install-BuildTools }
         Invoke-Step 'Install LLVM (libclang)' { Install-Llvm }
         Invoke-Step ('Install Rust (rustup, then {0})' -f $RustToolchain) { Install-Rust }

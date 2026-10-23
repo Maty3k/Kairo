@@ -107,6 +107,27 @@ jobs:
           foreach ($s in $r.steps) { Write-Host ('{0}: {1} ({2})' -f $s.step, $s.ok, $s.detail) }
           foreach ($s in $bad) { Write-Host "::error::$($s.step): $($s.detail)" }
           if ($bad.Count -gt 0) { exit 1 }
+          $optIn = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM' -ErrorAction SilentlyContinue).OptIn
+          Write-Host "Visual Studio usage data: OptIn = $optIn"
+          if ($optIn -ne 0) { Write-Host '::error::OptIn is not 0 under HKLM\SOFTWARE\Policies\Microsoft\VisualStudio\SQM'; exit 1 }
+
+      # The runner has no Private network, so the first run prints ATTENTION lines; the DONE screen must repeat them.
+      - name: The DONE screen repeats the ATTENTION lines
+        shell: powershell
+        run: |
+          $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
+          $notes = @($r.notes)
+          if ($notes.Count -eq 0) { Write-Host '::warning::the first run printed no ATTENTION line, so this check proves nothing'; exit 0 }
+          $log = Get-ChildItem -LiteralPath 'C:\kairo\logs' -Filter 'bootstrap-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1
+          $text = Get-Content -Raw -LiteralPath $log.FullName
+          $at = $text.LastIndexOf('Warnings from earlier in the run')
+          if ($at -lt 0) { Write-Host "::error::no 'Warnings from earlier in the run' block in $($log.Name)"; exit 1 }
+          # Compare without whitespace, so a line the transcript wrapped still matches.
+          $done = $text.Substring($at) -replace '\s', ''
+          $missing = @($notes | Where-Object { $want = ([string] $_) -replace '\s', ''; -not $done.Contains($want) })
+          Write-Host ('{0} ATTENTION line(s), {1} missing from the DONE screen' -f $notes.Count, $missing.Count)
+          foreach ($n in $missing) { Write-Host "::error::not repeated on the DONE screen: $n" }
+          if ($missing.Count -gt 0) { exit 1 }
 
       - name: SSH round trip (key only, cmd.exe /d /c, pwsh -EncodedCommand as tools/mac/pc sends it)
         shell: pwsh

@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # ---- M0 contract names (docs/milestones/M0.md) ------------------------------------------------------------------
-$DoctorVersion = 'm0-2026-10-21'
+$DoctorVersion = 'm0-2026-10-23'
 $KairoRoot     = 'C:\kairo'
 $SrcDir        = 'C:\kairo\src'
 $BinDir        = 'C:\kairo\bin'
@@ -62,6 +62,7 @@ $SshShellExe       = Join-Path $env:SystemRoot 'System32\cmd.exe'
 $SshShellOption    = '/d /c'
 $SshShellArguments = '/d'
 $PwshExe           = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+$VsSqmPolicyKey    = 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM'
 $WhoamiExe         = Join-Path $env:SystemRoot 'System32\whoami.exe'
 $RustToolchain     = '1.99.1'
 $NodeMajor         = 24
@@ -559,6 +560,10 @@ function Invoke-Doctor {
         if (Test-Path -LiteralPath $PwshExe) { $t.pwsh = (Get-Item -LiteralPath $PwshExe).VersionInfo.ProductVersion } else { Add-Problem 'PowerShell 7 (MSI) is missing' }
         $t.pwsh_telemetry_optout = [Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')
         if ($t.pwsh_telemetry_optout -ne '1') { Add-Concern 'POWERSHELL_TELEMETRY_OPTOUT is not 1 machine-wide, so PowerShell 7 sends startup telemetry' }
+        $t.vs_usage_data_optin = $null
+        $vsPolicy = Get-ItemProperty -LiteralPath $VsSqmPolicyKey -Name 'OptIn' -ErrorAction SilentlyContinue
+        if ($vsPolicy) { $t.vs_usage_data_optin = $vsPolicy.OptIn }
+        if ($t.vs_usage_data_optin -ne 0) { Add-Concern 'OptIn is not 0 under HKLM\SOFTWARE\Policies\Microsoft\VisualStudio\SQM, so Visual Studio sends its optional usage data' }
 
         $t.ffmpeg_dir_env = [Environment]::GetEnvironmentVariable('FFMPEG_DIR', 'Machine')
         if ($t.ffmpeg_dir_env -ne $FfmpegDir) { Add-Problem ('FFMPEG_DIR is "{0}", expected {1}' -f $t.ffmpeg_dir_env, $FfmpegDir) }
