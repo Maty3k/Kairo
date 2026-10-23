@@ -76,7 +76,6 @@ $SshdBlockEnd      = '# END Kairo'
 $SidAdministrators = 'S-1-5-32-544'
 $SidSystem         = 'S-1-5-18'
 $SidUsers          = 'S-1-5-32-545'
-$SidOwnerRights    = 'S-1-3-4'        # OWNER RIGHTS: replaces an owner's implicit READ_CONTROL and WRITE_DAC
 $SidPerfLogUsers   = 'S-1-5-32-559'
 # Git settings for Claude's elevated SSH sessions (GIT_CONFIG_GLOBAL in tools/mac/remote), in a folder only
 # administrators can change: those sessions never read your own .gitconfig.
@@ -339,23 +338,29 @@ function Get-FileRights($Rule) {
     return ($m -band 2032127)
 }
 
-function Test-FolderAcl {
-    # True if $Path is a real folder (not a link) owned by Administrators whose explicit entries are exactly
-    # $Explicit (SID -> access mask, each for the folder and everything below it). With -Protected nothing is
-    # inherited from the parent; without it the folder inherits and may add only the entries in $Explicit.
+function Get-FolderAclProblem {
+    # '' if $Path is a real folder (not a link) owned by Administrators whose explicit entries are exactly
+    # $Explicit (SID -> access mask, each for the folder and everything below it); otherwise the first difference,
+    # in words. With -Protected nothing is inherited from the parent; without it the folder inherits and may add
+    # only the entries in $Explicit.
     param([string] $Path, [hashtable] $Explicit, [switch] $Protected)
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return ('{0} is missing' -f $Path) }
     $item = Get-Item -LiteralPath $Path -Force
-    if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return ('{0} is a link' -f $Path) }
     $acl = Get-Acl -LiteralPath $Path
-    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $SidAdministrators) { return $false }
-    if ([bool] $acl.AreAccessRulesProtected -ne [bool] $Protected) { return $false }
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne $SidAdministrators) { return ('{0} is owned by {1}, not Administrators' -f $Path, (Resolve-SidName $owner)) }
+    if ([bool] $acl.AreAccessRulesProtected -ne [bool] $Protected) {
+        if ($Protected) { return ('{0} inherits permissions from its parent folder' -f $Path) }
+        return ('{0} does not inherit the permissions of its parent folder' -f $Path)
+    }
     $coverage = @{}
     foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
         $sid = $rule.IdentityReference.Value
-        if (-not $Explicit.ContainsKey($sid)) { return $false }
-        if ([string] $rule.AccessControlType -ne 'Allow') { return $false }
-        if ((Get-FileRights $rule) -ne $Explicit[$sid]) { return $false }
+        $rights = Get-FileRights $rule
+        $entry = '{0}: {1} {2} 0x{3:X} ({4}; {5})' -f $Path, $rule.AccessControlType, (Resolve-SidName $sid), $rights, $rule.InheritanceFlags, $rule.PropagationFlags
+        if ((-not $Explicit.ContainsKey($sid)) -or ([string] $rule.AccessControlType -ne 'Allow')) { return ('unexpected entry ' + $entry) }
+        if ($rights -ne $Explicit[$sid]) { return ('entry {0}, expected 0x{1:X}' -f $entry, $Explicit[$sid]) }
         if (-not $coverage.ContainsKey($sid)) { $coverage[$sid] = @{ Here = $false; Down = $false } }
         $propagation = [int] $rule.PropagationFlags
         if (($propagation -band 2) -eq 0) { $coverage[$sid].Here = $true }                  # not InheritOnly
@@ -363,10 +368,15 @@ function Test-FolderAcl {
         if ((($inherit -band 3) -eq 3) -and (($propagation -band 1) -eq 0)) { $coverage[$sid].Down = $true }
     }
     foreach ($sid in @($Explicit.Keys)) {
-        if (-not $coverage.ContainsKey($sid)) { return $false }
-        if (-not ($coverage[$sid].Here -and $coverage[$sid].Down)) { return $false }
+        if (-not $coverage.ContainsKey($sid)) { return ('{0}: no entry for {1}' -f $Path, (Resolve-SidName $sid)) }
+        if (-not ($coverage[$sid].Here -and $coverage[$sid].Down)) { return ('{0}: the entry for {1} does not cover the folder and everything in it' -f $Path, (Resolve-SidName $sid)) }
     }
-    return $true
+    return ''
+}
+
+function Test-FolderAcl {
+    param([string] $Path, [hashtable] $Explicit, [switch] $Protected)
+    return ((Get-FolderAclProblem -Path $Path -Explicit $Explicit -Protected:$Protected) -eq '')
 }
 
 function Find-ReparsePoint([string] $Root) {
@@ -1060,12 +1070,29 @@ function Install-WingetPackage {
     return New-Object psobject -Property @{ Code = $code; Ok = $ok }
 }
 
+function Assert-NoOutsideLink([string] $LeftAlone) {
+    # Recursive icacls changes follow links, so they run only while C:\kairo holds none but bin\current, a junction
+    # to a build inside C:\kairo\bin.
+    $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
+    if ($links.Count -gt 0) {
+        throw ('C:\kairo contains links that may point outside it ({0}), so {1}. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '), $LeftAlone)
+    }
+    if (Test-Path -LiteralPath $CurrentBin) {
+        $item = Get-Item -LiteralPath $CurrentBin -Force
+        if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $target = ([string] (@($item.Target) | Select-Object -First 1)) -replace '^\\\?\?\\', ''
+            if (-not $target.StartsWith($BinDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw ('C:\kairo\bin\current points outside C:\kairo\bin ({0}), so {1}. Tell Claude.' -f $target, $LeftAlone)
+            }
+        }
+    }
+}
+
 function Initialize-KairoTree([string] $OwnerSid) {
     # C:\kairo (docs/milestones/M0.md): Administrators and SYSTEM have full control and own everything; you can
     # read and run it all, but your own programs (kairo-devrun, kairo-hello, the watch agent) write only in logs
     # and state. So nothing running as you can change what Claude's elevated SSH sessions run or trust (builds,
-    # scripts, Git settings, FFmpeg). The OWNER RIGHTS entry stops a file's owner from rewriting its permissions,
-    # which matters because UAC makes you the owner of files this elevated window creates.
+    # scripts, Git settings, FFmpeg). Set-KairoOwnership keeps Administrators the owner of what later steps add.
     $existed = Test-Path -LiteralPath $KairoRoot
     if ($existed) {
         if (Test-KairoAcl $OwnerSid) {
@@ -1077,25 +1104,12 @@ function Initialize-KairoTree([string] $OwnerSid) {
         if (@($SidAdministrators, $SidSystem) -notcontains $owner) {
             throw ('C:\kairo already exists, but this setup did not create it (its owner is {0}). If nothing in it matters, delete it, otherwise move it away; then run the command again.' -f (Resolve-SidName $owner))
         }
-        # Resetting permissions below must never follow a link out of C:\kairo. Only bin\current, a junction to
-        # a build inside C:\kairo\bin, is expected.
-        $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
-        if ($links.Count -gt 0) {
-            throw ('C:\kairo contains links that may point outside it ({0}), so its permissions were left alone. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '))
-        }
-        if (Test-Path -LiteralPath $CurrentBin) {
-            $item = Get-Item -LiteralPath $CurrentBin -Force
-            if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $target = ([string] (@($item.Target) | Select-Object -First 1)) -replace '^\\\?\?\\', ''
-                if (-not $target.StartsWith($BinDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-                    throw ('C:\kairo\bin\current points outside C:\kairo\bin ({0}), so C:\kairo was left alone. Tell Claude.' -f $target)
-                }
-            }
-        }
+        # Resetting permissions below must never follow a link out of C:\kairo.
+        Assert-NoOutsideLink 'its permissions were left alone'
     } else {
         # Created with its final permissions in one call: inheriting from C:\ would give every signed-in user
         # Modify on it until icacls ran.
-        $sddl = 'D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;{0})(A;OICI;0x1200a9;;;{1})' -f $OwnerSid, $SidOwnerRights
+        $sddl = 'D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;{0})' -f $OwnerSid
         $security = New-Object System.Security.AccessControl.DirectorySecurity
         $security.SetSecurityDescriptorSddlForm($sddl)
         $null = [System.IO.Directory]::CreateDirectory($KairoRoot, $security)
@@ -1107,8 +1121,8 @@ function Initialize-KairoTree([string] $OwnerSid) {
     }
     Invoke-Icacls @($KairoRoot, '/inheritance:r',
         '/grant:r', ('*{0}:(OI)(CI)F' -f $SidAdministrators), '/grant:r', ('*{0}:(OI)(CI)F' -f $SidSystem),
-        '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/grant:r', ('*{0}:(OI)(CI)RX' -f $SidOwnerRights), '/C', '/Q')
-    $allowed = @($SidAdministrators, $SidSystem, $OwnerSid, $SidOwnerRights)
+        '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/C', '/Q')
+    $allowed = @($SidAdministrators, $SidSystem, $OwnerSid)
     $acl = Get-Acl -LiteralPath $KairoRoot
     foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
         $sid = $rule.IdentityReference.Value
@@ -1121,29 +1135,58 @@ function Initialize-KairoTree([string] $OwnerSid) {
     if ($existed) { Invoke-Icacls @(($KairoRoot + '\*'), '/reset', '/T', '/C', '/Q') }
     Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
     foreach ($d in @($LogsDir, $StateDir)) { Invoke-Icacls @($d, '/grant', ('*{0}:(OI)(CI)M' -f $OwnerSid), '/C', '/Q') }
-    if (-not (Test-KairoAcl $OwnerSid)) { throw 'C:\kairo permissions are not as expected after icacls.' }
+    $problem = Get-KairoAclProblem $OwnerSid
+    if ($problem) { throw ('C:\kairo permissions are not as expected after icacls: ' + $problem) }
     $Ctx.TreeOk = $true
     if ($existed) { return 'C:\kairo repaired: Administrators and SYSTEM full control; you read everything and write logs and state' }
     return 'created C:\kairo: Administrators and SYSTEM full control; you read everything and write logs and state'
 }
 
-function Test-KairoAcl([string] $OwnerSid) {
-    # The layout Initialize-KairoTree makes (doctor.ps1 checks the same).
+function Get-KairoAclProblem([string] $OwnerSid) {
+    # '' if C:\kairo has the layout Initialize-KairoTree makes (bootstrap.ps1 and doctor.ps1 check the same);
+    # otherwise the first difference.
     $root = @{}
     $root[$SidAdministrators] = $RightsFull
     $root[$SidSystem] = $RightsFull
     $root[$OwnerSid] = $RightsRead
-    $root[$SidOwnerRights] = $RightsRead
-    if (-not (Test-FolderAcl -Path $KairoRoot -Explicit $root -Protected)) { return $false }
+    $problem = Get-FolderAclProblem -Path $KairoRoot -Explicit $root -Protected
+    if ($problem) { return $problem }
     foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
-        if (-not (Test-FolderAcl -Path $d -Explicit @{})) { return $false }
+        $problem = Get-FolderAclProblem -Path $d -Explicit @{}
+        if ($problem) { return $problem }
     }
     $writable = @{}
     $writable[$OwnerSid] = $RightsModify
     foreach ($d in @($LogsDir, $StateDir)) {
-        if (-not (Test-FolderAcl -Path $d -Explicit $writable)) { return $false }
+        $problem = Get-FolderAclProblem -Path $d -Explicit $writable
+        if ($problem) { return $problem }
     }
-    return $true
+    return ''
+}
+
+function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
+
+function Set-KairoOwnership([string] $OwnerSid) {
+    # Administrators own everything in C:\kairo but logs and state, and nothing in src, bin, jobs or tools has
+    # permissions of its own (docs/milestones/M0.md). Depending on a Windows policy, files an elevated window creates
+    # belong to Administrators or to your account, and an owner can always rewrite a file's permissions; so this runs
+    # after the steps that add files (Git settings, the code folder, FFmpeg, PresentMon): first the owner, then a reset
+    # that removes anything an owner may have added in the meantime.
+    Assert-NoOutsideLink 'the owner was left as it is'
+    Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/C', '/Q')
+    foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
+        Invoke-Icacls @($d, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
+        Invoke-Icacls @($d, '/reset', '/T', '/C', '/Q')
+    }
+    $problem = Get-KairoAclProblem $OwnerSid
+    if ($problem) { throw ('C:\kairo permissions are not as expected: ' + $problem) }
+    # icacls fails on any file it could not change; these spot checks cover what the doctor checks too.
+    foreach ($p in @($KairoRoot, $SrcDir, $BinDir, $JobsDir, $ToolsDir, $GitConfigFile)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $owner = (Get-Acl -LiteralPath $p).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne $SidAdministrators) { throw ('{0} is still owned by {1}, not Administrators.' -f $p, (Resolve-SidName $owner)) }
+    }
+    return 'Administrators own C:\kairo and everything in src, bin, jobs and tools, which have no permissions of their own'
 }
 
 function Install-Git {
@@ -2118,6 +2161,7 @@ function Invoke-Bootstrap {
         Invoke-Step 'Download FFmpeg 9.0.2 LGPL (BtbN, SHA-256 checked)' { Assert-KairoTree; Install-Ffmpeg }
         Invoke-Step 'Download PresentMon 2.6.0 (SHA-256 checked)' { Assert-KairoTree; Install-PresentMon }
         Invoke-Step 'Set LIBCLANG_PATH and FFMPEG_DIR' { Set-BuildEnvironment }
+        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs and state)' { Assert-KairoTree; Set-KairoOwnership $ownerInfo.Sid }
 
         # ---- 4. Report -----------------------------------------------------------------------------------------
         Write-Title 'Write C:\kairo\state\bootstrap-report.json'

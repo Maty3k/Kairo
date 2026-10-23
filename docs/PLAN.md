@@ -1,6 +1,6 @@
 # Kairo implementation plan
 
-*2026-10-21 · For Kairo's owner (product calls, play-testing) and Claude Code (builder). Inputs: the owner's 35 decisions (§8) and research 00–15. `docs/research/` holds 00–13, the implementation cookbook 15 and its type-checked prototypes; the name check (14) stays private in the git-ignored `.private/` folder. Research 13 (the owner's AMD rig) overrides earlier reports, except the WGC interval (SP2 decides). **[Uncertain]**/**[Estimate]** come from the research; **[proposed]** marks a default you can change. Not legal advice.*
+*2026-10-21 · For Kairo's owner (product calls, play-testing) and Claude Code (builder). Inputs: the owner's 36 decisions (§8) and research 00–15. `docs/research/` holds 00–13, the implementation cookbook 15 and its type-checked prototypes; the name check (14) stays private in the git-ignored `.private/` folder. Research 13 (the owner's AMD rig) overrides earlier reports, except the WGC interval (SP2 decides). **[Uncertain]**/**[Estimate]** come from the research; **[proposed]** marks a default you can change. Not legal advice.*
 
 ---
 
@@ -352,14 +352,16 @@ Languages: Rust (engine, UI shell, tools), TypeScript/React (UI), HLSL (runtime-
 - **`kairo-loadgen`:** deterministic GPU load (ALU and bandwidth modes, research 13 §5.5), borderless on the OLED, scriptable.
 - **`pc bench`** (research 13 §9): environment in `bench/env.json`; AMD Chill, Boost, AFMF, FRTC, Enhanced Sync, RSR, Metrics Overlay and Instant Replay off, VSync off; warm-up; A/A noise floor (6 runs; CV >1% → more); ABBA×3 (12 × 60 s, 6 pairs) of Kairo off/on; PresentMon 2.6.0 with its own `--session_name KairoBench` (Adrenalin ships a PresentMon too), `--qpc_time --track_frame_type --track_gpu_video` (P17); `pm-stats.ps1`, `ab-stats.ps1`, PDH `encoder-usage.ps1`. **Gate (Instant Replay off):** mean FPS loss ≤3% with the upper 95% CI ≤4%; 1%-low loss ≤5%; PresentMode unchanged; no worse than Instant Replay alone + 1 pp (the three-way numbers feed the onboarding warning). **Workloads:** loadgen, built-in benchmarks of 2 of your games, one HDR run, video on the 180 Hz screen, alt-tab between monitors, a Copy for Discord export during play; live play only for soaks.
 
-| Games (you complete the list in M0) | Anti-cheat | Focus |
+| Games (yours first: Steam and Epic story games with HDR, M0) | Anti-cheat | Focus |
 |---|---|---|
+| Clair Obscur: Expedition 33 | — [Uncertain] | Your daily games: Unreal Engine 5, DX12 + HDR |
+| Horizon Zero Dawn Remastered, Horizon Forbidden West | — [Uncertain] | Your daily games: DX12 + HDR |
+| Ghost of Tsushima | — [Uncertain] | Your daily game: DX12 + HDR (SP3's HDR test game) |
 | VALORANT, League of Legends | Vanguard | Hotkeys, no warnings, voice process [Uncertain] |
 | CS2, Dota 2 | VAC (FACEIT) | 300+ fps on 360 Hz, Independent Flip, in-game voice in the Game track |
 | Fortnite, Apex, Call of Duty | EAC (Fortnite also BattlEye), Ricochet | DX12 capture cost, hotkeys |
 | Roblox | Hyperion (Byfron) [not in research; verify] | First run with you present; hotkeys, window capture |
 | Minecraft Java | — | Exclusive-fullscreen freeze |
-| Ghost of Tsushima | — [Uncertain] | DX12 + HDR |
 
 First runs in anti-cheat games are in practice or unranked mode, with you present; the matrix reruns every Kairo release, since anti-cheat updates are invisible. **Hardware:** S0 your AMD rig; S1 adds ≥1 NVIDIA, ≥1 Intel, Bluetooth headsets; S2 adds Win10 22H2, a hybrid laptop, an N edition.
 
@@ -651,14 +653,15 @@ Sizes are relative (S < M < L < XL). No dates: a milestone closes when its gate 
 | 33 | Update checks on by default: anonymous (version + Windows build to GitHub), disclosed in onboarding, one switch to turn off | Decided after the plan was drafted |
 | 34 | "Kairo" is the working name; the public name is settled before any branding spend | Decided after the private knockout search rated the name HIGH risk; Q22 |
 | 35 | Licence: GPL-3.0-or-later | Answers Q18 |
+| 36 | Smart App Control off on the dev PC (route a) | Answers Q3; decided 2026-10-22, after the bootstrap found it On |
 
 **Plan proposals** (veto any at a gate): instruments before spikes; switchover before the library app; control/media split; engine-owned updates; 2-minute key on by default; Alt+F11 Flag key; press detector in dev/beta; "Natural" HDR curve pending SP3; `bf=0`, no edit lists; Discord target 18,000,000 bytes; pop-up rules; permanent identifier `io.github.maty3k.kairo`; voice-free share copies; the exit-rule counting rules (row 26); no outside code until GPL vs Store is settled.
 
 | Q | Open question | Recommendation | Decide by |
 |---|---|---|---|
 | Q1 | GPU model, Windows build, CPU, RAM | Claude reads them | M0 |
-| Q2 | Games, anti-cheats, admin games, keyboard layouts, unattended test days | List now | M0 |
-| Q3 | Smart App Control: off (maybe irreversible), or on with paid signing | Off, if it's on | M0 |
+| Q2 | Games, anti-cheats, admin games, keyboard layouts, unattended test days | Answered 2026-10-22: single-player story games with HDR on Steam and Epic, US layout; admin games unknown; details in `.dogfood/` | Done |
+| Q3 | Smart App Control: off (maybe irreversible), or on with paid signing | Decided: off (decision 36) | Done |
 | Q4 | Voice apps; push-to-talk; headset or Bluetooth | — | M5 |
 | Q5 | Default quality; 120 fps | From M2 numbers | M2 |
 | Q6 | 2-minute key on by default | Yes | M5 |

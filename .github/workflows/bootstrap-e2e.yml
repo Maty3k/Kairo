@@ -1,0 +1,250 @@
+# The PC setup end to end on a fresh GitHub-hosted Windows runner (docs/milestones/M0.md).
+# tools/pc/bootstrap.ps1 runs the way the owner runs it (a scriptblock in elevated Windows
+# PowerShell 5.1) with -Yes and a throwaway key, three times: on the fresh runner, on a tree made
+# to look like the owner's PC after the first bootstrap version, and on a tree whose permissions
+# need a repair. Every run must succeed; an SSH round trip through the new sshd on 127.0.0.1 and
+# doctor.ps1 check what it left. The runner is thrown away afterwards, so its changes (OpenSSH,
+# firewall, C:\kairo, tasks, installs) do not matter. No secrets are used.
+
+name: Bootstrap e2e
+
+on:
+  pull_request:
+    paths:
+      - 'tools/pc/**'
+      - '.github/workflows/bootstrap-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/pc/**'
+      - '.github/workflows/bootstrap-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bootstrap:
+    name: bootstrap.ps1 end to end (fresh Windows runner)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner image has no working winget, and the bootstrap stops without it. This installs
+      # Microsoft's own release v1.29.380 (also the owner's version) and its dependencies; the
+      # SHA-256 values are the GitHub release asset digests. (Repair-WinGetPackageManager fails on
+      # this image: the App Installer bundle it finds has no x64 package.)
+      - name: Install winget
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $base = 'https://github.com/microsoft/winget-cli/releases/download/v1.29.380'
+          $dir = Join-Path $env:RUNNER_TEMP 'winget'
+          $null = New-Item -ItemType Directory -Force -Path $dir
+          $files = [ordered]@{
+            'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle' = '65dea9c01ce08ee7b763366b27c0e651f97db857c11ca9b9c301826c10092f2e'
+            'DesktopAppInstaller_Dependencies.zip'                   = 'ba875afe9d190f61218985ac0292a99d1db710bf93e13c68944ca9d89f0d82d1'
+          }
+          foreach ($name in $files.Keys) {
+            & "$env:SystemRoot\System32\curl.exe" -fsSL --retry 3 -o "$dir\$name" "$base/$name"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $name" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "$dir\$name").Hash.ToLowerInvariant()
+            if ($hash -ne $files[$name]) { throw "wrong SHA-256 for ${name}: $hash" }
+          }
+          Expand-Archive -LiteralPath "$dir\DesktopAppInstaller_Dependencies.zip" -DestinationPath "$dir\deps"
+          $deps = @(Get-ChildItem -LiteralPath "$dir\deps" -Recurse -Include *.appx, *.msix | Where-Object { $_.FullName -match '(?i)x64' } | ForEach-Object FullName)
+          Write-Host ('dependencies: ' + ($deps -join ', '))
+          Add-AppxPackage -Path "$dir\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -DependencyPath $deps -ForceApplicationShutdown -ForceUpdateFromAnyVersion
+          $winget = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+          & $winget --version
+          if ($LASTEXITCODE -ne 0) { throw 'winget does not run' }
+
+      - name: Throwaway SSH key (stands in for the Mac's)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'e2e-ssh'
+          $null = New-Item -ItemType Directory -Force -Path $dir
+          & "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe" -q -t ed25519 -N '' -f "$dir\id" -C e2e
+          if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen failed' }
+          # ssh refuses a private key that other accounts can read.
+          icacls "$dir\id" /inheritance:r /grant:r "$($env:USERNAME):F"
+          if ($LASTEXITCODE -ne 0) { throw 'icacls failed' }
+
+      - name: Bootstrap, first run (as the owner runs it, with -Yes)
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $key = (Get-Content -Raw "$env:RUNNER_TEMP\e2e-ssh\id.pub").Trim()
+          $text = Get-Content -Raw "$env:GITHUB_WORKSPACE\tools\pc\bootstrap.ps1"
+          & ([scriptblock]::Create($text)) -MacKey $key -Yes
+
+      - name: What the first run left
+        if: always()
+        shell: powershell
+        run: |
+          foreach ($d in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\logs', 'C:\kairo\tools', 'C:\kairo\state', 'C:\.cargo') {
+            if (Test-Path -LiteralPath $d) { Write-Host ('{0}  {1}' -f $d, (Get-Acl -LiteralPath $d).Sddl); icacls $d }
+          }
+          Get-ScheduledTask -TaskPath '\Kairo\' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host ('task {0}: {1} {2} {3}' -f $_.TaskName, $_.Principal.LogonType, $_.Principal.RunLevel, (@($_.Triggers | ForEach-Object { $_.Repetition.Interval + '/' + $_.Repetition.Duration }) -join ','))
+          }
+          Get-Service -Name sshd -ErrorAction SilentlyContinue | Format-List Name, Status, StartType
+          exit 0
+
+      - name: Every step of the first run succeeded
+        shell: powershell
+        run: |
+          $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
+          $bad = @($r.steps | Where-Object { -not $_.ok })
+          foreach ($s in $r.steps) { Write-Host ('{0}: {1} ({2})' -f $s.step, $s.ok, $s.detail) }
+          foreach ($s in $bad) { Write-Host "::error::$($s.step): $($s.detail)" }
+          if ($bad.Count -gt 0) { exit 1 }
+
+      - name: SSH round trip (key only, cmd.exe /d /c, pwsh -EncodedCommand as tools/mac/pc sends it)
+        shell: pwsh
+        run: |
+          $ssh = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
+          $target = "$env:USERNAME@127.0.0.1"
+          $opts = @('-i', "$env:RUNNER_TEMP\e2e-ssh\id", '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+            '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL', '-o', 'ConnectTimeout=15')
+          $out = & $ssh @opts $target 'echo kairo-cmd-ok'
+          if ($LASTEXITCODE -ne 0 -or (($out -join "`n") -notmatch 'kairo-cmd-ok')) { throw "key login through cmd.exe failed: $out" }
+          $script = 'Write-Output ("kairo-pwsh-ok " + $PSVersionTable.PSVersion + " " + [Security.Principal.WindowsIdentity]::GetCurrent().Name)'
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+          $line = '"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand ' + $b64
+          $out = & $ssh @opts $target $line
+          if ($LASTEXITCODE -ne 0 -or (($out -join "`n") -notmatch 'kairo-pwsh-ok')) { throw "pwsh -EncodedCommand over SSH failed: $out" }
+          Write-Host $out
+          # Without a key nothing may get in, and the server may offer public keys only.
+          $probe = & $ssh -v -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=15 $target 'echo should-not-run' 2>&1
+          $code = $LASTEXITCODE
+          $methods = @($probe | Select-String 'Authentications that can continue: (.*)' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
+          Write-Host ('offered without a key: {0}' -f ($methods -join ' | '))
+          if ($code -eq 0) { throw 'a login without a key succeeded' }
+          if ($methods.Count -eq 0 -or @($methods | Where-Object { $_ -ne 'publickey' }).Count -gt 0) { throw ('sshd offers more than publickey: {0}' -f ($methods -join ' | ')) }
+          # The refused login above is the expected outcome; its exit code is not this step's.
+          exit 0
+
+      - name: Administrators own C:\kairo (all but logs and state)
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($p in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\src\.git\config', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\tools', 'C:\kairo\tools\gitconfig', 'C:\kairo\tools\ffmpeg\bin\ffmpeg.exe') {
+            $owner = (Get-Acl -LiteralPath $p).Owner
+            Write-Host "$p -> $owner"
+            if ($owner -ne 'BUILTIN\Administrators') { Write-Host "::error::$p is owned by $owner"; $bad++ }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+      # The owner's PC after the first bootstrap version, which stopped at its C:\kairo check: that
+      # version's owner change made its OWNER RIGHTS entry inherit-only, so .NET cannot see it and
+      # the C:\kairo check passes as it is (compare "What the first run left" in a run of commit
+      # 6a6938d). On Windows 11 the files an elevated window creates belong to the user, so
+      # everything below src, bin, jobs and tools gets the user as its owner, and gitconfig also a
+      # write entry, which a program running as that owner could add with its implicit WRITE_DAC.
+      - name: Make the tree look like the owner's PC after the first bootstrap version
+        shell: powershell
+        run: |
+          icacls C:\kairo /grant '*S-1-3-4:(OI)(CI)RX'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo /setowner $env:USERNAME /T /C /Q
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($d in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\logs', 'C:\kairo\tools', 'C:\kairo\state') {
+            icacls $d /setowner '*S-1-5-32-544' /C /Q
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $listing = @(icacls C:\kairo)
+          $listing
+          icacls C:\kairo\src
+          icacls C:\kairo\tools\gitconfig
+          $sddl = (Get-Acl C:\kairo).Sddl
+          Write-Host "C:\kairo  $sddl"
+          if ($sddl -match ';(OW|S-1-3-4)\)') { Write-Host '::error::.NET still sees the OWNER RIGHTS entry, unlike on the owner''s PC'; exit 1 }
+          if (@($listing -match 'OWNER RIGHTS').Count -eq 0) { Write-Host '::error::the OWNER RIGHTS entry is gone, unlike on the owner''s PC'; exit 1 }
+
+      - name: Bootstrap, second run (on the tree that looks like the owner's PC)
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $key = (Get-Content -Raw "$env:RUNNER_TEMP\e2e-ssh\id.pub").Trim()
+          $text = Get-Content -Raw "$env:GITHUB_WORKSPACE\tools\pc\bootstrap.ps1"
+          & ([scriptblock]::Create($text)) -MacKey $key -Yes
+          $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
+          $bad = @($r.steps | Where-Object { -not $_.ok })
+          foreach ($s in $bad) { Write-Host "::error::second run: $($s.step): $($s.detail)" }
+          # As on the owner's PC, the C:\kairo check passes, so the last step alone must clean up.
+          $tree = @($r.steps | Where-Object { $_.step -like 'Create C:\kairo*' })
+          if ($tree.Count -ne 1 -or $tree[0].detail -ne 'C:\kairo is there with the expected permissions') {
+            Write-Host ('::error::second run did not take the owner''s path: ' + (@($tree | ForEach-Object { $_.detail }) -join '; ')); exit 1
+          }
+          $problems = New-Object System.Collections.ArrayList
+          $checked = 0
+          foreach ($d in 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\tools') {
+            foreach ($i in @(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Recurse -Force)) {
+              $checked++
+              $acl = Get-Acl -LiteralPath $i.FullName
+              if ($acl.Owner -ne 'BUILTIN\Administrators') { [void] $problems.Add(('{0} is owned by {1}' -f $i.FullName, $acl.Owner)) }
+              $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+              if ($explicit.Count -gt 0) { [void] $problems.Add(('{0} has entries of its own: {1}' -f $i.FullName, (($explicit | ForEach-Object { $_.IdentityReference.Value + ' ' + $_.FileSystemRights }) -join '; '))) }
+            }
+          }
+          foreach ($p in @($problems | Select-Object -First 20)) { Write-Host "::error::second run: $p" }
+          Write-Host ('owner and permissions of {0} items below src, bin, jobs and tools: {1} problems' -f $checked, $problems.Count)
+          # The clone and FFmpeg alone are hundreds of files; far fewer means the walk missed them.
+          if ($checked -lt 100) { Write-Host "::error::second run: only $checked items were checked"; exit 1 }
+          icacls C:\kairo\tools\gitconfig
+          if ($bad.Count -gt 0 -or $problems.Count -gt 0) { exit 1 }
+
+      # A tree whose permissions were changed (an OWNER RIGHTS entry .NET can see, and gitconfig as
+      # above): the C:\kairo step repairs it before the last step runs.
+      - name: Make the permissions of C:\kairo need a repair
+        shell: powershell
+        run: |
+          icacls C:\kairo /grant '*S-1-3-4:(OI)(CI)RX'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig /setowner $env:USERNAME
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo
+
+      - name: Bootstrap, third run (repairs C:\kairo)
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $key = (Get-Content -Raw "$env:RUNNER_TEMP\e2e-ssh\id.pub").Trim()
+          $text = Get-Content -Raw "$env:GITHUB_WORKSPACE\tools\pc\bootstrap.ps1"
+          & ([scriptblock]::Create($text)) -MacKey $key -Yes
+          $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
+          $bad = @($r.steps | Where-Object { -not $_.ok })
+          foreach ($s in $bad) { Write-Host "::error::third run: $($s.step): $($s.detail)" }
+          $tree = @($r.steps | Where-Object { $_.step -like 'Create C:\kairo*' })
+          if ($tree.Count -ne 1 -or $tree[0].detail -notlike 'C:\kairo repaired*') {
+            Write-Host ('::error::third run did not repair C:\kairo: ' + (@($tree | ForEach-Object { $_.detail }) -join '; ')); exit 1
+          }
+          if ((Get-Acl C:\kairo).Sddl -match ';(OW|S-1-3-4)\)') { Write-Host '::error::third run left the OWNER RIGHTS entry on C:\kairo'; exit 1 }
+          $acl = Get-Acl C:\kairo\tools\gitconfig
+          if ($acl.Owner -ne 'BUILTIN\Administrators') { Write-Host "::error::third run left gitconfig owned by $($acl.Owner)"; exit 1 }
+          $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.NTAccount]))
+          if ($explicit.Count -gt 0) { Write-Host ('::error::third run left entries of its own on gitconfig: ' + (($explicit | ForEach-Object { [string] $_.IdentityReference + ' ' + $_.FileSystemRights }) -join '; ')); exit 1 }
+          icacls C:\kairo
+          if ($bad.Count -gt 0) { exit 1 }
+
+      - name: doctor.ps1 after the bootstrap
+        if: always()
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\tools\pc\doctor.ps1"
+          Write-Host "doctor exit code: $LASTEXITCODE (1 is expected here: no build is deployed yet)"
+          exit 0
