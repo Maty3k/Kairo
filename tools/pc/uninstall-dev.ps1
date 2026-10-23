@@ -196,10 +196,13 @@ function Show-Kept {
     Write-Note '- cmd.exe as the SSH shell: DefaultShell, DefaultShellCommandOption and DefaultShellArguments'
     Write-Note '  under HKLM\SOFTWARE\OpenSSH.'
     Write-Note '- The POWERSHELL_TELEMETRY_OPTOUT system variable (it keeps PowerShell 7''s telemetry off).'
+    Write-Note '- Visual Studio''s optional usage data stays off. To switch it back on:'
+    Write-Note '  Remove-ItemProperty -Path HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM -Name OptIn'
     Write-Note '- Your membership of "Performance Log Users". To leave it:'
     Write-Note '  Remove-LocalGroupMember -SID S-1-5-32-559 -Member $env:USERNAME'
     Write-Note '- The LIBCLANG_PATH system variable (it points to LLVM).'
-    Write-Note '- Windows'' own SSH firewall rule stays switched off: turning it back on would open SSH on every network.'
+    Write-Note '- Windows'' own SSH firewall rule, and any other rule the setup switched off because it opened port 22,'
+    Write-Note '  stay switched off: turning Windows'' rule back on would open SSH on every network.'
     if (-not $RemoveData) { Write-Note '- C:\kairo itself and the empty C:\.cargo. Run this again with -RemoveData to delete them.' }
 }
 
