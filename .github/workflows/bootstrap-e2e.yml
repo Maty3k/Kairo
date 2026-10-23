@@ -124,7 +124,7 @@ jobs:
           if ($at -lt 0) { Write-Host "::error::no 'Warnings from earlier in the run' block in $($log.Name)"; exit 1 }
           # Compare without whitespace, so a line the transcript wrapped still matches.
           $done = $text.Substring($at) -replace '\s', ''
-          $missing = @($notes | Where-Object { -not $done.Contains(([string] $_) -replace '\s', '') })
+          $missing = @($notes | Where-Object { $want = ([string] $_) -replace '\s', ''; -not $done.Contains($want) })
           Write-Host ('{0} ATTENTION line(s), {1} missing from the DONE screen' -f $notes.Count, $missing.Count)
           foreach ($n in $missing) { Write-Host "::error::not repeated on the DONE screen: $n" }
           if ($missing.Count -gt 0) { exit 1 }
