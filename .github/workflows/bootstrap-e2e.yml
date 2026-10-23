@@ -188,8 +188,10 @@ jobs:
             Write-Host ('::error::second run did not take the owner''s path: ' + (@($tree | ForEach-Object { $_.detail }) -join '; ')); exit 1
           }
           $problems = New-Object System.Collections.ArrayList
+          $checked = 0
           foreach ($d in 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\tools') {
             foreach ($i in @(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Recurse -Force)) {
+              $checked++
               $acl = Get-Acl -LiteralPath $i.FullName
               if ($acl.Owner -ne 'BUILTIN\Administrators') { [void] $problems.Add(('{0} is owned by {1}' -f $i.FullName, $acl.Owner)) }
               $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
@@ -197,7 +199,9 @@ jobs:
             }
           }
           foreach ($p in @($problems | Select-Object -First 20)) { Write-Host "::error::second run: $p" }
-          Write-Host ('owner and permissions checked below src, bin, jobs and tools: {0} problems' -f $problems.Count)
+          Write-Host ('owner and permissions of {0} items below src, bin, jobs and tools: {1} problems' -f $checked, $problems.Count)
+          # The clone and FFmpeg alone are hundreds of files; far fewer means the walk missed them.
+          if ($checked -lt 100) { Write-Host "::error::second run: only $checked items were checked"; exit 1 }
           icacls C:\kairo\tools\gitconfig
           if ($bad.Count -gt 0 -or $problems.Count -gt 0) { exit 1 }
 
