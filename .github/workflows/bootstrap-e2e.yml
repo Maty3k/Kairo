@@ -1,9 +1,10 @@
 # The PC setup end to end on a fresh GitHub-hosted Windows runner (docs/milestones/M0.md).
 # tools/pc/bootstrap.ps1 runs the way the owner runs it (a scriptblock in elevated Windows
-# PowerShell 5.1) with -Yes and a throwaway key, twice (the second run must find everything in
-# place), then doctor.ps1 and an SSH round trip through the new sshd on 127.0.0.1 check what it
-# left. The runner is thrown away afterwards, so its changes (OpenSSH, firewall, C:\kairo, tasks,
-# installs) do not matter. No secrets are used.
+# PowerShell 5.1) with -Yes and a throwaway key, three times: on the fresh runner, on a tree made
+# to look like the owner's PC after the first bootstrap version, and on a tree whose permissions
+# need a repair. Every run must succeed; an SSH round trip through the new sshd on 127.0.0.1 and
+# doctor.ps1 check what it left. The runner is thrown away afterwards, so its changes (OpenSSH,
+# firewall, C:\kairo, tasks, installs) do not matter. No secrets are used.
 
 name: Bootstrap e2e
 
@@ -143,23 +144,35 @@ jobs:
           }
           if ($bad -gt 0) { exit 1 }
 
-      # The owner's PC after the first bootstrap version: an OWNER RIGHTS entry on C:\kairo (which
-      # .NET cannot see), and, on Windows 11, files of elevated windows that belong to the user.
+      # The owner's PC after the first bootstrap version, which stopped at its C:\kairo check: that
+      # version's owner change made its OWNER RIGHTS entry inherit-only, so .NET cannot see it and
+      # the C:\kairo check passes as it is (compare "What the first run left" in a run of commit
+      # 6a6938d). On Windows 11 the files an elevated window creates belong to the user, so
+      # everything below src, bin, jobs and tools gets the user as its owner, and gitconfig also a
+      # write entry, which a program running as that owner could add with its implicit WRITE_DAC.
       - name: Make the tree look like the owner's PC after the first bootstrap version
         shell: powershell
         run: |
           icacls C:\kairo /grant '*S-1-3-4:(OI)(CI)RX'
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          icacls C:\kairo\tools\gitconfig /setowner $env:USERNAME
+          icacls C:\kairo /setowner $env:USERNAME /T /C /Q
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          # What a program running as that owner could add with the owner's implicit WRITE_DAC.
+          foreach ($d in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\logs', 'C:\kairo\tools', 'C:\kairo\state') {
+            icacls $d /setowner '*S-1-5-32-544' /C /Q
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
           icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          $listing = @(icacls C:\kairo)
+          $listing
+          icacls C:\kairo\src
           icacls C:\kairo\tools\gitconfig
-          icacls C:\kairo
-          Write-Host ('gitconfig owner: ' + (Get-Acl C:\kairo\tools\gitconfig).Owner)
+          $sddl = (Get-Acl C:\kairo).Sddl
+          Write-Host "C:\kairo  $sddl"
+          if ($sddl -match ';(OW|S-1-3-4)\)') { Write-Host '::error::.NET still sees the OWNER RIGHTS entry, unlike on the owner''s PC'; exit 1 }
+          if (@($listing -match 'OWNER RIGHTS').Count -eq 0) { Write-Host '::error::the OWNER RIGHTS entry is gone, unlike on the owner''s PC'; exit 1 }
 
-      - name: Bootstrap, second run (everything already in place)
+      - name: Bootstrap, second run (on the tree that looks like the owner's PC)
         shell: powershell
         working-directory: ${{ runner.temp }}
         run: |
@@ -169,11 +182,58 @@ jobs:
           $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
           $bad = @($r.steps | Where-Object { -not $_.ok })
           foreach ($s in $bad) { Write-Host "::error::second run: $($s.step): $($s.detail)" }
-          $acl = Get-Acl C:\kairo\tools\gitconfig
-          if ($acl.Owner -ne 'BUILTIN\Administrators') { Write-Host "::error::second run left gitconfig owned by $($acl.Owner)"; exit 1 }
-          $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.NTAccount]))
-          if ($explicit.Count -gt 0) { Write-Host ("::error::second run left explicit entries on gitconfig: " + (($explicit | ForEach-Object { [string] $_.IdentityReference + ' ' + $_.FileSystemRights }) -join '; ')); exit 1 }
+          # As on the owner's PC, the C:\kairo check passes, so the last step alone must clean up.
+          $tree = @($r.steps | Where-Object { $_.step -like 'Create C:\kairo*' })
+          if ($tree.Count -ne 1 -or $tree[0].detail -ne 'C:\kairo is there with the expected permissions') {
+            Write-Host ('::error::second run did not take the owner''s path: ' + (@($tree | ForEach-Object { $_.detail }) -join '; ')); exit 1
+          }
+          $problems = New-Object System.Collections.ArrayList
+          foreach ($d in 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\tools') {
+            foreach ($i in @(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Recurse -Force)) {
+              $acl = Get-Acl -LiteralPath $i.FullName
+              if ($acl.Owner -ne 'BUILTIN\Administrators') { [void] $problems.Add(('{0} is owned by {1}' -f $i.FullName, $acl.Owner)) }
+              $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+              if ($explicit.Count -gt 0) { [void] $problems.Add(('{0} has entries of its own: {1}' -f $i.FullName, (($explicit | ForEach-Object { $_.IdentityReference.Value + ' ' + $_.FileSystemRights }) -join '; '))) }
+            }
+          }
+          foreach ($p in @($problems | Select-Object -First 20)) { Write-Host "::error::second run: $p" }
+          Write-Host ('owner and permissions checked below src, bin, jobs and tools: {0} problems' -f $problems.Count)
           icacls C:\kairo\tools\gitconfig
+          if ($bad.Count -gt 0 -or $problems.Count -gt 0) { exit 1 }
+
+      # A tree whose permissions were changed (an OWNER RIGHTS entry .NET can see, and gitconfig as
+      # above): the C:\kairo step repairs it before the last step runs.
+      - name: Make the permissions of C:\kairo need a repair
+        shell: powershell
+        run: |
+          icacls C:\kairo /grant '*S-1-3-4:(OI)(CI)RX'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig /setowner $env:USERNAME
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo
+
+      - name: Bootstrap, third run (repairs C:\kairo)
+        shell: powershell
+        working-directory: ${{ runner.temp }}
+        run: |
+          $key = (Get-Content -Raw "$env:RUNNER_TEMP\e2e-ssh\id.pub").Trim()
+          $text = Get-Content -Raw "$env:GITHUB_WORKSPACE\tools\pc\bootstrap.ps1"
+          & ([scriptblock]::Create($text)) -MacKey $key -Yes
+          $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
+          $bad = @($r.steps | Where-Object { -not $_.ok })
+          foreach ($s in $bad) { Write-Host "::error::third run: $($s.step): $($s.detail)" }
+          $tree = @($r.steps | Where-Object { $_.step -like 'Create C:\kairo*' })
+          if ($tree.Count -ne 1 -or $tree[0].detail -notlike 'C:\kairo repaired*') {
+            Write-Host ('::error::third run did not repair C:\kairo: ' + (@($tree | ForEach-Object { $_.detail }) -join '; ')); exit 1
+          }
+          if ((Get-Acl C:\kairo).Sddl -match ';(OW|S-1-3-4)\)') { Write-Host '::error::third run left the OWNER RIGHTS entry on C:\kairo'; exit 1 }
+          $acl = Get-Acl C:\kairo\tools\gitconfig
+          if ($acl.Owner -ne 'BUILTIN\Administrators') { Write-Host "::error::third run left gitconfig owned by $($acl.Owner)"; exit 1 }
+          $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.NTAccount]))
+          if ($explicit.Count -gt 0) { Write-Host ('::error::third run left entries of its own on gitconfig: ' + (($explicit | ForEach-Object { [string] $_.IdentityReference + ' ' + $_.FileSystemRights }) -join '; ')); exit 1 }
+          icacls C:\kairo
           if ($bad.Count -gt 0) { exit 1 }
 
       - name: doctor.ps1 after the bootstrap
