@@ -152,6 +152,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           icacls C:\kairo\tools\gitconfig /setowner $env:USERNAME
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # What a program running as that owner could add with the owner's implicit WRITE_DAC.
+          icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          icacls C:\kairo\tools\gitconfig
           icacls C:\kairo
           Write-Host ('gitconfig owner: ' + (Get-Acl C:\kairo\tools\gitconfig).Owner)
 
@@ -165,8 +169,11 @@ jobs:
           $r = Get-Content -Raw 'C:\kairo\state\bootstrap-report.json' | ConvertFrom-Json
           $bad = @($r.steps | Where-Object { -not $_.ok })
           foreach ($s in $bad) { Write-Host "::error::second run: $($s.step): $($s.detail)" }
-          $owner = (Get-Acl C:\kairo\tools\gitconfig).Owner
-          if ($owner -ne 'BUILTIN\Administrators') { Write-Host "::error::second run left gitconfig owned by $owner"; exit 1 }
+          $acl = Get-Acl C:\kairo\tools\gitconfig
+          if ($acl.Owner -ne 'BUILTIN\Administrators') { Write-Host "::error::second run left gitconfig owned by $($acl.Owner)"; exit 1 }
+          $explicit = @($acl.GetAccessRules($true, $false, [System.Security.Principal.NTAccount]))
+          if ($explicit.Count -gt 0) { Write-Host ("::error::second run left explicit entries on gitconfig: " + (($explicit | ForEach-Object { [string] $_.IdentityReference + ' ' + $_.FileSystemRights }) -join '; ')); exit 1 }
+          icacls C:\kairo\tools\gitconfig
           if ($bad.Count -gt 0) { exit 1 }
 
       - name: doctor.ps1 after the bootstrap

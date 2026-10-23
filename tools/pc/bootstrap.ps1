@@ -1070,6 +1070,24 @@ function Install-WingetPackage {
     return New-Object psobject -Property @{ Code = $code; Ok = $ok }
 }
 
+function Assert-NoOutsideLink([string] $LeftAlone) {
+    # Recursive icacls changes follow links, so they run only while C:\kairo holds none but bin\current, a junction
+    # to a build inside C:\kairo\bin.
+    $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
+    if ($links.Count -gt 0) {
+        throw ('C:\kairo contains links that may point outside it ({0}), so {1}. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '), $LeftAlone)
+    }
+    if (Test-Path -LiteralPath $CurrentBin) {
+        $item = Get-Item -LiteralPath $CurrentBin -Force
+        if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $target = ([string] (@($item.Target) | Select-Object -First 1)) -replace '^\\\?\?\\', ''
+            if (-not $target.StartsWith($BinDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw ('C:\kairo\bin\current points outside C:\kairo\bin ({0}), so {1}. Tell Claude.' -f $target, $LeftAlone)
+            }
+        }
+    }
+}
+
 function Initialize-KairoTree([string] $OwnerSid) {
     # C:\kairo (docs/milestones/M0.md): Administrators and SYSTEM have full control and own everything; you can
     # read and run it all, but your own programs (kairo-devrun, kairo-hello, the watch agent) write only in logs
@@ -1086,21 +1104,8 @@ function Initialize-KairoTree([string] $OwnerSid) {
         if (@($SidAdministrators, $SidSystem) -notcontains $owner) {
             throw ('C:\kairo already exists, but this setup did not create it (its owner is {0}). If nothing in it matters, delete it, otherwise move it away; then run the command again.' -f (Resolve-SidName $owner))
         }
-        # Resetting permissions below must never follow a link out of C:\kairo. Only bin\current, a junction to
-        # a build inside C:\kairo\bin, is expected.
-        $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
-        if ($links.Count -gt 0) {
-            throw ('C:\kairo contains links that may point outside it ({0}), so its permissions were left alone. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '))
-        }
-        if (Test-Path -LiteralPath $CurrentBin) {
-            $item = Get-Item -LiteralPath $CurrentBin -Force
-            if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $target = ([string] (@($item.Target) | Select-Object -First 1)) -replace '^\\\?\?\\', ''
-                if (-not $target.StartsWith($BinDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-                    throw ('C:\kairo\bin\current points outside C:\kairo\bin ({0}), so C:\kairo was left alone. Tell Claude.' -f $target)
-                }
-            }
-        }
+        # Resetting permissions below must never follow a link out of C:\kairo.
+        Assert-NoOutsideLink 'its permissions were left alone'
     } else {
         # Created with its final permissions in one call: inheriting from C:\ would give every signed-in user
         # Modify on it until icacls ran.
@@ -1161,26 +1166,27 @@ function Get-KairoAclProblem([string] $OwnerSid) {
 
 function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
 
-function Set-KairoOwnership {
-    # Administrators own everything in C:\kairo but logs and state (docs/milestones/M0.md). Depending on a Windows
-    # policy, files an elevated window creates belong to Administrators or to your account, and an owner can always
-    # rewrite a file's permissions; so this runs after the steps that add files (Git settings, the code folder,
-    # FFmpeg, PresentMon). icacls /T follows links, so only while C:\kairo has none but bin\current.
-    $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
-    if ($links.Count -gt 0) {
-        throw ('C:\kairo contains links that may point outside it ({0}), so the owner was left as it is. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '))
-    }
+function Set-KairoOwnership([string] $OwnerSid) {
+    # Administrators own everything in C:\kairo but logs and state, and nothing in src, bin, jobs or tools has
+    # permissions of its own (docs/milestones/M0.md). Depending on a Windows policy, files an elevated window creates
+    # belong to Administrators or to your account, and an owner can always rewrite a file's permissions; so this runs
+    # after the steps that add files (Git settings, the code folder, FFmpeg, PresentMon): first the owner, then a reset
+    # that removes anything an owner may have added in the meantime.
+    Assert-NoOutsideLink 'the owner was left as it is'
     Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/C', '/Q')
     foreach ($d in @($SrcDir, $BinDir, $JobsDir, $ToolsDir)) {
         Invoke-Icacls @($d, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
+        Invoke-Icacls @($d, '/reset', '/T', '/C', '/Q')
     }
+    $problem = Get-KairoAclProblem $OwnerSid
+    if ($problem) { throw ('C:\kairo permissions are not as expected: ' + $problem) }
     # icacls fails on any file it could not change; these spot checks cover what the doctor checks too.
     foreach ($p in @($KairoRoot, $SrcDir, $BinDir, $JobsDir, $ToolsDir, $GitConfigFile)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }
         $owner = (Get-Acl -LiteralPath $p).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         if ($owner -ne $SidAdministrators) { throw ('{0} is still owned by {1}, not Administrators.' -f $p, (Resolve-SidName $owner)) }
     }
-    return 'Administrators own C:\kairo and everything in src, bin, jobs and tools'
+    return 'Administrators own C:\kairo and everything in src, bin, jobs and tools, which have no permissions of their own'
 }
 
 function Install-Git {
@@ -2155,7 +2161,7 @@ function Invoke-Bootstrap {
         Invoke-Step 'Download FFmpeg 9.0.2 LGPL (BtbN, SHA-256 checked)' { Assert-KairoTree; Install-Ffmpeg }
         Invoke-Step 'Download PresentMon 2.6.0 (SHA-256 checked)' { Assert-KairoTree; Install-PresentMon }
         Invoke-Step 'Set LIBCLANG_PATH and FFMPEG_DIR' { Set-BuildEnvironment }
-        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs and state)' { Assert-KairoTree; Set-KairoOwnership }
+        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs and state)' { Assert-KairoTree; Set-KairoOwnership $ownerInfo.Sid }
 
         # ---- 4. Report -----------------------------------------------------------------------------------------
         Write-Title 'Write C:\kairo\state\bootstrap-report.json'
