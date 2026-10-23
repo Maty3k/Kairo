@@ -195,6 +195,7 @@ $Ctx = @{
     SshdRestartPending = $false
     SshLeftOff         = $false   # a failed SSH step stopped sshd and set it to Manual (fail closed)
     TreeOk             = $false   # C:\kairo has the permissions of the M0 contract; later steps write into it only then
+    VsUsageOff         = $false   # Visual Studio's optional usage data is off; the Build Tools install waits for it
     DisabledRules      = @()
     FirewallInterfaces = @()
     SshdBackup         = $null
@@ -1226,12 +1227,15 @@ function Set-VsUsageDataOff {
     $null = New-ItemProperty -Path $VsSqmPolicyKey -Name 'OptIn' -Value 0 -PropertyType DWord -Force
     $read = (Get-ItemProperty -LiteralPath $VsSqmPolicyKey -Name 'OptIn').OptIn
     if ($read -ne 0) { throw ('OptIn reads back as {0}, not 0.' -f $read) }
+    $Ctx.VsUsageOff = $true
     return ('OptIn = 0 under {0}' -f $VsSqmPolicyKey)
 }
 
 function Install-BuildTools {
     $have = Get-VsCppPath
     if ($have) { return ('already installed: ' + $have) }
+    # The owner agreed to the install with Visual Studio's optional usage data off, so it never runs with it on.
+    if (-not $Ctx.VsUsageOff) { throw 'Not installed: Visual Studio''s optional usage data could not be switched off (see the step before). Tell Claude.' }
     Write-Note 'This is the longest step (often 10 to 25 minutes). A Visual Studio Installer window shows the progress.'
     $res = Install-WingetPackage -Id 'Microsoft.VisualStudio.BuildTools' -Override $VsOverride
     $have = Get-VsCppPath
