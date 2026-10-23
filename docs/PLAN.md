@@ -307,7 +307,7 @@ Languages: Rust (engine, UI shell, tools), TypeScript/React (UI), HLSL (runtime-
 |---|---|
 | Toolchain | Rust 1.99.1, cargo-xwin 0.23.1, Node 24.22.1 LTS, PowerShell 7.6.7, PresentMon 2.6.0 |
 | Engine | `windows` =0.62.2; `ffmpeg-next` =9.0.0 + `ffmpeg-sys-next` =9.0.1 over FFmpeg 9.0.2 LGPL (dev PC: BtbN `n9.0.2-29-g6dfaba896f`; distributed: Kairo's own build, §3.3); `wasapi` =0.26.0; `rubato` =5.0.1; `tray-icon` 0.26.1; `tokio` 1.54.0; `ts-rs` 12.0.1; `schemars` 1.2.3; `rusqlite` 0.40.2; `steamlocate` 2.1.1; `sentry` 0.49.3; `crash-handler` 0.8.1; `minidumper` 0.11.0; `minisign-verify` (pin at implementation time) |
-| UI | `tauri` 2.12.4 (review 2.12.5 in M0, P20) + single-instance 2.5.4, drag 2.1.1 (Mac mock only); React 19.3.1; Vite 8.3.5; TypeScript 6.0.3; Tailwind 4.3.3; TanStack Query/Virtual; wavesurfer.js 8.0.3; i18next 26.5.4; Vitest 5.0.5; WebdriverIO 9.32.0 |
+| UI | `tauri` =2.12.5 + `tauri-build` =2.7.4 (reviewed in M0, P20) + single-instance 2.5.4, drag 2.1.1 (Mac mock only); React 19.3.1; Vite 8.3.5; TypeScript 6.0.3; Tailwind 4.3.3; TanStack Query/Virtual; wavesurfer.js 8.0.3; i18next 26.5.4; Vitest 5.0.5; WebdriverIO 9.32.0 |
 | Later / C# exit | GameInput 4.0.302; Velopack 1.2.161; Laravel 13.x · .NET 10 NativeAOT, CsWinRT 2.3.1, CsWin32 0.3.366, Vortice 3.8.3, NAudio 3.3.0, FFmpeg.AutoGen 9.0.1.1, StreamJsonRpc 2.26.150 |
 | Not used | `windows-capture`, `global-hotkey`, `auto-launch`, the `interprocess` client, `sentry-rust-minidump`, `tauri-plugin-updater` (updates live in control), Video.js, ADLX (licence unchecked) |
 

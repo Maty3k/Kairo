@@ -4,13 +4,15 @@
 
 **How this was checked.** Versions were read from the crates.io and npm registries on 2026-10-21. API claims were checked against the source of the exact released versions: tag `tauri-v2.12.4` (tauri, tauri-runtime-wry, the JS API), `wry-v0.57.0`, the `windows` 0.62.2 crate source, interprocess 2.4.6, ts-rs 12.0.1, arboard 3.7.0, wavesurfer.js 8.0.3, @radix-ui/react-slider 1.6.1, the plugins-workspace `v2` branch and drag-rs `v2`. Microsoft Learn and Chromium source were used for WebView2 behaviour.
 
+**Updated 2026-10-23.** After the Tauri 2.12.5 review (cookbook P20, §12 item 22), the pins below are `tauri` =2.12.5, `tauri-build` =2.7.4 and `@tauri-apps/cli` 2.12.4. The files cited under Sources are unchanged at tag `tauri-v2.12.5`, apart from version numbers, the changelogs and a capabilities-folder watch in `tauri-build/src/acl.rs`, so the notes still hold. The updater and process plugins were taken out of the snippets on the same day, because updates live in control (PLAN.md §2.1), and updater artifacts moved to a release-only overlay (§1.5).
+
 **Tags.** Untagged means verified in a primary source or in source code today. **[Unverified]**: I could not confirm it. **[Estimate]**: arithmetic or judgement; measure it. **[Decision]**: a recommendation the plan should adopt or reject explicitly.
 
 ---
 
 ## 0. What the coding agent must know first
 
-1. **Versions (2026-10-21).** Use Tauri **2.12.4** (crate), `@tauri-apps/cli` **2.12.3**, `@tauri-apps/api` **2.12.4** (MSRV 1.90, edition 2024), React **19.3.1**, Vite **8.3.5** with `@vitejs/plugin-react` **6.1.2**, and Node **24.22.1 LTS**.
+1. **Versions (2026-10-21; Tauri moved to 2.12.5 on 2026-10-23).** Use Tauri **=2.12.5** with `tauri-build` **=2.7.4** (crates), `@tauri-apps/cli` **2.12.4**, `@tauri-apps/api` **2.12.4** (MSRV 1.90, edition 2024), React **19.3.1**, Vite **8.3.5** with `@vitejs/plugin-react` **6.1.2**, and Node **24.22.1 LTS**.
    - Use TypeScript **6.0.3**, not 7.0.2. `typescript-eslint` 8.72.0 peers `typescript >=4.8.4 <6.1.0`, and TS 7.0 shipped without a stable programmatic API.
    - Tauri **3.0.0-alpha.5** is on the npm `next` tag. Never install `@next` versions.
 2. **Window lifecycle works as Kairo needs by default.** This was verified in source:
@@ -34,7 +36,7 @@
    - `window-state` 2.5.0: exclude `VISIBLE`.
    - `opener` 2.7.2: call `reveal_item_in_dir` from Rust.
    - `dialog` 2.8.3.
-   - `updater` 2.14.0 + `process` 2.4.0.
+   - No `updater` or `process` plugin: updates live in control (PLAN.md §2.1; `deny.toml` bans `tauri-plugin-updater`), and `exit()` is in `@tauri-apps/api/app` since 2.12.0 (permission `core:app:allow-exit`).
    - `tauri-plugin-drag` 2.1.1 (crate) with `@crabnebula/tauri-plugin-drag` 2.1.0 (npm). It works, but its Windows backend uses `windows` 0.52, and it has open crash and hang issues (#72, #76, #94). Guard the paths you pass and keep the ~15-line fallback in §6.2.
    - `clipboard-manager` 2.5.0 can't put files on the clipboard; use the `CF_HDROP` code in §6.1.
 7. **CSP.**
@@ -60,10 +62,10 @@
 
 | Component | Version (date) | Notes |
 |---|---|---|
-| `tauri` | 2.12.4 (2026-10-14), MSRV 1.90 | 2.12.0 (2026-09-26): async `asset://`, multipart fix, `Webview::convert_file_src`, `appDirectoriesOverride`, `exit()` in `@tauri-apps/api/app`, MSRV 1.90, edition 2024. It also **updated `windows` to 0.62 and `webview2-com` to 0.39** (drops Windows 7). |
-| `tauri-build` / `tauri-cli` | 2.7.3 / 2.12.3 | npm `@tauri-apps/cli` 2.12.3 |
+| `tauri` | 2.12.5 (2026-10-21), MSRV 1.90 | 2.12.5 changes only a Linux doc comment in `tauri` itself (cookbook §12 item 22). 2.12.0 (2026-09-26): async `asset://`, multipart fix, `Webview::convert_file_src`, `appDirectoriesOverride`, `exit()` in `@tauri-apps/api/app`, MSRV 1.90, edition 2024. It also **updated `windows` to 0.62 and `webview2-com` to 0.39** (drops Windows 7). |
+| `tauri-build` / `tauri-cli` | 2.7.4 / 2.12.4 | npm `@tauri-apps/cli` 2.12.4 (bundler 2.10.4) |
 | `@tauri-apps/api` | 2.12.4 | `next` tag = 3.0.0-alpha.3. Don't use it. |
-| wry / tao / webview2-com | 0.57.0 / 0.37.1 / 0.39.1 | Pulled in by tauri-runtime-wry 2.12.2 |
+| wry / tao / webview2-com | 0.57.0 / 0.37.1 / 0.39.1 | Pulled in by tauri-runtime-wry 2.12.3 |
 | `create-tauri-app` | 4.7.5 | `react-ts` template pins `typescript ~6.0.3`, `vite ^8.0.16`, `@vitejs/plugin-react ^6.0.2`, `react ^19.1.0` |
 | React / react-dom | 19.3.1 | |
 | Vite / plugin-react | 8.3.5 / 6.1.2 | Vite 8 needs Node `^20.19 \|\| >=22.12` |
@@ -81,8 +83,7 @@ pnpm add @tanstack/react-query@5.104.5 @tanstack/react-virtual@3.14.21 @tanstack
   zustand@5.0.15 lucide-react@1.61.0 motion@14.5.0 @fontsource-variable/inter@5.3.0 \
   wavesurfer.js@8.0.3 react-image-crop@11.1.2 i18next@26.5.4 react-i18next@17.1.0 \
   react-hotkeys-hook@5.3.3 react-error-boundary@6.1.6 sonner@2.0.8 \
-  @tauri-apps/plugin-dialog@2.8.3 @tauri-apps/plugin-updater@2.14.0 @tauri-apps/plugin-process@2.4.0 \
-  @crabnebula/tauri-plugin-drag@2.1.0
+  @tauri-apps/plugin-dialog@2.8.3 @crabnebula/tauri-plugin-drag@2.1.0
 ```
 
 **Choose the bundle identifier once, before the beta.** It is baked into several places:
@@ -112,13 +113,11 @@ Kairo/
 
 ```toml
 [dependencies]
-tauri = { version = "2.12.4", features = [] }   # no "protocol-asset", no "unstable", no "tray-icon"
+tauri = { version = "=2.12.5", features = [] }   # no "protocol-asset", no "unstable", no "tray-icon"
 tauri-plugin-single-instance = "2.5.4"
 tauri-plugin-window-state   = "2.5.0"
 tauri-plugin-opener         = "2.7.2"
 tauri-plugin-dialog         = "2.8.3"
-tauri-plugin-updater        = "2.14.0"
-tauri-plugin-process        = "2.4.0"
 tauri-plugin-drag           = "2.1.1"
 tauri-plugin-wdio-webdriver = { version = "1.5.0", optional = true }   # E2E only
 kairo-protocol = { path = "../../../crates/kairo-protocol" }
@@ -147,7 +146,7 @@ arboard = { version = "3.7.0", default-features = false }   # Set::file_list() f
 e2e = ["dep:tauri-plugin-wdio-webdriver"]
 
 [build-dependencies]
-tauri-build = { version = "2.7.3", features = [] }
+tauri-build = { version = "=2.7.4", features = [] }   # moves with tauri: 2.12.5 needs ^2.7.4
 ```
 
 - Tauri's defaults (`wry`, `compression`, `common-controls-v6`, `dynamic-acl`) are fine.
@@ -191,9 +190,11 @@ tauri-build = { version = "2.7.3", features = [] }
       "dangerousDisableAssetCspModification": ["style-src"]
     }
   },
-  "bundle": { "targets": ["nsis"], "externalBin": ["binaries/kairo-engine"], "createUpdaterArtifacts": true }
+  "bundle": { "targets": ["nsis"], "externalBin": ["binaries/kairo-engine"] }
 }
 ```
+
+- **Updater artifacts** (updated 2026-10-23) come only from the release build, through an overlay: `tauri build --config tauri.release.conf.json` with `{"bundle":{"createUpdaterArtifacts":true},"plugins":{"updater":{"pubkey":"<tauri signer public key>"}}}`. No updater plugin is compiled in, but tauri-cli 2.12.4 stops every bundling build that has `createUpdaterArtifacts` on and no `plugins > updater`. It signs with `TAURI_SIGNING_PRIVATE_KEY` and fails without it unless given `--no-sign`. Control verifies the `.sig` (PLAN.md §2.1).
 
 - **`appDirectoriesOverride`** is documented to move every `app_*_dir`, "including Tauri itself (the default webview data directory on Windows and Linux) and plugins". The window `dataDirectory` option is not affected.
   - With the override, all of Kairo's per-user state lives under `%LOCALAPPDATA%\Kairo`.
@@ -228,7 +229,6 @@ Generated identifiers turn `_` into `-`: `allow-engine-call`. The source is `tau
     "core:default",
     "core:window:allow-show", "core:window:allow-set-focus", "core:window:allow-set-progress-bar",
     "dialog:allow-open", "dialog:allow-save", "dialog:allow-message",
-    "updater:default", "process:allow-restart",
     "drag:allow-start-drag",
     { "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://github.com/Maty3k/Kairo/*" }, { "url": "https://apps.microsoft.com/*" }] },
@@ -240,8 +240,6 @@ Generated identifiers turn `_` into `-`: `allow-engine-call`. The source is `tau
 
 - `core:window:default` is read-only (getters only). `show`, `set-focus` and `set-progress-bar` must be listed explicitly.
 - `dialog:default` = `allow-message, allow-save, allow-open`.
-- `updater:default` covers check, download and install.
-- `process:default` = `allow-exit, allow-restart`.
 - `drag:default` = `allow-start-drag`.
 - **E2E**: `wdio-webdriver:default` must not appear in `main.json`, because the plugin isn't compiled into normal builds. Put it inline in an E2E-only overlay: `tauri build --features e2e --config tauri.e2e.conf.json` with `{"app":{"security":{"capabilities":["main",{"identifier":"e2e","windows":["main"],"permissions":["wdio-webdriver:default"]}]}}}`.
 
@@ -265,7 +263,6 @@ pub fn run() {
             .build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_drag::init())
         .register_asynchronous_uri_scheme_protocol("kairo-media", media_protocol::handle)
         .invoke_handler(tauri::generate_handler![
@@ -273,8 +270,6 @@ pub fn run() {
             shell::clip_copy, shell::clip_reveal, shell::clip_drag_win,
         ])
         .setup(|app| {
-            #[cfg(desktop)]
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
             app.manage(engine_client::EngineClient::spawn(app.handle().clone()));
             app.manage(media_protocol::MediaResolver::default());
             let cfg = app.config().app.windows.iter().find(|w| w.label == "main").unwrap().clone();
@@ -1305,8 +1300,8 @@ declare module 'i18next' { interface CustomTypeOptions { defaultNS: 'common'; re
 ## 9. Recommended packages (copy-paste)
 
 **npm (apps/ui):**
-- **Dependencies:** react@19.3.1 react-dom@19.3.1 @tauri-apps/api@2.12.4 @tauri-apps/plugin-dialog@2.8.3 @tauri-apps/plugin-updater@2.14.0 @tauri-apps/plugin-process@2.4.0 @crabnebula/tauri-plugin-drag@2.1.0 @tanstack/react-query@5.104.5 @tanstack/react-virtual@3.14.21 @tanstack/react-router@1.170.45 zustand@5.0.15 radix-ui@1.8.1 class-variance-authority@0.7.1 clsx@2.1.1 tailwind-merge@3.7.0 lucide-react@1.61.0 motion@14.5.0 @fontsource-variable/inter@5.3.0 wavesurfer.js@8.0.3 react-image-crop@11.1.2 i18next@26.5.4 react-i18next@17.1.0 react-hotkeys-hook@5.3.3 react-error-boundary@6.1.6 sonner@2.0.8
-- **Dev dependencies:** typescript@6.0.3 @types/react@19.3.0 @types/react-dom@19.3.0 @types/node@^24 vite@8.3.5 @vitejs/plugin-react@6.1.2 tailwindcss@4.3.3 @tailwindcss/vite@4.3.3 tw-animate-css@1.4.0 @tauri-apps/cli@2.12.3 vitest@5.0.5 @vitest/coverage-v8@5.0.5 @vitest/browser-playwright@5.0.5 playwright@1.64.1 vitest-browser-react@2.3.0 jsdom@30.1.3 @testing-library/react@16.3.3 @testing-library/dom@10.4.2 @testing-library/user-event@14.6.8 @testing-library/jest-dom@7.0.1 axe-core@4.14.0 eslint@9.39.5 @eslint/js@9.39.5 typescript-eslint@8.72.0 eslint-plugin-react-hooks@7.1.1 eslint-plugin-react-refresh@0.5.7 eslint-plugin-jsx-a11y@6.10.2 eslint-plugin-i18next@6.1.5 globals@17.13.0 prettier@3.9.10 prettier-plugin-tailwindcss@0.8.1 webdriverio@9.32.0 @wdio/cli@9.32.0 @wdio/local-runner@9.32.0 @wdio/mocha-framework@9.32.0 @wdio/spec-reporter@9.32.0 @wdio/tauri-service@1.5.0
+- **Dependencies:** react@19.3.1 react-dom@19.3.1 @tauri-apps/api@2.12.4 @tauri-apps/plugin-dialog@2.8.3 @crabnebula/tauri-plugin-drag@2.1.0 @tanstack/react-query@5.104.5 @tanstack/react-virtual@3.14.21 @tanstack/react-router@1.170.45 zustand@5.0.15 radix-ui@1.8.1 class-variance-authority@0.7.1 clsx@2.1.1 tailwind-merge@3.7.0 lucide-react@1.61.0 motion@14.5.0 @fontsource-variable/inter@5.3.0 wavesurfer.js@8.0.3 react-image-crop@11.1.2 i18next@26.5.4 react-i18next@17.1.0 react-hotkeys-hook@5.3.3 react-error-boundary@6.1.6 sonner@2.0.8
+- **Dev dependencies:** typescript@6.0.3 @types/react@19.3.0 @types/react-dom@19.3.0 @types/node@^24 vite@8.3.5 @vitejs/plugin-react@6.1.2 tailwindcss@4.3.3 @tailwindcss/vite@4.3.3 tw-animate-css@1.4.0 @tauri-apps/cli@2.12.4 vitest@5.0.5 @vitest/coverage-v8@5.0.5 @vitest/browser-playwright@5.0.5 playwright@1.64.1 vitest-browser-react@2.3.0 jsdom@30.1.3 @testing-library/react@16.3.3 @testing-library/dom@10.4.2 @testing-library/user-event@14.6.8 @testing-library/jest-dom@7.0.1 axe-core@4.14.0 eslint@9.39.5 @eslint/js@9.39.5 typescript-eslint@8.72.0 eslint-plugin-react-hooks@7.1.1 eslint-plugin-react-refresh@0.5.7 eslint-plugin-jsx-a11y@6.10.2 eslint-plugin-i18next@6.1.5 globals@17.13.0 prettier@3.9.10 prettier-plugin-tailwindcss@0.8.1 webdriverio@9.32.0 @wdio/cli@9.32.0 @wdio/local-runner@9.32.0 @wdio/mocha-framework@9.32.0 @wdio/spec-reporter@9.32.0 @wdio/tauri-service@1.5.0
 
 **Cargo:**
 - The shell crate (§1.4).
