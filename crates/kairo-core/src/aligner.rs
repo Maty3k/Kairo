@@ -697,7 +697,7 @@ mod tests {
     // not), and check where impulses land and that every splice is faded.
 
     /// How far behind real time the mixer reads: 200 ms (research 10 §5.2).
-    const MIX_DELAY: i64 = 9_600;
+    const MIX_DELAY: i64 = crate::mix::MIX_DELAY_FRAMES;
     /// One millisecond, in samples.
     const MS: f64 = 48.0;
 
