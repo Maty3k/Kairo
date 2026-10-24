@@ -26,7 +26,7 @@ env:
 
 jobs:
   linux:
-    name: Linux (fmt, clippy, kairo-core tests, house rules)
+    name: Linux (fmt, clippy, kairo-core and mock tests, house rules)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -41,12 +41,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      # kairo-core plus the binaries' non-Windows stubs.
+      # kairo-core, the mock engine's Unix code (only this job lints and tests it) and the
+      # Windows binaries' non-Windows stubs.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Test kairo-core
-        run: cargo test -p kairo-core --locked
+      - name: Test kairo-core and the mock engine
+        run: cargo test -p kairo-core -p kairo-mock-engine --locked
 
       - name: House rules (forbidden APIs, sockets outside kairo-net)
         run: |
