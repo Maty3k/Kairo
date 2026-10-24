@@ -1,7 +1,7 @@
 # CLAUDE.md: Kairo house rules
 Windows instant-replay clipper, GPL-3.0, PUBLIC repo. The owner play-tests and decides; you build everything.
 Read first: docs/PLAN.md, docs/adr/, docs/milestones/<current>.md; before engine work, docs/research/15-implementation-cookbook.md. Gates, never dates.
-Current milestone: M0, see docs/milestones/M0.md
+Current milestone: M1, see docs/milestones/M1.md (M0 closed 2026-10-23)
 
 ## Never (anti-cheat; CI enforces)
 1. Code in other processes: injection, graphics hooks, CreateRemoteThread, in-context or low-level hooks.
