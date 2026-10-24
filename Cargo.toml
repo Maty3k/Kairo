@@ -27,6 +27,10 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # Each crate enables only the Win32 features it uses.
 windows = "=0.62.2"
+# Audio resampling for kairo-core's SourceAligner (research 10 §5.4). Without default features
+# it leaves out the FFT resampler and its realfft and num-complex dependencies. Checked on
+# crates.io on 2026-10-24: MIT OR Apache-2.0.
+rubato = { version = "=5.0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
