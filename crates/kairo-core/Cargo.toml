@@ -1,6 +1,6 @@
 [package]
 name = "kairo-core"
-description = "Kairo's platform-independent core; in M0 the dev-loop contract shared by the PC tools."
+description = "Kairo's platform-independent core: the dev-loop contract shared by the PC tools and the engine's media maths."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
