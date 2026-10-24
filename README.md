@@ -2,7 +2,7 @@
 
 Catch the perfect moment. Kairo clips your best plays from games and anything else on your screen.
 
-**Status:** planning is done and milestone M0 (setup and bridge) is in progress. There is nothing to download or install yet. "Kairo" is a working name; the public name is settled before launch.
+**Status:** planning is done, milestone M0 (setup and bridge) closed on 2026-10-23, and milestone M1 (test instruments) is in progress. There is nothing to download or install yet. "Kairo" is a working name; the public name is settled before launch.
 
 ## What it is
 
@@ -37,7 +37,8 @@ Windows 11 and AMD Radeon RX 7000/9000 graphics come first. NVIDIA and Intel gra
 |---|---|
 | [docs/PLAN.md](docs/PLAN.md) | The implementation plan: product, architecture, milestones and decisions |
 | [SETUP.md](SETUP.md) | Setting up the Windows test PC (milestone M0) |
-| [docs/milestones/M0.md](docs/milestones/M0.md) | The current milestone: goal, gate, test card and progress |
+| [docs/milestones/M1.md](docs/milestones/M1.md) | The current milestone: goal, gate, your part and progress |
+| [docs/milestones/M0.md](docs/milestones/M0.md) | Milestone M0, setup and bridge (closed 2026-10-23), with its gate report |
 | [docs/adr/](docs/adr/) | Architecture decision records |
 | [docs/research/](docs/research/) | The research behind the plan |
 | [CLAUDE.md](CLAUDE.md) | House rules for the coding agent |
