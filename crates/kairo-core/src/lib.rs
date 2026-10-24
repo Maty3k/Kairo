@@ -10,7 +10,8 @@
 //! with its offline replay, cadence statistics, the replay ring with the cut that turns it into
 //! a clip, the aligner that places each audio source on the 48 kHz timeline, and the mixer
 //! with its limiter and meters. These modules take times as arguments and never read a clock.
-//! It also holds pattern v1, the test signal the testbed draws and `kairo-verify` reads back.
+//! It also holds pattern v1, the test signal the testbed draws and `kairo-verify` reads back,
+//! and the logs the testbed and `kairo-tone` write as ground truth.
 //! The crate has no Windows code, so its tests run on the Mac and on Linux CI.
 
 #![forbid(unsafe_code)]
@@ -28,6 +29,7 @@ pub mod mix;
 pub mod pacer;
 pub mod ring;
 pub mod rpc;
+pub mod testbed_log;
 pub mod testsig;
 pub mod time;
 pub mod timeline;
