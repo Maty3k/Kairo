@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kairo-core` media maths: the clock that ties output ticks and audio samples to QPC time, the frame pacer, the `wgc-probe` trace format with its offline replay, and cadence statistics (#10).
 - `kairo-core` replay ring and clip cut: keyframe-indexed packets evicted a whole GOP at a time, gapless audio tracks, pins for saves in flight, and cutting a clip that starts on a keyframe, never spans two encoder epochs and starts its audio one AAC packet early (#11).
 - `kairo-core` audio aligner: places each capture source on the 48 kHz timeline, follows its clock drift with a PI loop steering the rubato 5.0.1 resampler, and splices over gaps, overlaps, pauses and reported losses with 2 ms fades, never behind the mixer (#12).
+- `kairo-core` mixer: stem tracks clipped for their encoders; the mix track as the sum of the stems in the mix times their gains (ramped across a block), through a look-ahead limiter that holds it under −1 dBFS whatever the input; peak and RMS meters; and a mixer catch-up capped at one second (#13).
 
 ### Changed
 
