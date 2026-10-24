@@ -53,7 +53,7 @@ $ProgressPreference = 'SilentlyContinue'
 # =============================================================================================================
 # Names from the M0 contract (docs/milestones/M0.md). Change them there first, then everywhere.
 # =============================================================================================================
-$BootstrapVersion = 'm0-2026-10-23'
+$BootstrapVersion = 'm1-2026-10-24'
 $KairoRoot  = 'C:\kairo'
 $SrcDir     = 'C:\kairo\src'
 $BinDir     = 'C:\kairo\bin'
@@ -152,13 +152,13 @@ $NodePreferred = '24.22.1'
 # 2026-10-21. TODO(verify): keep in step with apps/ui/package.json "packageManager" once that file exists.
 $PnpmVersion = '12.14.0'
 
-# FFmpeg: BtbN LGPL shared build of n9.0.2 (PLAN section 2.11: n9.0.2-29-g6dfaba896f). The SHA-256 matches both
-# the GitHub release asset digest and BtbN's own checksums.sha256 for release autobuild-2026-10-20-13-08.
-# NOTE: BtbN keeps daily builds for 14 days (month-end builds for 2 years), so this URL stops working around
-# 2026-11-03. After that, re-pin (for example to the 2026-10-31 month-end build) and update PLAN section 2.11.
-$FfmpegAsset  = 'ffmpeg-n9.0.2-29-g6dfaba896f-win64-lgpl-shared-9.0'
-$FfmpegUrl    = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-20-13-08/ffmpeg-n9.0.2-29-g6dfaba896f-win64-lgpl-shared-9.0.zip'
-$FfmpegSha256 = 'c39750c8dfe849e4389843e5f4af51e8062a6d6a3e8b74c1fd7e469594ef68e2'
+# FFmpeg: BtbN LGPL shared build of n9.0.2 (PLAN section 2.11: n9.0.2-17-g2a571b6068). The SHA-256 matches the
+# GitHub release asset digest, BtbN's own checksums.sha256 for release autobuild-2026-09-30-13-08 and a local hash.
+# BtbN keeps month-end builds like this one for 2 years (daily builds only for 14 days), so this URL works until
+# about 2028-09. Re-pin only to another month-end build, and update PLAN section 2.11 and doctor.ps1 with it.
+$FfmpegAsset  = 'ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-shared-9.0'
+$FfmpegUrl    = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-shared-9.0.zip'
+$FfmpegSha256 = '7157177b8a6cb2174c1650ba8c71b363f2c78cba5330f88c4c02cf5b2b880646'
 $FfmpegDir    = 'C:\kairo\tools\ffmpeg'
 
 # PresentMon 2.6.0 console build, official GameTechDev release v2.6.0 (980,320 bytes). The SHA-256 matches the

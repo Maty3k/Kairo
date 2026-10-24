@@ -118,7 +118,7 @@ Kairo/                        (public, GPL-3.0; "-only" vs "-or-later" is Q18)
 | `windows-registry` | 0.6.1 | — | MIT OR Apache-2.0 | Run key, AMD hints (not 0.100) |
 | `ffmpeg-next` | =9.0.0 | `default-features=false`, `codec`, `format`, `software-resampling` | WTFPL | encoders, packets, mux (9.0.1 is git-only **[RC]**) |
 | `ffmpeg-sys-next` | =9.0.1 | `default-features=false`, `avcodec`, `avformat`, `swresample` | WTFPL | raw FFI; `links="ffmpeg"`: one sys crate only |
-| FFmpeg DLLs | BtbN `autobuild-2026-10-20-13-08`, `n9.0.2-29-g6dfaba896f` lgpl-shared | the engine links avcodec-63, avformat-63, avutil-61, swresample-7; the export `ffmpeg.exe` also needs avfilter-12, swscale-10, avdevice-63 | LGPL-3.0 | mirrored with source in Kairo releases (zip 77,233,322 B; 7 DLLs 149.2 MiB **[RC]**) |
+| FFmpeg DLLs | BtbN `autobuild-2026-09-30-13-08` (a month-end build, kept 2 years), `n9.0.2-17-g2a571b6068` lgpl-shared | the engine links avcodec-63, avformat-63, avutil-61, swresample-7; the export `ffmpeg.exe` also needs avfilter-12, swscale-10, avdevice-63 | LGPL-3.0 | mirrored with source in Kairo releases (zip 76,972,461 B; 7 DLLs 148.9 MiB **[RC]**) |
 | `wasapi` | =0.26.0 | — | MIT | WASAPI capture |
 | `rubato` | =5.0.1 | — | MIT OR Apache-2.0 | drift resampler |
 | `rtrb` / `crossbeam-channel` / `bytemuck` | 0.3.5 / 0.5.17 / 1.25.2 | — | MIT OR Apache-2.0 / same / Zlib OR Apache-2.0 OR MIT | SPSC audio, sync channels, slice casts |
@@ -605,7 +605,7 @@ pub fn write_clip(tmp: &Path, streams: &[OutStream], packets: &[SnapPacket], met
 | Mac (check) | `brew install llvm`; `LIBCLANG_PATH=$(brew --prefix llvm)/lib`; copy `include/` + `lib/` of the same zip to `~/kairo-deps/ffmpeg-9.0-lgpl-shared`; `FFMPEG_DIR=… cargo xwin check --target x86_64-pc-windows-msvc -p kairo-engine` **[U end to end; M0 exit 5]** |
 | Fallback | hand mirrors (already) or a vendored `ffmpeg-sys-next` reading bindings generated on the PC |
 
-LGPL checklist: no `--enable-gpl/nonfree`; dynamic DLLs with standard names; exact source (FFmpeg at 6dfaba896f, configure line, BtbN scripts, bundled libs) next to the binaries; About box "uses libraries from the FFmpeg project under the LGPLv3"; never refuse modified DLLs. Own trimmed build in M11 (nv-codec-headers 12.1.14.0 → drivers ≥531.61).
+LGPL checklist: no `--enable-gpl/nonfree`; dynamic DLLs with standard names; exact source (FFmpeg at 2a571b6068, configure line, BtbN scripts, bundled libs) next to the binaries; About box "uses libraries from the FFmpeg project under the LGPLv3"; never refuse modified DLLs. Own trimmed build in M11 (nv-codec-headers 12.1.14.0 → drivers ≥531.61).
 
 ---
 

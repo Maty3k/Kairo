@@ -261,11 +261,22 @@ jobs:
           icacls C:\kairo
           if ($bad.Count -gt 0) { exit 1 }
 
+      # The doctor exits 1 here (no build is deployed yet), so only its FFmpeg checks must pass: the pinned
+      # build is installed with its development files and has every encoder and filter M0 lists.
       - name: doctor.ps1 after the bootstrap
         if: always()
         shell: powershell
         working-directory: ${{ runner.temp }}
         run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\tools\pc\doctor.ps1"
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\tools\pc\doctor.ps1"
           Write-Host "doctor exit code: $LASTEXITCODE (1 is expected here: no build is deployed yet)"
+          $out
+          $ff = (($out -join "`n") | ConvertFrom-Json).ffmpeg
+          $missing = @()
+          foreach ($p in @($ff.encoders.PSObject.Properties) + @($ff.filters.PSObject.Properties)) { if (-not $p.Value) { $missing += $p.Name } }
+          if (-not ($ff.present -and $ff.pin_ok -and $ff.dev_files) -or $missing.Count -gt 0) {
+            Write-Host ('::error::FFmpeg after the bootstrap: present={0} pin_ok={1} dev_files={2} missing: {3}' -f $ff.present, $ff.pin_ok, $ff.dev_files, ($missing -join ', '))
+            exit 1
+          }
+          Write-Host ('FFmpeg: {0}' -f $ff.version)
           exit 0
