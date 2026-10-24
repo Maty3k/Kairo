@@ -297,7 +297,7 @@ Kairo/ (public, GPL-3.0)  CLAUDE.md LICENSE SECURITY.md PRIVACY.md CHANGELOG.md 
 │           kairo-verify · kairo-testbed · kairo-loadgen · kairo-probes · kairo-devrun
 ├─ apps/ui/  Tauri 2 (src-tauri: engine client, kairo-media, clipboard, drag) + React/TS
 ├─ locales/ · data/{games,known-bad-drivers}.json · tools/{mac,pc}/ · .claude/commands/
-└─ docs/  PLAN.md (this plan) · research/ (00–13, 15, prototypes/) · adr/ · spikes/ · milestones/
+└─ docs/  PLAN.md (this plan) · research/ (00–13, 15, 16, prototypes/) · adr/ · spikes/ · milestones/
 kairo-cloud/ (separate PRIVATE repo, Laravel 13, Stage C)
 ```
 
