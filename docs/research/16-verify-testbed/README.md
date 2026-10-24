@@ -273,10 +273,10 @@ kairo_core::testsig (pattern v1: Scene(N) = solid rects + 1-D bands + texture ba
 - **Exclusive.** It needs keyboard focus: `SetFullscreenState` fails with `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` when "the output window does not have keyboard focus" (MS). So exclusive implies `--activate`, then:
   1. `SetFullscreenState(TRUE, output)` on the `IDXGIOutput` whose `Monitor` equals the HMONITOR;
   2. `ResizeBuffers`, which flip-model swap chains need after the switch (MS);
-  3. `GetFullscreenState` must report TRUE: `e fse ok`, otherwise `e fse failed` and exit 5.
+  3. `GetFullscreenState` must report TRUE: `e fse result=ok`, otherwise `e fse result=failed` and exit 5.
 
   Losing fullscreen later logs `e fullscreen_lost`. It keeps the desktop's display mode, uses vsync only, and runs on the 180 Hz monitor only. It exists for M1:159 and SP6.
-- **`--activate`** (exclusive mode, and M1:159's fullscreen test, which `watch.json` can only see as a fullscreen *foreground* window, M0:74). The testbed waits until the owner's last input (`GetLastInputInfo`) is older than the foreground lock time-out (`SPI_GETFOREGROUNDLOCKTIMEOUT`, 200 s by default) plus 5 s. Then it shows the window with `SW_SHOW`, calls `SetForegroundWindow`, checks `GetForegroundWindow` and retries for 10 s; otherwise `e activate failed` and exit 5.
+- **`--activate`** (exclusive mode, and M1:159's fullscreen test, which `watch.json` can only see as a fullscreen *foreground* window, M0:74). The testbed waits until the owner's last input (`GetLastInputInfo`) is older than the foreground lock time-out (`SPI_GETFOREGROUNDLOCKTIMEOUT`, 200 s by default) plus 5 s. Then it shows the window with `SW_SHOW`, calls `SetForegroundWindow`, checks `GetForegroundWindow` and retries for 10 s: `e activate result=ok`, otherwise `e activate result=failed` and exit 5.
   - An expired lock time-out is one of the conditions MS lists, but "it is possible for a process to be denied the right to set the foreground window even if it meets these conditions" (MS) [Unverified for a task-launched process; PR 8's attended run settles it].
   - It never synthesises input, presses keys or attaches to another thread's input (CL:10, ci:59).
   - Fallback: one job with `abort_on_input:false` in which the owner clicks the testbed once (M1:92 allows it when the owner is meant to use the window; asked in §11 Q2).
@@ -380,8 +380,8 @@ h pattern=1 run=93 mode=borderless pace=vsync fps=180 F=180 size=2560x1440 refre
 f <N> <target_hns> <present_hns> <display_hns|->
 b <m> <N_f> <target_hns> <played_hns|->
 m <N> vblank|slot
-e <name> [k=v …]   (ready, activate ok|failed, fse ok|failed, fullscreen_lost, hdr_changed, device_lost,
-                    audio_failed, audio_device_changed, end reason=…)
+e <name> [k=v …]   (ready, activate result=ok|failed, fse result=ok|failed, fullscreen_lost, hdr_changed,
+                    device_lost, audio_failed, audio_device_changed, end reason=…)
 ```
 
 - **Times** are absolute QPC in 100 ns (core/timeline.rs:88).
@@ -421,7 +421,7 @@ testbed.exe --monitor <monitorDevicePath> [--mode borderless|windowed|exclusive]
   - missed vblanks ≤0.1% at fps ≤ refresh in borderless or exclusive mode;
   - display times present and advancing at the refresh;
   - beep played − target within ±1 ms [Estimate];
-  - `e activate ok` and `e fse ok` on the exclusive row;
+  - `e activate result=ok` and `e fse result=ok` on the exclusive row;
   - gate 2's capture reads ≥99.9% of barcodes ("a barcode that survives H.264").
 
 ---
