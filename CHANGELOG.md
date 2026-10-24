@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The bootstrap switches off Visual Studio's optional usage data before installing the Build Tools, and its DONE screen repeats the yellow warnings (#4).
 - Milestone M0 closed on 2026-10-23: all six gates passed (gate report in `docs/milestones/M0.md`).
 - Milestone M1, test instruments: goal, gate and progress (`docs/milestones/M1.md`).
+- `kairo-core` media maths: the clock that ties output ticks and audio samples to QPC time, the frame pacer, the `wgc-probe` trace format with its offline replay, and cadence statistics (#10).
 
 ### Changed
 
