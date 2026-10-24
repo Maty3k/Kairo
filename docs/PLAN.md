@@ -654,8 +654,9 @@ Sizes are relative (S < M < L < XL). No dates: a milestone closes when its gate 
 | 34 | "Kairo" is the working name; the public name is settled before any branding spend | Decided after the private knockout search rated the name HIGH risk; Q22 |
 | 35 | Licence: GPL-3.0-or-later | Answers Q18 |
 | 36 | Smart App Control off on the dev PC (route a) | Answers Q3; decided 2026-10-22, after the bootstrap found it On |
+| 37 | The exit-rule counting in [M1](milestones/M1.md#the-exit-rule-clock): the clock starts with the first `wgc-probe` commit; a counted day is at least 4 hours of engine work with the PC available for at least 2; a day is excluded only with evidence logged that day | Accepts row 26's proposed counting (M1 Your part, step 9); decided 2026-10-24, still open to veto at a gate |
 
-**Plan proposals** (veto any at a gate): instruments before spikes; switchover before the library app; control/media split; engine-owned updates; 2-minute key on by default; Alt+F11 Flag key; press detector in dev/beta; "Natural" HDR curve pending SP3; `bf=0`, no edit lists; Discord target 18,000,000 bytes; pop-up rules; permanent identifier `io.github.maty3k.kairo`; voice-free share copies; the exit-rule counting rules (row 26); no outside code until GPL vs Store is settled.
+**Plan proposals** (veto any at a gate): instruments before spikes; switchover before the library app; control/media split; engine-owned updates; 2-minute key on by default; Alt+F11 Flag key; press detector in dev/beta; "Natural" HDR curve pending SP3; `bf=0`, no edit lists; Discord target 18,000,000 bytes; pop-up rules; permanent identifier `io.github.maty3k.kairo`; voice-free share copies; no outside code until GPL vs Store is settled.
 
 | Q | Open question | Recommendation | Decide by |
 |---|---|---|---|

@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The plan pins Tauri 2.12.5 with `tauri-build` 2.7.4 and drops the updater and process plugins (#3).
 - The PC's FFmpeg pin moves to BtbN's 2026-09-30 month-end build of 9.0.2 (`n9.0.2-17-g2a571b6068`), which BtbN keeps for two years, and the bootstrap's CI job fails if the pinned build lacks an encoder or filter (#14).
+- The plan records decision 37: the owner accepts M1's exit-rule counting (#16).
 
 ### Fixed
 
