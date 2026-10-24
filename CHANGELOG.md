@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kairo-core` mixer: stem tracks clipped for their encoders; the mix track as the sum of the stems in the mix times their gains (ramped across a block), through a look-ahead limiter that holds it under −1 dBFS whatever the input; peak and RMS meters; and a mixer catch-up capped at one second (#13).
 - `kairo-mock-engine`, the Mac's stand-in for the engine: `kairo-engine.sock` in the per-user temp folder with the engine's framing, the `engine.hello` handshake first (refusing another major version) and `engine.shutdown` (#15).
 - The design of `kairo-verify`, the testbed and the voice-tone process, with its research notes (`docs/research/16-verify-testbed/`) (#17).
+- `kairo-core` pattern v1, the test signal the testbed draws and `kairo-verify` reads back: a block barcode with a CRC-16, whitened so no cell holds a level for long, moving bars, a grey ramp, a flash, drifting patches, a load band, a motion variant without barcodes or flash, −30 dBFS tone bursts, BT.709 and 4:2:0 maths, and the PQ and BT.2390 curves for HDR patches (#18).
 
 ### Changed
 
