@@ -5,8 +5,9 @@
 //! Exit codes for `check`: 0 pass (warnings allowed), 1 fail, 2 usage, 3 cannot evaluate (not
 //! an MP4, no H.264 track, unreadable, a non-UTF-8 file name, or a required check this build
 //! can't run), 4 internal (the report couldn't be written). For `mutate`: 0 written, 1 the change
-//! doesn't apply to this clip, 2 usage, 3 the input can't be read or rebuilt, 4 the output can't
-//! be written (it never replaces an existing file). Messages and reports name the file only.
+//! doesn't apply to this clip, 2 usage (an output that names no file included), 3 the input can't
+//! be read or rebuilt, 4 the output can't be written (it never replaces an existing file, and an
+//! interrupted run leaves at most `OUT.partial`). Messages and reports name the file only.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -70,15 +71,15 @@ fn output(value: &OsString) -> Output {
 /// piece of one, since output must not name folders (CLAUDE.md).
 fn shown(word: &OsStr) -> String {
     match word.to_str() {
-        Some(w)
-            if w.len() <= 32
-                && !w.contains(['/', '\\', ':'])
-                && !w.chars().any(char::is_control) =>
-        {
-            format!("{w:?}")
-        }
+        Some(w) if safe_word(w) => format!("{w:?}"),
         _ => "(a word that may be a path, not shown)".to_owned(),
     }
+}
+
+/// Whether a word can't be a path or a piece of one: at most 32 bytes, with no `/`, `\\`, `:` or
+/// control character.
+fn safe_word(word: &str) -> bool {
+    word.len() <= 32 && !word.contains(['/', '\\', ':']) && !word.chars().any(char::is_control)
 }
 
 /// Options README §6.1 documents for the content checks, which come with research 16's PRs 4
@@ -194,51 +195,64 @@ fn parse_mutate(rest: &[OsString]) -> Result<Command, String> {
     let Some((name, rest)) = rest.split_first() else {
         return Err(usage());
     };
-    let (op, files) = match (name.to_str(), rest) {
-        (Some("undo-faststart"), files) => (Op::UndoFaststart, files),
-        (Some("add-elst"), files) => (Op::AddElst, files),
-        (Some("remove-colr"), files) => (Op::RemoveColr, files),
-        (Some("set-colr"), [p, t, m, r, files @ ..]) => {
+    // How many values each change takes before IN and OUT.
+    let count = match name.to_str() {
+        Some("undo-faststart" | "add-elst" | "remove-colr") => 0,
+        Some("set-default") => 1,
+        Some("perturb-stts") => 2,
+        Some("set-colr") => 4,
+        _ => return Err(format!("unknown change {}\n{USAGE}", shown(name))),
+    };
+    let [values @ .., input, output] = rest else {
+        return Err(usage());
+    };
+    if values.len() != count || input.is_empty() || output.is_empty() {
+        return Err(usage());
+    }
+    let op = match (name.to_str(), values) {
+        (Some("set-colr"), [p, t, m, r]) => {
             let code = "set-colr's P, T and M are codes from 0 to 65535";
             let full_range = match r.to_str() {
                 Some("0") => false,
                 Some("1") => true,
                 _ => return Err(format!("set-colr's R is 0 or 1\n{USAGE}")),
             };
-            let op = Op::SetColr {
+            Op::SetColr {
                 primaries: number(p, code)?,
                 transfer: number(t, code)?,
                 matrix: number(m, code)?,
                 full_range,
-            };
-            (op, files)
+            }
         }
-        (Some("set-default"), [title, files @ ..]) => {
+        (Some("set-default"), [title]) => {
+            // Messages repeat the title, so it may not look like a path (CLAUDE.md).
             let title = title
                 .to_str()
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| format!("set-default takes a track title\n{USAGE}"))?;
-            (Op::SetDefault(title.to_owned()), files)
+                .filter(|t| !t.is_empty() && safe_word(t))
+                .ok_or_else(|| {
+                    format!(
+                        "set-default takes a track title (up to 32 bytes, no / \\ or :)\n{USAGE}"
+                    )
+                })?;
+            Op::SetDefault(title.to_owned())
         }
-        (Some("perturb-stts"), [sample, ticks, files @ ..]) => {
+        (Some("perturb-stts"), [sample, ticks]) => {
             let sample = number(sample, "perturb-stts's S is a sample number from 1")?;
             let ticks = number(ticks, "perturb-stts's D is a number of ticks from 1")?;
             if sample == 0 || ticks == 0 {
                 return Err(format!("perturb-stts's S and D start at 1\n{USAGE}"));
             }
-            (Op::PerturbStts { sample, ticks }, files)
+            Op::PerturbStts { sample, ticks }
         }
-        (Some("set-colr" | "set-default" | "perturb-stts"), _) => return Err(usage()),
-        _ => return Err(format!("unknown change {}\n{USAGE}", shown(name))),
+        (Some("undo-faststart"), []) => Op::UndoFaststart,
+        (Some("add-elst"), []) => Op::AddElst,
+        _ => Op::RemoveColr,
     };
-    match files {
-        [input, output] if !input.is_empty() && !output.is_empty() => Ok(Command::Mutate {
-            op,
-            input: PathBuf::from(input),
-            output: PathBuf::from(output),
-        }),
-        _ => Err(usage()),
-    }
+    Ok(Command::Mutate {
+        op,
+        input: PathBuf::from(input),
+        output: PathBuf::from(output),
+    })
 }
 
 /// The file's name for messages and reports, or `None` if it isn't UTF-8.
@@ -352,9 +366,13 @@ fn mutate_file(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let (Some(in_name), Some(out_name)) = (file_name(input), file_name(output)) else {
-        say(err, "the file names must be UTF-8");
+    let Some(in_name) = file_name(input) else {
+        say(err, "the input must be a file with a UTF-8 name");
         return 3;
+    };
+    let Some(out_name) = file_name(output) else {
+        say(err, "the output must be a file with a UTF-8 name");
+        return 2;
     };
     let mut source = match File::open(input) {
         Ok(file) => file,
@@ -364,24 +382,38 @@ fn mutate_file(
         }
     };
     // Never over an existing file, the input included.
-    let file = match File::create_new(output) {
+    if output.symlink_metadata().is_ok() {
+        say(
+            err,
+            &format!("{out_name}: already exists; mutate never replaces a file"),
+        );
+        return 4;
+    }
+    // Written under a temporary name first, then linked to the output's name, which fails if
+    // something took it meanwhile: an interrupted run never leaves a cut clip under that name.
+    let mut partial = output.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    let file = match File::create_new(&partial) {
         Ok(file) => file,
         Err(error) => {
-            say(err, &format!("{out_name}: {error}"));
+            say(err, &format!("{out_name}.partial: {error}"));
             return 4;
         }
     };
     let mut writer = BufWriter::new(file);
     let result = crate::mutate::mutate(&mut source, op, &mut writer)
         .and_then(|()| writer.flush().map_err(MutateError::Write));
+    drop(writer);
+    let result =
+        result.and_then(|()| std::fs::hard_link(&partial, output).map_err(MutateError::Write));
+    let _ = std::fs::remove_file(&partial);
     match result {
         Ok(()) => {
             let _ = writeln!(out, "{out_name}: {in_name} with {op}");
             0
         }
         Err(error) => {
-            drop(writer);
-            let _ = std::fs::remove_file(output);
             let name = if matches!(error, MutateError::Write(_)) {
                 out_name
             } else {
@@ -455,6 +487,22 @@ mod tests {
                 "{line}"
             );
         };
+        // The count of values is checked first, so a missing one says so.
+        for line in [
+            "mutate set-colr 1 1 1 a.mp4 b.mp4",
+            "mutate perturb-stts 100 a.mp4 b.mp4",
+        ] {
+            let message = parse_args(&args(line)).unwrap_err();
+            assert!(
+                message.starts_with("mutate takes a change, its values"),
+                "{line}: {message}"
+            );
+        }
+        let message = parse_args(&args("mutate set-default /x/in.mp4 a.mp4 b.mp4")).unwrap_err();
+        assert!(
+            message.starts_with("set-default takes a track title") && !message.contains("/x/"),
+            "{message}"
+        );
         mutate("mutate undo-faststart in.mp4 out.mp4", Op::UndoFaststart);
         mutate("mutate add-elst in.mp4 out.mp4", Op::AddElst);
         mutate("mutate remove-colr in.mp4 out.mp4", Op::RemoveColr);
@@ -513,6 +561,10 @@ mod tests {
             "mutate perturb-stts 0 128 a.mp4 b.mp4",
             "mutate perturb-stts 100 0 a.mp4 b.mp4",
             "mutate perturb-stts 100 a.mp4 b.mp4",
+            "mutate set-default /x/in.mp4 a.mp4 b.mp4",
+            "mutate set-default C:\\x\\in.mp4 a.mp4 b.mp4",
+            "mutate set-default a-very-long-title-of-more-than-32-bytes a.mp4 b.mp4",
+            "mutate add-elst a.mp4",
             "synth --preset 1080p60",
             "--version extra",
         ] {

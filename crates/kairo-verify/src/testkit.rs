@@ -354,6 +354,8 @@ fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
 pub enum ColrSpec {
     Nclx(u16, u16, u16, bool, u8),
     Other([u8; 4]),
+    /// A colr payload as given.
+    Payload(Vec<u8>),
 }
 
 fn colr(c: &ColrSpec) -> Vec<u8> {
@@ -371,6 +373,7 @@ fn colr(c: &ColrSpec) -> Vec<u8> {
             body.extend_from_slice(&[0; 6]);
             boxed(b"colr", &body)
         }
+        ColrSpec::Payload(body) => boxed(b"colr", body),
     }
 }
 

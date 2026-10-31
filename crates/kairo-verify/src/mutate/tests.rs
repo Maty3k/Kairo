@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `mutate` against the in-memory builder: rebuilding changes nothing, each change equals the
-//! same defect built from scratch on every file layout the builder makes, and each fails its own
-//! check and no other (README §9's U tier: "each operation flips exactly its own check").
+//! same defect built from scratch on eleven of the builder's file layouts, and each fails the
+//! checks its defect names and no other (README §9's U tier: "each operation flips exactly its own
+//! check"; `set-colr` flips `video.colr` and `video.params`, README §7.3).
 
 use super::*;
 use crate::checks::Status;
@@ -57,6 +58,7 @@ fn layouts() -> Vec<(&'static str, Edit)> {
         ("QuickTime meta", |s| s.qt_meta = true),
         ("udta filler", |s| s.udta_filler = 2),
         ("no pasp", |s| s.pasp = None),
+        ("moov last", |s| s.faststart = false),
     ]
 }
 
@@ -72,6 +74,16 @@ fn changes() -> Vec<(Op, Edit, &'static [&'static str])> {
         (
             colr_666(),
             |s| s.colr = vec![ColrSpec::Nclx(6, 6, 6, false, 0)],
+            &["video.colr", "video.params"],
+        ),
+        (
+            Op::SetColr {
+                primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                full_range: true,
+            },
+            |s| s.colr = vec![ColrSpec::Nclx(1, 1, 1, true, 0)],
             &["video.colr", "video.params"],
         ),
         (Op::RemoveColr, |s| s.colr = Vec::new(), &["video.colr"]),
@@ -112,11 +124,15 @@ fn rebuilding_without_a_change_gives_the_input_back() {
 fn each_change_is_its_defect_built_from_scratch_and_fails_only_its_check() {
     for (name, layout) in layouts() {
         let input = Spec::with(layout).build();
-        // Video after the audio already fails the track layout; nothing else may change.
+        // Video after the audio already fails the track layout and moov last fails faststart;
+        // nothing else may change.
         let before = failing(&input);
-        let video_last = name == "video last";
-        assert_eq!(before.is_empty(), !video_last, "{name}: {before:?}");
+        let odd = matches!(name, "video last" | "moov last");
+        assert_eq!(before.is_empty(), !odd, "{name}: {before:?}");
         for (op, defect, fails) in changes() {
+            if name == "moov last" && op == Op::UndoFaststart {
+                continue;
+            }
             let out = mutated(&input, &op).unwrap_or_else(|e| panic!("{name}, {op}: {e}"));
             let expected = Spec::with(|s| {
                 layout(s);
@@ -138,7 +154,7 @@ fn each_change_is_its_defect_built_from_scratch_and_fails_only_its_check() {
 }
 
 #[test]
-fn moving_the_moov_back_restores_a_faststart_clip_byte_for_byte() {
+fn undoing_faststart_equals_the_built_moov_last_clip() {
     // The builder's layout without faststart is ftyp, free, mdat, moov; undoing faststart on the
     // good clip makes exactly that, so the offsets moved with the media.
     let good = Spec::good().build();
@@ -304,6 +320,7 @@ fn a_failed_write_is_reported_as_one() {
     assert_eq!(MutateError::Write(io::Error::other("x")).exit_code(), 4);
     assert_eq!(MutateError::NotApplicable(String::new()).exit_code(), 1);
     assert_eq!(MutateError::Unsound(String::new()).exit_code(), 3);
+    assert_eq!(MutateError::Read(io::Error::other("x")).exit_code(), 3);
 }
 
 #[test]
@@ -315,9 +332,120 @@ fn operations_print_as_the_command_line_writes_them() {
             "undo-faststart",
             "add-elst",
             "set-colr 6 6 6 0",
+            "set-colr 1 1 1 1",
             "remove-colr",
             "set-default \"Game\"",
             "perturb-stts 100 128"
         ]
     );
+}
+
+#[test]
+fn set_colr_writes_nclx_only_and_refuses_a_change_to_nothing() {
+    // A profile colr (ICC, 36 bytes here) is never touched: alone it is refused, beside nclx
+    // only the nclx changes.
+    let mut profile = b"prof".to_vec();
+    profile.extend([0x5A; 32]);
+    let alone = Spec::with(|s| s.colr = vec![ColrSpec::Payload(profile.clone())]).build();
+    assert!(matches!(
+        mutated(&alone, &colr_666()),
+        Err(MutateError::NotApplicable(_))
+    ));
+    let both = Spec::with(|s| {
+        s.colr = vec![
+            ColrSpec::Nclx(1, 1, 1, false, 0),
+            ColrSpec::Payload(profile.clone()),
+        ]
+    })
+    .build();
+    let expected = Spec::with(|s| {
+        s.colr = vec![
+            ColrSpec::Nclx(6, 6, 6, false, 0),
+            ColrSpec::Payload(profile.clone()),
+        ]
+    })
+    .build();
+    assert!(mutated(&both, &colr_666()).unwrap() == expected);
+    // The values the clip already holds change nothing, so they are refused.
+    let same = Op::SetColr {
+        primaries: 1,
+        transfer: 1,
+        matrix: 1,
+        full_range: false,
+    };
+    assert!(matches!(
+        mutated(&Spec::good().build(), &same),
+        Err(MutateError::NotApplicable(_))
+    ));
+}
+
+#[test]
+fn clips_with_other_file_offsets_are_refused() {
+    // saio in stbl and iloc in a meta hold absolute offsets that wouldn't move.
+    let saio = Spec::with(|s| {
+        s.extra_stbl_box = Some(crate::testkit::full(
+            b"saio",
+            0,
+            0,
+            &[0, 0, 0, 1, 0, 0, 0, 0],
+        ))
+    })
+    .build();
+    let refused = mutated(&saio, &Op::AddElst);
+    assert!(
+        matches!(&refused, Err(MutateError::Unsound(what)) if what.contains("saio")),
+        "{refused:?}"
+    );
+    // A top-level meta after the media, with its own iloc, is copied as it is but not moved.
+    let mut meta = Spec::with(|s| s.faststart = true).build();
+    meta.extend(crate::testkit::boxed(b"meta", &[0; 4]));
+    let refused = mutated(&meta, &Op::AddElst);
+    assert!(
+        matches!(refused, Err(MutateError::Unsound(_))),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn sixty_four_bit_sizes_and_uuid_boxes_inside_moov_are_kept() {
+    // moov/udta with a 64-bit size and a uuid child (also 64-bit), made through the rebuild.
+    let mut patched = Vec::new();
+    rebuild_with(
+        &mut &Spec::good().build()[..],
+        &mut patched,
+        |_, moov, _| {
+            let udta = moov.child_mut(b"udta").unwrap();
+            udta.large = true;
+            udta.children_mut().unwrap().push(Node {
+                kind: FourCc(*b"uuid"),
+                uuid: Some([7; 16]),
+                large: true,
+                body: Body::Raw(vec![1, 2, 3]),
+            });
+            Ok(())
+        },
+    )
+    .unwrap();
+    let read = |bytes: &[u8]| {
+        let clip = Clip::read(&mut &bytes[..]).unwrap();
+        assert!(clip.problems.is_empty(), "{:?}", clip.problems);
+        let udta = clip
+            .mp4
+            .moov
+            .as_ref()
+            .unwrap()
+            .child(b"udta")
+            .unwrap()
+            .clone();
+        (udta.header, udta.child(b"uuid").unwrap().header)
+    };
+    assert_eq!(read(&patched), (16, 32));
+    assert!(failing(&patched).is_empty());
+    // Rebuilding it gives it back, and a change that grows moov keeps both headers.
+    let mut same = Vec::new();
+    rebuild(&mut &patched[..], None, &mut same).unwrap();
+    assert!(same == patched);
+    let grown = mutated(&patched, &Op::AddElst).unwrap();
+    assert_eq!(read(&grown), (16, 32));
+    assert_eq!(failing(&grown), ["container.no_editlist"]);
 }

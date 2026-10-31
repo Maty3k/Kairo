@@ -476,6 +476,14 @@ impl Mp4 {
                 }
             };
             let size = parsed.size.unwrap_or(file_len - at);
+            if parsed.size.is_none() && size < parsed.header {
+                let what = format!(
+                    "{} box runs to the end of the file but is shorter than its {}-byte header",
+                    parsed.kind, parsed.header
+                );
+                file.problem(&parsed.kind.to_string(), at, what);
+                break;
+            }
             if size > file_len - at {
                 file.problem(
                     &parsed.kind.to_string(),

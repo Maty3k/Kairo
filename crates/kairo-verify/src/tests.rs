@@ -961,14 +961,27 @@ mod cli {
     #[test]
     fn mutate_writes_a_new_file_and_never_replaces_one() {
         let dir = Dir::new();
+        let folder = dir.0.to_string_lossy().into_owned();
         let good = dir.file("good.mp4", &Spec::good().build());
         let out = dir.0.join("nocolr.mp4");
-        let (code, said, err) = run(&[
-            os("mutate"),
-            os("remove-colr"),
-            good.as_os_str(),
-            out.as_os_str(),
-        ]);
+        let mutate = |change: &str, input: &PathBuf, output: &PathBuf| {
+            let (code, said, err) = run(&[
+                os("mutate"),
+                os(change),
+                input.as_os_str(),
+                output.as_os_str(),
+            ]);
+            // No message names a folder (CLAUDE.md), and no partial file is left behind.
+            assert!(
+                !said.contains(&folder) && !err.contains(&folder),
+                "{said}{err}"
+            );
+            let mut partial = output.as_os_str().to_owned();
+            partial.push(".partial");
+            assert!(!PathBuf::from(partial).exists());
+            (code, said, err)
+        };
+        let (code, said, err) = mutate("remove-colr", &good, &out);
         assert_eq!((code, err.as_str()), (0, ""), "{said}");
         assert_eq!(said, "nocolr.mp4: good.mp4 with remove-colr\n");
         let written = std::fs::read(&out).unwrap();
@@ -976,41 +989,27 @@ mod cli {
         // An existing output is never replaced, the input included.
         for target in [&out, &good] {
             let before = std::fs::read(target).unwrap();
-            let (code, _, err) = run(&[
-                os("mutate"),
-                os("add-elst"),
-                good.as_os_str(),
-                target.as_os_str(),
-            ]);
+            let (code, _, err) = mutate("add-elst", &good, target);
             assert_eq!(code, 4, "{err}");
+            assert!(err.contains("already exists"), "{err}");
             assert_eq!(std::fs::read(target).unwrap(), before);
         }
         // A change that doesn't apply exits 1 and leaves no file behind.
         let again = dir.0.join("again.mp4");
-        let (code, _, err) = run(&[
-            os("mutate"),
-            os("remove-colr"),
-            out.as_os_str(),
-            again.as_os_str(),
-        ]);
+        let (code, _, err) = mutate("remove-colr", &out, &again);
         assert_eq!(code, 1, "{err}");
         assert!(
             err.starts_with("kairo-verify: nocolr.mp4: the change doesn't apply"),
             "{err}"
         );
         assert!(!again.exists());
-        // Unreadable input exits 3; no folder appears in any message.
-        let missing = dir.0.join("missing.mp4");
-        let (code, _, err) = run(&[
-            os("mutate"),
-            os("add-elst"),
-            missing.as_os_str(),
-            again.as_os_str(),
-        ]);
+        // An unreadable input exits 3, an output that names no file 2.
+        let (code, _, err) = mutate("add-elst", &dir.0.join("missing.mp4"), &again);
         assert_eq!(code, 3, "{err}");
+        assert!(err.starts_with("kairo-verify: missing.mp4: "), "{err}");
         assert!(!again.exists());
-        let folder = dir.0.to_string_lossy().into_owned();
-        assert!(!err.contains(&folder), "{err}");
+        let (code, _, err) = mutate("add-elst", &good, &dir.0.join(".."));
+        assert_eq!(code, 2, "{err}");
     }
 
     #[test]

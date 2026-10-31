@@ -5,9 +5,12 @@
 //!
 //! The clip must pass `container.structure`. Its `moov` is rebuilt from the box tree with every
 //! size recomputed (a 64-bit size stays 64-bit), the other top-level boxes are copied as they
-//! are, and every chunk offset in `stco` and `co64` moves with the bytes it points at. So the
-//! output differs from the input only in the change named; the tests prove it by comparing each
-//! output byte for byte with the same defect built from scratch.
+//! are (a size-0 box that is no longer last gets its real size), and every chunk offset in
+//! `stco` and `co64` moves with the bytes it points at. A clip with other absolute file offsets
+//! (`iloc`, `saio`, a top-level `meta`) is refused, since they wouldn't move. `perturb-stts`
+//! writes `stts` in its merged form, as encoders do. So, for the clips FFmpeg writes, the output
+//! differs from the input only in the change named; the tests prove it by comparing each output
+//! byte for byte with the same defect built from scratch.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -125,6 +128,18 @@ fn rebuild(
     op: Option<&Op>,
     out: &mut dyn Write,
 ) -> Result<(), MutateError> {
+    rebuild_with(source, out, |clip, moov, order| match op {
+        Some(op) => apply(op, clip, moov, order),
+        None => Ok(()),
+    })
+}
+
+/// [`rebuild`] with any `edit` of the `moov` tree and the top-level order.
+fn rebuild_with(
+    source: &mut dyn Source,
+    out: &mut dyn Write,
+    edit: impl FnOnce(&Clip, &mut Node, &mut Vec<usize>) -> Result<(), MutateError>,
+) -> Result<(), MutateError> {
     let clip = Clip::read(source).map_err(|e| match e {
         ReadError::Io(error) => MutateError::Read(error),
     })?;
@@ -146,11 +161,20 @@ fn rebuild(
     ) else {
         return Err(MutateError::Unsound("no moov".to_owned()));
     };
-    let mut moov = Node::read(tree, &clip.mp4.moov_bytes())?;
-    let mut order: Vec<usize> = (0..tops.len()).collect();
-    if let Some(op) = op {
-        apply(op, &clip, &mut moov, &mut order)?;
+    if let Some(top) = tops.iter().find(|b| b.kind.0 == *b"meta") {
+        return Err(MutateError::Unsound(format!(
+            "a top-level meta box at offset {} may hold file offsets this can't move",
+            top.offset
+        )));
     }
+    let mut moov = Node::read(tree, &clip.mp4.moov_bytes())?;
+    if let Some(kind) = moov.find_kind(&[b"iloc", b"saio"]) {
+        return Err(MutateError::Unsound(format!(
+            "a {kind} box holds file offsets this can't move"
+        )));
+    }
+    let mut order: Vec<usize> = (0..tops.len()).collect();
+    edit(&clip, &mut moov, &mut order)?;
     let placed = place(source, tops, &order, moov_index, &moov)?;
     for (table, width) in chunk_tables(&mut moov) {
         move_offsets(table, width, &placed)?;
@@ -311,6 +335,14 @@ impl Node {
         }
     }
 
+    /// The first box of one of these types in this tree, itself included.
+    fn find_kind(&self, kinds: &[&[u8; 4]]) -> Option<FourCc> {
+        if kinds.contains(&&self.kind.0) {
+            return Some(self.kind);
+        }
+        self.children().iter().find_map(|c| c.find_kind(kinds))
+    }
+
     fn children(&self) -> &[Node] {
         match &self.body {
             Body::Parent { children, .. } => children,
@@ -410,7 +442,7 @@ fn apply(op: &Op, clip: &Clip, moov: &mut Node, order: &mut Vec<usize>) -> Resul
             matrix,
             full_range,
         } => {
-            let mut changed = 0;
+            let (mut nclx, mut changed) = (0, 0);
             for entry in video_entries(moov, clip)? {
                 for colr in entry.children_mut().into_iter().flatten() {
                     if colr.kind.0 != *b"colr" {
@@ -422,15 +454,25 @@ fn apply(op: &Op, clip: &Clip, moov: &mut Node, order: &mut Vec<usize>) -> Resul
                     if payload.get(0..4) != Some(&b"nclx"[..]) || payload.len() < 11 {
                         continue;
                     }
+                    let before = payload[4..11].to_vec();
                     payload[4..6].copy_from_slice(&primaries.to_be_bytes());
                     payload[6..8].copy_from_slice(&transfer.to_be_bytes());
                     payload[8..10].copy_from_slice(&matrix.to_be_bytes());
                     payload[10] = (u8::from(*full_range) << 7) | (payload[10] & 0x7f);
-                    changed += 1;
+                    nclx += 1;
+                    if payload[4..11] != before[..] {
+                        changed += 1;
+                    }
                 }
             }
-            if changed == 0 {
+            if nclx == 0 {
                 return Err(not_applicable("the video has no nclx colr box"));
+            }
+            if changed == 0 {
+                return Err(not_applicable(format!(
+                    "the video's colr already holds {primaries} {transfer} {matrix} {}",
+                    u8::from(*full_range)
+                )));
             }
         }
         Op::RemoveColr => {
@@ -762,8 +804,10 @@ fn moved(offset: u64, placed: &[Placed]) -> Result<u64, MutateError> {
         .iter()
         .filter(|p| !p.moov)
         .find(|p| {
+            // A chunk of no bytes may sit at the very end of a payload, as container.structure
+            // allows; the next box's payload starts at least 8 bytes later.
             offset >= p.old.offset + p.old.header
-                && offset < p.old.offset.saturating_add(p.old.size)
+                && offset <= p.old.offset.saturating_add(p.old.size)
         })
         .map(|p| p.offset + p.header + (offset - p.old.offset - p.old.header))
         .ok_or_else(|| {
