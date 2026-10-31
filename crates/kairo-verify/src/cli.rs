@@ -7,7 +7,11 @@
 //! can't run), 4 internal (the report couldn't be written). For `mutate`: 0 written, 1 the change
 //! doesn't apply to this clip, 2 usage (an output that names no file included), 3 the input can't
 //! be read or rebuilt, 4 the output can't be written (it never replaces an existing file, and an
-//! interrupted run leaves at most `OUT.partial`). Messages and reports name the file only.
+//! interrupted run leaves at most `OUT.partial`). For `synth`: 0 written, 2 usage (settings that
+//! can't be rendered, a terminal as stdout, or an expect path that names a folder), 4 the frames
+//! or the expect file couldn't be written (a closed pipe included; it never replaces an existing
+//! expect file, and writes it only once every frame is out). Messages and reports name the file
+//! only.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -15,9 +19,12 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use kairo_core::testsig::Curve;
+
 use crate::expect::Expect;
 use crate::mutate::{MutateError, Op};
 use crate::profile::{Plan, Profile};
+use crate::synth::{Codec, Defect, Format, HdrSource, Synth};
 use crate::{Clip, boxes};
 
 /// The usage text.
@@ -28,8 +35,12 @@ pub const USAGE: &str =
        kairo-verify boxes <clip.mp4>
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
                            |set-default TRACK|perturb-stts S D  IN OUT
+       kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds 30]
+                          [--defect D] [--hdr natural|match --lw NITS --sdr-white NITS]
+                          [--codec nv12|ipcm [--gop N]] --expect FILE    (frames on stdout)
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
+defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable
 The cli decoder (--ffmpeg PATH) decodes for the content checks; the audio checks and the linked
 decoder come with research 16's next PRs.";
 
@@ -70,6 +81,10 @@ enum Command {
         op: Op,
         input: PathBuf,
         output: PathBuf,
+    },
+    Synth {
+        synth: Synth,
+        expect: PathBuf,
     },
     Version,
     Help,
@@ -134,6 +149,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             };
         }
         Some("mutate") => return parse_mutate(rest),
+        Some("synth") => return parse_synth(rest),
         Some("check") => {}
         _ => return Err(format!("unknown command {}\n{USAGE}", shown(verb))),
     }
@@ -294,6 +310,112 @@ fn parse_mutate(rest: &[OsString]) -> Result<Command, String> {
         input: PathBuf::from(input),
         output: PathBuf::from(output),
     })
+}
+
+/// `synth`'s options (README §6.1).
+fn parse_synth(rest: &[OsString]) -> Result<Command, String> {
+    let mut format: Option<Format> = None;
+    let mut source_hz = 180;
+    let mut seconds = 30;
+    let mut defect = None;
+    let mut curve = None;
+    let mut lw_nits = None;
+    let mut sdr_white_nits = None;
+    let mut ipcm = false;
+    let mut gop = None;
+    let mut expect = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let flag = word.to_str().unwrap_or_default();
+        let mut value = |name: &str| {
+            words
+                .next()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
+        };
+        // A value that isn't UTF-8 parses as nothing; errors never repeat the value, which may
+        // be a path.
+        let text = |word: &OsStr| word.to_str().unwrap_or_default().to_owned();
+        match flag {
+            "--preset" => {
+                format = Some(
+                    text(value("--preset")?)
+                        .parse()
+                        .map_err(|e| format!("{e}\n{USAGE}"))?,
+                );
+            }
+            "--source-hz" => {
+                source_hz = number(value("--source-hz")?, "--source-hz takes a rate in Hz")?
+            }
+            "--seconds" => seconds = number(value("--seconds")?, "--seconds takes whole seconds")?,
+            "--defect" => {
+                defect = Some(
+                    text(value("--defect")?)
+                        .parse::<Defect>()
+                        .map_err(|e| format!("{e}\n{USAGE}"))?,
+                );
+            }
+            "--hdr" => match value("--hdr")?.to_str() {
+                Some("natural") => curve = Some(Curve::Natural),
+                Some("match") => curve = Some(Curve::MatchSdrApps),
+                _ => return Err(format!("--hdr takes natural or match\n{USAGE}")),
+            },
+            "--lw" => lw_nits = Some(number(value("--lw")?, "--lw takes the peak in nits")?),
+            "--sdr-white" => {
+                sdr_white_nits = Some(number(value("--sdr-white")?, "--sdr-white takes nits")?);
+            }
+            "--codec" => match value("--codec")?.to_str() {
+                Some("nv12") => ipcm = false,
+                Some("ipcm") => ipcm = true,
+                _ => return Err(format!("--codec takes nv12 or ipcm\n{USAGE}")),
+            },
+            "--gop" => gop = Some(number(value("--gop")?, "--gop takes a number of frames")?),
+            "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+            "--wav-dir" => {
+                return Err(
+                    "--wav-dir and the audio tracks come with research 16's PR 5; this build writes video only"
+                        .to_owned(),
+                );
+            }
+            _ if flag.starts_with('-') && flag.len() > 1 => {
+                let name = OsStr::new(flag.split('=').next().unwrap_or_default());
+                return Err(format!("unknown option {}\n{USAGE}", shown(name)));
+            }
+            _ => {
+                return Err(format!(
+                    "synth takes no file; the frames go to stdout\n{USAGE}"
+                ));
+            }
+        }
+    }
+    let format = format.ok_or_else(|| format!("synth needs --preset\n{USAGE}"))?;
+    let expect = expect.ok_or_else(|| format!("synth needs --expect FILE\n{USAGE}"))?;
+    let hdr = match (curve, lw_nits, sdr_white_nits) {
+        (None, None, None) => None,
+        (Some(curve), Some(lw_nits), Some(sdr_white_nits)) => Some(HdrSource {
+            curve,
+            lw_nits,
+            sdr_white_nits,
+        }),
+        _ => return Err(format!("--hdr, --lw and --sdr-white go together\n{USAGE}")),
+    };
+    let codec = match (ipcm, gop) {
+        (true, gop) => Codec::Ipcm {
+            gop: gop.unwrap_or(format.fps),
+        },
+        (false, None) => Codec::Nv12,
+        (false, Some(_)) => return Err(format!("--gop goes with --codec ipcm\n{USAGE}")),
+    };
+    let synth = Synth {
+        format,
+        source_hz,
+        seconds,
+        defect,
+        hdr,
+        codec,
+    };
+    synth.check().map_err(|e| e.to_string())?;
+    Ok(Command::Synth { synth, expect })
 }
 
 /// The file's name for messages and reports, or `None` if it isn't UTF-8.
@@ -504,9 +626,99 @@ fn mutate_file(
     }
 }
 
+/// `synth`: the frames to `out`, then the expect file, which is written under a temporary name
+/// and linked to its own only once every frame is out.
+fn synth_file(
+    synth: &Synth,
+    expect: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    stdout_is_terminal: bool,
+) -> u8 {
+    if stdout_is_terminal {
+        say(
+            err,
+            "synth writes binary frames to stdout: pipe them to an encoder or redirect them to a file",
+        );
+        return 2;
+    }
+    // A file, not a folder: a trailing separator, `.`, `..` or an existing folder is refused
+    // without repeating it, since its name would be a folder's (CLAUDE.md).
+    let names_folder =
+        expect.as_os_str().to_string_lossy().ends_with(['/', '\\']) || expect.is_dir();
+    let Some(name) = file_name(expect).filter(|_| !names_folder) else {
+        say(err, "the expect file must name a file, with a UTF-8 name");
+        return 2;
+    };
+    if expect.symlink_metadata().is_ok() {
+        say(
+            err,
+            &format!("{name}: already exists; synth never replaces a file"),
+        );
+        return 4;
+    }
+    let folder = expect
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !folder.is_dir() {
+        say(err, &format!("{name}: its folder doesn't exist"));
+        return 4;
+    }
+    // The frames first; then the expect file, written under a temporary name and linked to its
+    // own, so an interrupted run leaves nothing behind but, for the moment it takes to write a
+    // few hundred bytes, the temporary file.
+    if let Err(error) = synth.write(out) {
+        say(err, &error.to_string());
+        return error.exit_code();
+    }
+    let mut partial = expect.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    let mut file = match File::create_new(&partial) {
+        Ok(file) => file,
+        Err(error) => {
+            say(err, &format!("{name}.partial: {error}"));
+            return 4;
+        }
+    };
+    let result = serde_json::to_string_pretty(&synth.expect())
+        .map_err(|e| (4, format!("{name}: {e}")))
+        .and_then(|text| {
+            file.write_all(format!("{text}\n").as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| (4, format!("{name}: {e}")))
+        });
+    drop(file);
+    let result = result.and_then(|()| {
+        std::fs::hard_link(&partial, expect).map_err(|e| (4, format!("{name}: {e}")))
+    });
+    let _ = std::fs::remove_file(&partial);
+    match result {
+        Ok(()) => {
+            say(err, &format!("synth: {synth}; the expect file is {name}"));
+            0
+        }
+        Err((code, message)) => {
+            say(err, &message);
+            code
+        }
+    }
+}
+
 /// Runs the command line `args` (without the program name), writing to `out` and `err`, and
 /// returns the exit code.
 pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    run_with(args, out, err, false)
+}
+
+/// [`run`], told whether stdout is a terminal, which `synth` refuses to write frames to.
+pub fn run_with(
+    args: &[OsString],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    stdout_is_terminal: bool,
+) -> u8 {
     match parse_args(args) {
         Ok(Command::Version) => {
             let _ = writeln!(out, concat!("kairo-verify ", env!("CARGO_PKG_VERSION")));
@@ -518,6 +730,9 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         }
         Ok(Command::Boxes(path)) => show_boxes(&path, out, err),
         Ok(Command::Mutate { op, input, output }) => mutate_file(&op, &input, &output, out, err),
+        Ok(Command::Synth { synth, expect }) => {
+            synth_file(&synth, &expect, out, err, stdout_is_terminal)
+        }
         Ok(command) => check(command, out, err),
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -606,6 +821,46 @@ mod tests {
                 ticks: 128,
             },
         );
+        assert_eq!(
+            parse_args(&args(
+                "synth --preset 480x270@60 --seconds 4 --codec ipcm --expect e.json"
+            )),
+            Ok(Command::Synth {
+                synth: Synth {
+                    format: Format {
+                        width: 480,
+                        height: 270,
+                        fps: 60
+                    },
+                    source_hz: 180,
+                    seconds: 4,
+                    defect: None,
+                    hdr: None,
+                    codec: Codec::Ipcm { gop: 60 },
+                },
+                expect: PathBuf::from("e.json"),
+            })
+        );
+        assert!(matches!(
+            parse_args(&args(
+                "synth --preset 1080p60 --defect drop@930 --hdr natural --lw 1000 --sdr-white 240 --source-hz 360 --expect e.json"
+            )),
+            Ok(Command::Synth {
+                synth: Synth {
+                    defect: Some(Defect::Drop(Some(930))),
+                    hdr: Some(HdrSource {
+                        curve: Curve::Natural,
+                        lw_nits: 1000,
+                        sdr_white_nits: 240
+                    }),
+                    source_hz: 360,
+                    seconds: 30,
+                    codec: Codec::Nv12,
+                    ..
+                },
+                ..
+            })
+        ));
         assert!(matches!(
             parse_args(&args(
                 "check --profile test --expect e.json --decoder none c.mp4"
@@ -647,6 +902,18 @@ mod tests {
             "mutate set-default a-very-long-title-of-more-than-32-bytes a.mp4 b.mp4",
             "mutate add-elst a.mp4",
             "synth --preset 1080p60",
+            "synth --expect e.json",
+            "synth --preset 1080p60 --expect e.json --gop 60",
+            "synth --preset 1080p60 --expect e.json --hdr natural",
+            "synth --preset 1080p60 --expect e.json --lw 1000 --sdr-white 240",
+            "synth --preset 1080p60 --expect e.json --hdr pq --lw 1000 --sdr-white 240",
+            "synth --preset 1080p60 --expect e.json --defect frobnicate",
+            "synth --preset 1080p60 --expect e.json --defect judder --source-hz 165",
+            "synth --preset 1080p60 --expect e.json --wav-dir .",
+            "synth --preset 1080p60 --expect e.json --codec h265",
+            "synth --preset 1080p60 --expect e.json --seconds 0",
+            "synth --preset 1081x1080@60 --expect e.json",
+            "synth --preset 1080p60 --expect e.json extra",
             "--version extra",
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");

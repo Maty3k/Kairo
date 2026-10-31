@@ -19,6 +19,11 @@ impl<'a> Bits<'a> {
         Self { data, pos: 0 }
     }
 
+    /// The number of bits read so far.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     /// One bit.
     pub fn bit(&mut self) -> Option<u32> {
         let byte = *self.data.get(self.pos / 8)?;

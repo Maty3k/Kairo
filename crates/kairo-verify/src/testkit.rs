@@ -1,70 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Test helpers (container.md §9.1): an H.264 bit writer and an MP4 builder that makes a good
+//! Test helpers (container.md §9.1): H.264 parameter sets and an MP4 builder that makes a good
 //! Kairo-style clip by default, so each test can change one thing and see one check fail. No
-//! clip files: everything is built in memory.
+//! clip files: everything is built in memory. The bit writer is the I_PCM writer's.
 
-/// An MSB-first bit writer for RBSPs.
-#[derive(Default)]
-pub struct BitWriter {
-    bytes: Vec<u8>,
-    bits: u32,
-}
-
-impl BitWriter {
-    pub fn u(&mut self, n: u32, value: u64) -> &mut Self {
-        for i in (0..n).rev() {
-            if self.bits.is_multiple_of(8) {
-                self.bytes.push(0);
-            }
-            let bit = ((value >> i) & 1) as u8;
-            if let Some(last) = self.bytes.last_mut() {
-                *last |= bit << (7 - self.bits % 8);
-            }
-            self.bits += 1;
-        }
-        self
-    }
-
-    pub fn flag(&mut self, on: bool) -> &mut Self {
-        self.u(1, u64::from(on))
-    }
-
-    pub fn ue(&mut self, value: u32) -> &mut Self {
-        let v = u64::from(value) + 1;
-        let len = 64 - v.leading_zeros();
-        self.u(len - 1, 0).u(len, v)
-    }
-
-    pub fn se(&mut self, value: i32) -> &mut Self {
-        let v = i64::from(value);
-        let k = if v > 0 { 2 * v - 1 } else { -2 * v };
-        self.ue(k as u32)
-    }
-
-    /// The RBSP with its stop bit and alignment.
-    pub fn finish(&mut self) -> Vec<u8> {
-        self.u(1, 1);
-        while !self.bits.is_multiple_of(8) {
-            self.u(1, 0);
-        }
-        std::mem::take(&mut self.bytes)
-    }
-}
-
-/// A NAL unit: its header byte, then the RBSP with emulation prevention.
-pub fn nal(header: u8, rbsp: &[u8]) -> Vec<u8> {
-    let mut out = vec![header];
-    let mut zeros = 0;
-    for &b in rbsp {
-        if zeros >= 2 && b <= 3 {
-            out.push(3);
-            zeros = 0;
-        }
-        out.push(b);
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-    }
-    out
-}
+pub use crate::ipcm::{BitWriter, nal};
 
 /// The VUI fields the builder writes.
 #[derive(Clone, Debug)]

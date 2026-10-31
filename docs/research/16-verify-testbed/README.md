@@ -480,6 +480,7 @@ kairo-verify boxes <clip.mp4>      (box tree; file name and `ilst` keys only; re
 
   - `hdr` is `{"curve","lw_nits","sdr_white_nits"}` for HDR-sourced clips.
   - `trim` is `{"first_N","last_N"}` for a Precise-trim export (M7).
+  - `cabac` is `false` only for the CI corpus's lossless I_PCM clips, which are CAVLC (§7.2), and only the `test` profile accepts it; absent means CABAC.
   - Tone values are `present`, `absent` or `any` (report-only).
 - **Without `--expect`:**
   - `engine` uses PLAN:446's defaults (30 s, Mix + Game + Mic) and runs content checks only if the barcode is found in the first 60 frames. Otherwise they report `skip: no testbed pattern`, which is M4's real game clips.
@@ -679,11 +680,13 @@ ffmpeg -hide_banner -nostdin -loglevel verbose -y -i v-good-1080p60.mp4
 |---|---|---|
 | **PC** (AMF, NV12 in system memory on the LUID device; CL:31) | `-f rawvideo -pix_fmt nv12 -video_size 1920x1080 -framerate 60 -i pipe:0` | `SETPARAMS -pix_fmt nv12 -c:v h264_amf -usage transcoding -quality balanced -rc vbr_peak -b:v 25M -maxrate 40M -bufsize 40M -g 60 -vbaq 1 -preanalysis 0 -high_motion_quality_boost_enable 0 -preencode 0 -bf 0 -max_b_frames 0 -frame_skipping 0 -filler_data 0 -coder cabac -profile:v high -header_spacing 60 -async_depth 4` (PLAN:166, CB:483–488, R13:802) |
 | **Mac** (stand-in) | as PC | `SETPARAMS -c:v h264_videotoolbox -b:v 25M -maxrate 40M -g 60 -bf 0 -profile:v high` |
-| **CI** (lossless, `--codec ipcm`) | `-f h264 -framerate 60 -i pipe:0` (the raw demuxer's default is 25 fps) | `-c:v copy -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv`. A stream copy can't filter, but colour options on a copy do write `colr` [Mac] |
+| **CI** (lossless, `--codec ipcm`) | `-f h264 -r 60 -i pipe:0`. `-r` as an input option makes the CLI count frames. With only the raw demuxer's `-framerate 60` (its default is 25 fps), FFmpeg 8.0.1's CLI times the packets in whole microseconds, so 96 of 240 samples last 20,001 ticks of 1.2 MHz and `video.cfr` fails; with `-r 60` every sample lasts 256 ticks at T = 15,360 [Mac] | `-c:v copy -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv`. A stream copy can't filter, but colour options on a copy do write `colr` [Mac] |
 
 - **The I_PCM writer** (about 300 lines on top of the parser tests' bit writer) produces 480×270 (coded 480×272 with SPS cropping), 60 fps, 4 s clips.
   - High profile with CAVLC (`expect` sets `cabac:false`), VUI colour 1/1/1/0, `poc_type` 2.
   - IDR I slices every `--gop` frames (default 60). In between, **P slices made only of I_PCM macroblocks**, so the stream is lossless while only IDRs are sync samples.
+  - The SPS and PPS precede every IDR, as AMF's `-header_spacing 60` does.
+  - [Mac] FFmpeg 8.0.1 muxes it by stream copy into a clip whose decoded frames equal `synth`'s NV12 output byte for byte, with only the IDRs in `stss` and `colr` from the copy options.
   - Each clip is about 47 MB.
 - **The resulting file** (P8, as in Kairo's saves): video sample 1 lasts 584 ticks (256 + 328), so E = 328, an audio lead of 1,024. No `elst`. A/V exact [Mac]. `corpus check` asserts E = 328 at T = 15,360 for every clip except `bframes`.
 - **Spacing and log checks.** On the PC the builder runs one encode at a time, ≥1.5 s apart (M1:94). An encode fails on `has not been used for any stream`, and unless its log shows:
@@ -985,7 +988,7 @@ Branches follow `m1/<slug>`; Conventional Commits with DCO; squash after CI (CL:
 | 18 | CI time and download size | PR 6 | Cache keyed by SHA-256; the I_PCM corpus is ~0.9 GB, under 2 min [Estimate] |
 | 19 | AMF hang or TDR on RX 9000 (M1:204) | `max_seconds`, ≥1.5 s spacing, the 4101 check | P0: stop and report |
 | 20 | A 9.0.2 stream copy dropping `udta/name` [Unverified] | Audio is always re-encoded at the mux with titles re-specified | — |
-| 21 | Raw I_PCM H.264 into the 9.0.2 muxer: timestamps at `-framerate 60`, I_PCM-only P slices not marked as keyframes, and `colr` from copy options [Unverified] | PR 6's first CI corpus (`corpus check` fails loudly) | Write the I_PCM stream as MP4 samples directly with `mutate`'s serializer |
+| 21 | Raw I_PCM H.264 into the 9.0.2 muxer: timestamps at `-framerate 60`, I_PCM-only P slices not marked as keyframes, and `colr` from copy options [Unverified]. On the Mac with 8.0.1: the timestamps need the input `-r 60` (§7.2); the other two hold [Mac] | PR 6's first CI corpus (`corpus check` fails loudly) | Write the I_PCM stream as MP4 samples directly with `mutate`'s serializer |
 | 22 | `SetForegroundWindow` from a task-launched process after the lock time-out [Unverified] | PR 8's attended run | The owner's one click in an `abort_on_input:false` job (§4.1) |
 | 23 | `ES_DISPLAY_REQUIRED` wakes a dark display; WGC delivers while the displays sleep [Unverified] | PR 8's attended run, owner present | Attended runs start on "go" with the displays on; away runs wait for M1:196 |
 | 24 | AMF's debug trace prints the applied properties [Unverified] | The first attended AMF session | Those options are listed "set, not read back" until M3 task 6 |

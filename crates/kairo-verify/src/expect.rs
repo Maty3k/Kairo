@@ -40,6 +40,10 @@ pub struct Expect {
     /// For a Precise-trim export, the first and last source frame numbers.
     #[serde(default)]
     pub trim: Option<Trim>,
+    /// `false` for a CAVLC clip: only the CI corpus's lossless I_PCM clips (README §7.2), which
+    /// the `test` profile alone accepts. Absent means CABAC, as Kairo encodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cabac: Option<bool>,
     /// The audio tracks, in order (the video track comes first and isn't listed).
     pub tracks: Vec<Track>,
 }
@@ -125,6 +129,9 @@ impl std::error::Error for ExpectError {}
 /// The tone names a track may list.
 const TONES: [&str; 4] = ["game", "voice", "mic", "cue"];
 
+/// The HDR curves: Natural (PQ + BT.2390) and Match SDR apps.
+pub const CURVES: [&str; 2] = ["natural", "match"];
+
 impl Expect {
     /// Parses and checks an `expect.json`.
     pub fn parse(text: &str) -> Result<Expect, ExpectError> {
@@ -149,6 +156,19 @@ impl Expect {
             && (w == 0 || h == 0 || w > 16_384 || h > 16_384)
         {
             return bad(format!("size {w}x{h} is out of range"));
+        }
+        if let Some(hdr) = &expect.hdr {
+            if !CURVES.contains(&hdr.curve.as_str()) {
+                return bad("the hdr curve is not natural or match".to_owned());
+            }
+            for (what, nits) in [
+                ("lw_nits", hdr.lw_nits),
+                ("sdr_white_nits", hdr.sdr_white_nits),
+            ] {
+                if !(1..=10_000).contains(&nits) {
+                    return bad(format!("hdr {what} {nits} is not 1–10000"));
+                }
+            }
         }
         if expect.tracks.len() > 16 {
             return bad(format!("{} audio tracks; at most 16", expect.tracks.len()));
@@ -189,6 +209,12 @@ mod tests {
         assert_eq!((expect.fps, expect.seconds), (60, 30));
         assert_eq!(expect.tracks.len(), 2);
         assert_eq!(expect.tracks[1].tones["voice"], Tone::Absent);
+        assert_eq!(expect.cabac, None);
+        let lossless = r#"{"kairo_expect":1,"fps":60,"seconds":4,"tracks":[],"cabac":false,
+            "hdr":{"curve":"match","lw_nits":1000,"sdr_white_nits":240}}"#;
+        let lossless = Expect::parse(lossless).unwrap();
+        assert_eq!(lossless.cabac, Some(false));
+        assert_eq!(lossless.hdr.map(|h| h.curve), Some("match".to_owned()));
         let trim = r#"{"kairo_expect":1,"fps":30,"seconds":5,"tracks":[],"trim":{"first_N":10,"last_N":160}}"#;
         assert_eq!(
             Expect::parse(trim).unwrap().trim,
@@ -221,6 +247,9 @@ mod tests {
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"size":[0,1080],"tracks":[]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[{"title":"Mic","channels":3,"default":false}]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[{"title":"Mic","channels":1,"default":false,"tones":{"beep":"any"}}]}"#,
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[],"hdr":{"curve":"pq","lw_nits":1000,"sdr_white_nits":240}}"#,
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[],"hdr":{"curve":"natural","lw_nits":0,"sdr_white_nits":240}}"#,
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[],"hdr":{"curve":"natural","lw_nits":1000,"sdr_white_nits":20000}}"#,
         ] {
             assert!(
                 matches!(Expect::parse(bad), Err(ExpectError::Value(_))),

@@ -10,6 +10,8 @@ mod export;
 mod tracks;
 mod video;
 
+pub(crate) use video::level_needed;
+
 use std::collections::BTreeMap;
 
 use serde::Serialize;

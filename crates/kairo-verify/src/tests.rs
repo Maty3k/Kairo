@@ -347,6 +347,52 @@ fn with_vui(change: impl FnOnce(&mut VuiSpec)) -> Spec {
 }
 
 #[test]
+fn cavlc_passes_only_where_the_expect_file_says_so() {
+    // README §7.2: the CI corpus's lossless I_PCM clips are CAVLC, and their expect file says so.
+    let text = |cabac: &str| {
+        format!(
+            r#"{{"kairo_expect":1,"fps":60,"seconds":2,{cabac}"tracks":[
+                {{"title":"Mix","channels":2,"default":true}},
+                {{"title":"Game","channels":2,"default":false}},
+                {{"title":"Mic","channels":1,"default":false}}]}}"#
+        )
+    };
+    let lossless = |profile| {
+        Plan::new(
+            profile,
+            false,
+            Some(Expect::parse(&text(r#""cabac":false,"#)).unwrap()),
+        )
+    };
+    let cavlc = Spec::with(|s| s.cabac = false);
+    fails_only(&cavlc, &lossless(Profile::Test).unwrap(), &[]);
+    let report = fails_only(
+        &Spec::good(),
+        &lossless(Profile::Test).unwrap(),
+        &["video.params"],
+    );
+    let params = report.checks.iter().find(|f| f.id == "video.params");
+    assert_eq!(params.map(|f| f.detail.as_str()), Some("CABAC; want CAVLC"));
+    // Without it CAVLC is a defect, and only the test profile takes it.
+    fails_only(&cavlc, &plan(Profile::Test, 2, &ROLES), &["video.params"]);
+    for profile in [
+        Profile::Capture,
+        Profile::Smoke,
+        Profile::Engine,
+        Profile::Original,
+        Profile::Share,
+    ] {
+        assert!(lossless(profile).is_err(), "{profile}");
+    }
+    let cabac = Expect::parse(&text(r#""cabac":true,"#)).unwrap();
+    fails_only(
+        &Spec::good(),
+        &Plan::new(Profile::Capture, false, Some(cabac)).unwrap(),
+        &[],
+    );
+}
+
+#[test]
 fn parameter_sets_must_be_what_kairo_encodes() {
     let e = engine();
     let params = ["video.params"];
@@ -1179,6 +1225,154 @@ mod cli {
             );
             assert_eq!(run(&[os("boxes"), odd.as_os_str()]).0, 3);
         }
+    }
+
+    /// Runs `synth` with these options into `out`, the expect file at `expect`: (code, stderr).
+    fn synth_to(
+        words: &[&str],
+        expect: &std::path::Path,
+        out: &mut dyn std::io::Write,
+    ) -> (u8, String) {
+        let args: Vec<OsString> = std::iter::once("synth")
+            .chain(words.iter().copied())
+            .chain(["--expect"])
+            .map(OsString::from)
+            .chain([expect.as_os_str().to_os_string()])
+            .collect();
+        let mut err = Vec::new();
+        let code = crate::cli::run_with(&args, out, &mut err, false);
+        (code, String::from_utf8(err).unwrap())
+    }
+
+    #[test]
+    fn synth_stops_cleanly_when_its_reader_goes_away() {
+        // An encoder that exits early: the pipe breaks after about 1 MB (review of PR 4c).
+        struct Closes(usize);
+        impl std::io::Write for Closes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 >= 1 << 20 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "closed",
+                    ));
+                }
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = Dir::new();
+        let expect = dir.0.join("e.json");
+        let (code, err) = synth_to(
+            &["--preset", "640x360@60", "--seconds", "1"],
+            &expect,
+            &mut Closes(0),
+        );
+        assert_eq!(code, 4, "{err}");
+        assert!(err.contains("writing the frames failed"), "{err}");
+        let mut partial = expect.as_os_str().to_owned();
+        partial.push(".partial");
+        assert!(!expect.exists() && !PathBuf::from(partial).exists());
+    }
+
+    #[test]
+    fn synth_refuses_a_folder_as_its_expect_file() {
+        let dir = Dir::new();
+        let folder = dir.0.join("Alice");
+        std::fs::create_dir(&folder).unwrap();
+        let mut trailing = folder.as_os_str().to_owned();
+        trailing.push("/");
+        for path in [
+            folder.clone(),
+            PathBuf::from(trailing),
+            dir.0.join("Bob").join(".."),
+        ] {
+            let (code, err) = synth_to(
+                &["--preset", "64x36@60", "--seconds", "1"],
+                &path,
+                &mut Vec::new(),
+            );
+            assert_eq!(code, 2, "{path:?}: {err}");
+            assert!(!err.contains("Alice") && !err.contains("Bob"), "{err}");
+        }
+        // A file in a folder that doesn't exist: refused before any frame.
+        let mut out = Vec::new();
+        let (code, err) = synth_to(
+            &["--preset", "64x36@60", "--seconds", "1"],
+            &dir.0.join("nowhere").join("e.json"),
+            &mut out,
+        );
+        assert_eq!((code, out.len()), (4, 0), "{err}");
+    }
+
+    #[test]
+    fn synth_writes_frames_then_the_expect_file_and_never_replaces_one() {
+        let dir = Dir::new();
+        let folder = dir.0.to_string_lossy().into_owned();
+        let expect = dir.0.join("e.json");
+        let synth = |terminal: bool| {
+            let words = [
+                "synth",
+                "--preset",
+                "64x36@60",
+                "--seconds",
+                "1",
+                "--codec",
+                "ipcm",
+                "--gop",
+                "30",
+                "--defect",
+                "dup@20",
+                "--expect",
+            ];
+            let args: Vec<OsString> = words
+                .iter()
+                .map(OsString::from)
+                .chain([expect.clone().into_os_string()])
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = crate::cli::run_with(&args, &mut out, &mut err, terminal);
+            let err = String::from_utf8(err).unwrap();
+            // No message names a folder (CLAUDE.md), and no partial file is left behind.
+            assert!(!err.contains(&folder), "{err}");
+            let mut partial = expect.as_os_str().to_owned();
+            partial.push(".partial");
+            assert!(!PathBuf::from(partial).exists());
+            (code, out, err)
+        };
+        // A terminal gets no frames, and no file is made.
+        let (code, out, err) = synth(true);
+        assert_eq!((code, out.len()), (2, 0), "{err}");
+        assert!(!expect.exists());
+        let (code, out, err) = synth(false);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            err,
+            "kairo-verify: synth: 60 frames, 64x36 at 60 fps from a 180 Hz testbed, I_PCM H.264 \
+             (GOP 30), defect dup@20; the expect file is e.json\n"
+        );
+        // An SPS and a PPS before each of the two IDRs (frames 0 and 30), and 58 P slices.
+        let mut kinds = [0; 32];
+        for (i, window) in out.windows(5).enumerate() {
+            if window[..4] == [0, 0, 0, 1] {
+                kinds[usize::from(out[i + 4] & 0x1F)] += 1;
+            }
+        }
+        assert_eq!((kinds[7], kinds[8], kinds[5], kinds[1]), (2, 2, 2, 58));
+        let written = Expect::parse(&std::fs::read_to_string(&expect).unwrap()).unwrap();
+        assert_eq!(written.cabac, Some(false));
+        assert_eq!(
+            (written.fps, written.seconds, written.size),
+            (60, 1, Some([64, 36]))
+        );
+        // Never over an existing file.
+        let before = std::fs::read(&expect).unwrap();
+        let (code, out, err) = synth(false);
+        assert_eq!((code, out.len()), (4, 0), "{err}");
+        assert!(err.contains("e.json: already exists"), "{err}");
+        assert_eq!(std::fs::read(&expect).unwrap(), before);
     }
 
     #[test]
