@@ -24,8 +24,12 @@ $path = Join-Path $Kairo.Logs $name
 if (-not [IO.File]::Exists($path)) { Fail ('the job wrote no ' + $name) }
 $info = [IO.FileInfo]::new($path)
 if ($info.LastWriteTimeUtc -lt $started) { Fail ($name + ' is older than the job ' + $id + ', which did not write it') }
-if ($info.Length -gt 1048576) { Fail ($name + ' is larger than 1 MiB (' + $info.Length + ' bytes)') }
-$text = Read-SharedText $path
-Send-KV 'out' ([Convert]::ToBase64String($Utf8NoBom.GetBytes($text)))
-Say ('fetched ' + $name + ' (' + $info.Length + ' bytes)')
+try {
+    $text = Read-SharedText $path 1048576
+} catch {
+    Fail ($name + ' not read: ' + $_.Exception.Message)
+}
+$bytes = $Utf8NoBom.GetBytes($text)
+Send-KV 'out' ([Convert]::ToBase64String($bytes))
+Say ('fetched ' + $name + ' (' + $bytes.Length + ' bytes)')
 Exit-Pc 0

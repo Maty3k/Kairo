@@ -44,7 +44,11 @@ foreach ($name in @(($id + '.result.json'), ($id + '.out.log'), ($id + '.err.log
     $found = $true
     if ($name.EndsWith('.result.json')) {
         Say ('--- ' + $path + ' ---')
-        Say-Indented (Read-SharedText $path).Trim()
+        try {
+            Say-Indented (Read-SharedText $path).Trim()
+        } catch {
+            Say ('  (not read: ' + $_.Exception.Message + ')')
+        }
     } else {
         Show-Tail $path $tail
     }

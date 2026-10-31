@@ -90,7 +90,7 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          foreach ($d in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\logs', 'C:\kairo\tools', 'C:\kairo\state', 'C:\.cargo') {
+          foreach ($d in 'C:\kairo', 'C:\kairo\src', 'C:\kairo\bin', 'C:\kairo\jobs', 'C:\kairo\logs', 'C:\kairo\tools', 'C:\kairo\state', 'C:\kairo\build', 'C:\.cargo') {
             if (Test-Path -LiteralPath $d) { Write-Host ('{0}  {1}' -f $d, (Get-Acl -LiteralPath $d).Sddl); icacls $d }
           }
           Get-ScheduledTask -TaskPath '\Kairo\' -ErrorAction SilentlyContinue | ForEach-Object {
@@ -144,6 +144,18 @@ jobs:
           $out = & $ssh @opts $target $line
           if ($LASTEXITCODE -ne 0 -or (($out -join "`n") -notmatch 'kairo-pwsh-ok')) { throw "pwsh -EncodedCommand over SSH failed: $out" }
           Write-Host $out
+          # The real stub.ps1, as tools/mac/pc sends it (comment lines dropped, the script on stdin):
+          # its environment reset runs, a cmdlet then loads, and no module folder is the user's.
+          $stub = @((Get-Content -Raw "$env:GITHUB_WORKSPACE\tools\mac\remote\stub.ps1") -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($stub))
+          $line = '"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand ' + $b64
+          $probe = 'Write-Output ("stub-ok|" + $env:PSModulePath + "|" + $env:HOME + "|" + (Join-Path $env:ProgramFiles "x"))'
+          $out = @($probe | & $ssh @opts $target $line)
+          $text = $out -join "`n"
+          Write-Host $text
+          if ($text -notmatch 'stub-ok' -or $text -notmatch '@@KAIRO-EXIT 0') { throw "stub.ps1 over SSH failed: $text" }
+          $modules = @($out | Where-Object { $_ -like 'stub-ok|*' } | ForEach-Object { ($_ -split '\|')[1] })
+          if ($modules.Count -ne 1 -or $modules[0] -match '(?i)Documents|AppData|\\Users\\') { throw ('PSModulePath names a user folder: ' + ($modules -join ';')) }
           # Without a key nothing may get in, and the server may offer public keys only.
           $probe = & $ssh -v -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=15 $target 'echo should-not-run' 2>&1
           $code = $LASTEXITCODE
@@ -183,6 +195,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
           icacls C:\kairo\tools\gitconfig /grant "$($env:USERNAME):(M)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # That version made no C:\kairo\build (pc build makes it, or a newer bootstrap): remove the
+          # empty one the first run made, so the second run also takes the "no build folder yet" path.
+          cmd /d /c rd /q C:\kairo\build
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $listing = @(icacls C:\kairo)
           $listing

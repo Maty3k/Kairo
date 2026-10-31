@@ -27,11 +27,23 @@ pub enum WindowMode {
     Hidden,
 }
 
+/// The CPU priority a job's processes get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    /// Normal priority, which timing tests need (`\Kairo\Run` itself runs at priority 4).
+    #[default]
+    Normal,
+    /// Below normal (`BELOW_NORMAL_PRIORITY_CLASS`), for builds and other background work;
+    /// child processes inherit it.
+    BelowNormal,
+}
+
 /// A job file, e.g. `C:\kairo\jobs\next.json`.
 ///
 /// `id`, `cmd` and `max_seconds` are required. Missing optional fields take the safe choice:
-/// `cwd` null (the layout root), `abort_on_input` true, `window` hidden. Unknown fields are
-/// rejected, so a misspelt field fails loudly instead of being ignored.
+/// `cwd` null (the layout root), `abort_on_input` true, `window` hidden, `priority` normal.
+/// Unknown fields are rejected, so a misspelt field fails loudly instead of being ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobFile {
@@ -50,6 +62,9 @@ pub struct JobFile {
     /// Console window for console programs.
     #[serde(default)]
     pub window: WindowMode,
+    /// CPU priority of the job's processes.
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 fn default_abort_on_input() -> bool {
@@ -258,6 +273,13 @@ mod tests {
         assert_eq!(job.max_seconds, 300);
         assert!(!job.abort_on_input);
         assert_eq!(job.window, WindowMode::Visible);
+        assert_eq!(job.priority, Priority::Normal);
+        let low = r#"{"id":"build-1","cmd":["cargo.exe","build"],"max_seconds":3600,"priority":"below_normal"}"#;
+        assert_eq!(
+            parse_job(low.as_bytes()).unwrap().priority,
+            Priority::BelowNormal
+        );
+        assert!(parse_job(br#"{"id":"a","cmd":["x"],"max_seconds":1,"priority":"idle"}"#).is_err());
     }
 
     #[test]
@@ -266,6 +288,7 @@ mod tests {
         assert_eq!(job.cwd, None);
         assert!(job.abort_on_input);
         assert_eq!(job.window, WindowMode::Hidden);
+        assert_eq!(job.priority, Priority::Normal);
     }
 
     #[test]

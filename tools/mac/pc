@@ -301,8 +301,9 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            index and stash are not touched. Uses git push (updateInstead) and falls
                            back to git bundle + scp; --bundle skips the push.
   build [-p PACKAGE]... [--tail N] [--force]
-                           cargo build --release (--workspace unless -p) in C:\kairo\src at below-
-                           normal priority; stops if the owner becomes active (unless --force).
+                           cargo build --release (--workspace unless -p) of C:\kairo\src as a hidden,
+                           below-normal \Kairo\Run job in the owner's session, never elevated, into
+                           C:\kairo\build\target; stops if the owner becomes active (unless --force).
   deploy [--force]         Copy the last successful build to C:\kairo\bin\<build-id>, point
                            C:\kairo\bin\current at it, restart the watch agent, keep 3 builds.
   rollback [BUILD-ID] [--force]
@@ -322,9 +323,8 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            the last table, which must still be the same display; aliases whose
                            display is off are kept.
   cli ping|keys [--pipe NAME] [--force]
-                           Run kairo-cli on the PC (it talks to kairo-hello over its named pipe).
-  ssh                      Interactive shell on the PC (cmd.exe; type pwsh for PowerShell 7), for
-                           people (not while the owner plays).
+                           Run kairo-cli on the PC as a short \Kairo\Run job. It reaches a named-pipe
+                           server running outside \Kairo\Run: refused while a pc run job holds it.
   help                     This text.
 
 Exit codes: 0 ok, 1 failed, 2 usage or bad input, 3 refused: PC busy, 4 refused: busy state unknown,
@@ -603,7 +603,7 @@ JOB_MAX=''
 JQ_JOB_CHECK='
 def fail(m): error("job: " + m);
 if type != "object" then fail("must be a JSON object") else . end
-| (keys - ["id", "cmd", "cwd", "max_seconds", "abort_on_input", "window"]) as $extra
+| (keys - ["id", "cmd", "cwd", "max_seconds", "abort_on_input", "window", "priority"]) as $extra
 | if ($extra | length) > 0 then fail("unknown field(s) " + ($extra | join(", ")) + " (kairo-devrun rejects them)") else . end
 | if (has("id") and has("cmd") and has("max_seconds")) | not then fail("id, cmd and max_seconds are required") else . end
 | if (.id | type) != "string" or (.id | test("\\A[A-Za-z0-9_-]{1,64}\\z") | not) then fail("id must match ^[A-Za-z0-9_-]{1,64}$") else . end
@@ -614,6 +614,7 @@ if type != "object" then fail("must be a JSON object") else . end
 | if has("cwd") and .cwd != null and ((.cwd | type) != "string" or .cwd == "" or (.cwd | explode | any(. < 32))) then fail("cwd must be null or a folder") else . end
 | if has("abort_on_input") and (.abort_on_input | type) != "boolean" then fail("abort_on_input must be true or false") else . end
 | if has("window") and .window != "visible" and .window != "hidden" then fail("window must be \"visible\" or \"hidden\"") else . end
+| if has("priority") and .priority != "normal" and .priority != "below_normal" then fail("priority must be \"normal\" or \"below_normal\"") else . end
 | "\(.id) \(.max_seconds)"
 '
 
@@ -920,9 +921,11 @@ cmd_cli() {
 }
 
 cmd_ssh() {
-    [ $# -eq 0 ] || usage_error "ssh takes no arguments; use the verbs for scripted work"
-    ensure_agent_key
-    exec "$SSH" -t -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$KEY_FILE" "$PC_HOST"
+    # Gone: the SSH session is elevated, and an interactive shell would start in the owner's home
+    # folder, run any program found there before PATH, and load the owner's PowerShell profile and
+    # modules with administrator rights (docs/milestones/M1.md, open items).
+    err "there is no interactive shell on the PC: an elevated shell would run programs from the owner's folders with administrator rights. Use the verbs (pc help)."
+    exit 2
 }
 
 # ------------------------------------------------------------------------------------------

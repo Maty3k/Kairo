@@ -406,7 +406,7 @@ Sizes are relative (S < M < L < XL). No dates: a milestone closes when its gate 
 8. Tell Claude your games, launchers, HDR games, any run as admin, keyboard layouts, play times and the days the PC may test while you're away.
 9. When asked, press a key in the "Hello from Kairo" window.
 10. On the Mac, free up disk space to at least 20 GB (about 12 GB is free today), then accept Microsoft's licence for the SDK files cargo-xwin downloads (Claude shows the text).
-11. Optional: a Dev Drive for `C:\kairo`, or a Defender exclusion for `C:\kairo\src\target` only.
+11. Optional: a Dev Drive for `C:\kairo` (no Defender exclusion: since M1, builds go to `C:\kairo\build`, which the owner's account can write).
 
 **Claude.** Writes the bootstrap, tools and scaffold; sets up the Mac; records PC facts in `.dogfood/`. **Risks → fallbacks.** Tasks fail over SSH → the bootstrap creates them; Git over SSH misbehaves → bundle + scp; SSH flaky → Claude Code on the PC.
 

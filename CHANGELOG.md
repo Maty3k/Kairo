@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The plan pins Tauri 2.12.5 with `tauri-build` 2.7.4 and drops the updater and process plugins (#3).
 - The PC's FFmpeg pin moves to BtbN's 2026-09-30 month-end build of 9.0.2 (`n9.0.2-17-g2a571b6068`), which BtbN keeps for two years, and the bootstrap's CI job fails if the pinned build lacks an encoder or filter (#14).
 - The plan records decision 37: the owner accepts M1's exit-rule counting (#16).
+- `pc build` runs cargo as the owner's account instead of in the elevated SSH session: a hidden `\Kairo\Run` job at below-normal priority (job files gain `priority`) that builds into `C:\kairo\build`. The elevated side no longer writes, deletes or blindly reads anything in the folders the owner's account can write (kairo-devrun prunes old job logs instead), `pc deploy` copies only Kairo's programs that the owner's account made, `pc cli` runs `kairo-cli` as a job, and `pc doctor` and the bootstrap read tool versions from files instead of running programs from the owner's profile with administrator rights; the bootstrap's repair no longer walks the owner-writable folders. The elevated scripts now fix PowerShell's module path before their first command (CI checks it), since PowerShell 7 would otherwise load a module from the owner's Documents first; Git never comes from the PATH and reads no per-user files; `pc sync` logs into the admin-only `jobs\`; and `pc ssh`, an interactive elevated shell, is gone (#23).
 
 ### Fixed
 
