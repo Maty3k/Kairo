@@ -6,8 +6,10 @@
 //! One pass over the decode keeps a few numbers per frame, never the pixels, so memory stays
 //! flat however long the clip is (README §6.7).
 
+pub mod bars;
 pub mod cadence;
 pub mod flash;
+pub mod levels;
 
 use kairo_core::testsig::{
     self, Barcode, BarcodeError, CODE_COLS, CODE_ROWS, CodeCopy, Load, Options, Part, Patches,
@@ -34,7 +36,7 @@ pub struct Window {
 }
 
 impl Window {
-    fn central(rect: &Rect) -> Self {
+    pub(crate) fn central(rect: &Rect) -> Self {
         let middle = |a: i64, b: i64| {
             let quarter = (b - a) / 4;
             let (lo, hi) = (a + quarter, b - quarter);

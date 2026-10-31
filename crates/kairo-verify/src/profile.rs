@@ -174,6 +174,19 @@ pub const JUDDER_MAX_EXCESS: f64 = 0.05;
 /// How many first frames are searched for the pattern in a clip that needn't hold it
 /// (README §6.1).
 pub const PATTERN_PROBE_FRAMES: usize = 60;
+/// `content.bars`: every frame's worst plane at least this many dB (PLAN:351).
+pub const BARS_MIN_DB: f64 = 40.0;
+/// The same for the share exports, proposed (README §2 item 14).
+pub const EXPORT_BARS_MIN_DB: f64 = 30.0;
+/// The ramp's Cb and Cr may stray this many codes from grey (README §6.3).
+pub const RAMP_CHROMA_TOLERANCE: f64 = 2.0;
+/// `content.colour_matrix`: another reference beating BT.709 limited by this many dB fails,
+/// proposed (README §2 item 14).
+pub const COLOUR_MATRIX_MARGIN_DB: f64 = 6.0;
+/// `content.bars_lines`: the largest row or column residual, proposed (README §2 item 14).
+pub const BARS_LINES_MAX_CODES: f64 = 4.0;
+/// `content.levels` and `hdr.curve_levels`: ±2 codes (SP3, PLAN:430).
+pub const LEVELS_TOLERANCE: f64 = 2.0;
 /// The AAC lead the cut gives a clip, in samples: one priming packet plus up to one more
 /// (PLAN:179, cookbook P8, core/cut.rs).
 pub const LEAD_SAMPLES: (u64, u64) = (1024, 2047);
@@ -235,6 +248,11 @@ pub fn content_mode(profile: Profile, id: &str, expect: Option<&Expect>) -> Mode
     let share = profile.is_share_export();
     let hdr = expect.is_some_and(|e| e.hdr.is_some());
     match id {
+        // HDR-sourced engine clips: the bars are warnings until SP3 settles the curve's colour
+        // (README §2 item 14).
+        "content.bars" | "content.colour_matrix" if hdr && matches!(profile, Engine | Original) => {
+            Warning
+        }
         "decode.clean" | "content.bars" | "content.colour_matrix" | "build.lgpl" => Required,
         "content.barcode" | "content.levels" if share => Warning,
         "cadence.drops_dups" | "cadence.judder" | "source.stability" if profile == Smoke => Warning,
@@ -248,9 +266,9 @@ pub fn content_mode(profile: Profile, id: &str, expect: Option<&Expect>) -> Mode
         },
         "hdr.curve_levels" => match profile {
             Capture | Smoke => Off,
+            _ if !hdr => Off,
             _ if share => Warning,
-            _ if hdr => Required,
-            _ => Off,
+            _ => Required,
         },
         "source.stability" => match profile {
             Capture | Engine => Required,
@@ -558,6 +576,24 @@ mod tests {
             content_mode(Profile::Test, "hdr.curve_levels", None),
             Mode::Off
         );
+        // Exports judge HDR curves only for HDR-sourced clips, and as warnings; `original`, like
+        // engine, keeps HDR-sourced bars as warnings until SP3 (review F4, F7 of PR 4b).
+        let hdr = expect(
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[],
+                "hdr":{"curve":"natural","lw_nits":1000,"sdr_white_nits":240}}"#,
+        );
+        assert_eq!(
+            content_mode(Profile::Share, "hdr.curve_levels", None),
+            Mode::Off
+        );
+        assert_eq!(
+            content_mode(Profile::Share, "hdr.curve_levels", Some(&hdr)),
+            Mode::Warning
+        );
+        for p in [Profile::Engine, Profile::Original] {
+            assert_eq!(content_mode(p, "content.bars", Some(&hdr)), Mode::Warning);
+            assert_eq!(content_mode(p, "content.bars", None), Mode::Required);
+        }
         for p in Profile::ALL {
             for id in STRUCTURE_CHECKS.iter().chain(&EXPORT_CHECKS) {
                 let _ = mode(p, id);

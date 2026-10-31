@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The content checks this build runs on decoded pictures (docs/research/16-verify-testbed/
 //! README.md §6.3, §6.5): `decode.clean` for the video, `content.barcode`,
-//! `cadence.drops_dups`, `cadence.judder` and `content.flash`. Bars, levels, HDR and audio come
-//! with research 16's next PRs; until then a profile that needs them ends in `error`.
+//! `cadence.drops_dups`, `cadence.judder`, `content.flash`, `content.bars`,
+//! `content.colour_matrix`, `content.bars_lines`, `content.levels` and `hdr.curve_levels`. Audio
+//! comes with research 16's next PR; until then a profile that needs it ends in `error`.
 //!
 //! Every picture's time comes from Kairo's sample tables, never from the decoder.
 
@@ -11,13 +12,15 @@ use std::ops::ControlFlow;
 use serde_json::json;
 
 use super::{Ctx, Finding, Outcome, Status, skipped, weigh};
+use crate::analyze::bars::{self, BandSums, Bands, FrameBars};
 use crate::analyze::cadence::{self, Counts, Event};
 use crate::analyze::flash::{self, Flashes};
+use crate::analyze::levels::{self, Expected, Patch};
 use crate::analyze::{self, Geometry, Line, NoLine, Reading};
 use crate::decode::{DecodeError, DecodeStats, Decoder};
 use crate::profile::{self, Content, Mode, Plan, Profile};
 
-/// What the decoder gave: its kind, how the decode went and each picture's reading.
+/// What the decoder gave: its kind, how the decode went, and what each picture showed.
 #[derive(Debug, Clone)]
 pub struct Decoded {
     /// `synthetic`, `cli` or `linked`.
@@ -28,15 +31,36 @@ pub struct Decoded {
     pub stats: Result<DecodeStats, DecodeError>,
     /// One reading per picture, in presentation order.
     pub readings: Vec<Reading>,
+    /// Each picture's bars, scored when its barcode read.
+    bars: Vec<Option<FrameBars>>,
+    /// The band sums of the pictures whose barcode didn't read, kept to score them once their
+    /// neighbours' frame numbers are known: at most [`PENDING_MAX`].
+    pending: Vec<(usize, BandSums)>,
+    /// Unreadable pictures past [`PENDING_MAX`], left unscored.
+    pending_dropped: usize,
+    /// The bands of the pictures' size, if they fit.
+    bands: Option<Bands>,
+    /// Each picture's whole patches, measured when its barcode read.
+    patches: Vec<Vec<Patch>>,
 }
 
+/// How many unreadable pictures' band sums may wait for the barcode line. A picture is scored as
+/// soon as the next readable one shows its neighbours at most 64 frames apart, so only long or
+/// out-of-order unreadable runs wait: about 169 KB each at 1440p, 20 MB at most.
+const PENDING_MAX: usize = 120;
+
 /// The checks this build runs.
-pub(crate) const RUNS: [&str; 5] = [
+pub(crate) const RUNS: [&str; 10] = [
     "decode.clean",
     "content.barcode",
     "cadence.drops_dups",
     "cadence.judder",
     "content.flash",
+    "content.bars",
+    "content.colour_matrix",
+    "content.bars_lines",
+    "content.levels",
+    "hdr.curve_levels",
 ];
 
 /// What the readings add up to.
@@ -60,6 +84,8 @@ struct Analysis {
     /// The 99th percentile of |step − tick| between consecutive readable frames, in 100 ns, from
     /// the line's slope (README §6.3 `cadence.judder`).
     p99_step_error_hns: Option<f64>,
+    /// Each picture's bars, the unreadable ones scored against their likely frame numbers.
+    bars: Vec<Option<FrameBars>>,
 }
 
 /// How far the line's testbed rate may exceed the expect file's `source_hz`: a timer-paced
@@ -69,11 +95,42 @@ const SOURCE_RATE_SLACK: f64 = 0.005;
 /// The fastest display the cadence ideal is replayed for, in Hz.
 const MAX_IDEAL_HZ: f64 = 2_000.0;
 
-/// Runs `decoder` over the clip's video, reading each picture's barcodes and flash.
-pub(crate) fn decode(decoder: &mut dyn Decoder) -> Decoded {
-    let mut readings = Vec::new();
+/// What the plan says the patches show.
+fn expected_patches(plan: &Plan) -> Expected {
+    match plan.expect.as_ref().and_then(|e| e.hdr.as_ref()) {
+        Some(hdr) => Expected::Hdr {
+            curve: if hdr.curve == "match" {
+                kairo_core::testsig::Curve::MatchSdrApps
+            } else {
+                kairo_core::testsig::Curve::Natural
+            },
+            peak_nits: f64::from(hdr.lw_nits),
+            white_nits: f64::from(hdr.sdr_white_nits),
+        },
+        None => Expected::Sdr,
+    }
+}
+
+/// Runs `decoder` over the clip's video: each picture's barcodes and flash, and, once its frame
+/// number is known, its bars and patches. Nothing but these numbers is kept (README §6.7).
+pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan) -> Decoded {
+    let expected = expected_patches(plan);
+    let mut decoded = Decoded {
+        kind: decoder.kind(),
+        licence: decoder.licence(),
+        stats: Ok(DecodeStats::default()),
+        readings: Vec::new(),
+        bars: Vec::new(),
+        pending: Vec::new(),
+        pending_dropped: 0,
+        bands: None,
+        patches: Vec::new(),
+    };
     let mut geometry: Option<(usize, usize, Option<Geometry>)> = None;
-    let stats = decoder.video(&mut |_, planes| {
+    let mut previous: Option<i64> = None;
+    // The last readable picture: (index, frame number).
+    let mut last_readable: Option<(usize, i64)> = None;
+    let stats = decoder.video(&mut |index, planes| {
         let size = (planes.width(), planes.height());
         if geometry.as_ref().is_none_or(|g| (g.0, g.1) != size) {
             let layout = u32::try_from(size.0)
@@ -81,19 +138,98 @@ pub(crate) fn decode(decoder: &mut dyn Decoder) -> Decoded {
                 .zip(u32::try_from(size.1).ok())
                 .and_then(|(w, h)| Geometry::new(w, h).ok());
             geometry = Some((size.0, size.1, layout));
+            decoded.bands = Bands::new(size.0, size.1);
         }
-        readings.push(match geometry.as_ref().and_then(|g| g.2.as_ref()) {
+        let reading = match geometry.as_ref().and_then(|g| g.2.as_ref()) {
             Some(layout) => analyze::read(layout, planes),
             None => Reading::default(),
+        };
+        // The same unwrapping as analyze::frame_numbers, as the pictures come.
+        let number = reading.code.map(|c| {
+            let n = previous.map_or(i64::from(c.frame24), |p| {
+                kairo_core::testsig::unwrap_frame(p, c.frame24)
+            });
+            previous = Some(n);
+            n
         });
+        let sums = decoded.bands.as_ref().and_then(|b| b.sums(planes));
+        let (frame_bars, patches) = match (number.and_then(|n| u64::try_from(n).ok()), sums) {
+            (Some(n), Some(sums)) => (
+                decoded.bands.as_ref().map(|b| bars::judge(b, &sums, n)),
+                levels::patches(planes, n, &expected),
+            ),
+            (None, Some(sums)) => {
+                if decoded.pending.len() < PENDING_MAX {
+                    decoded.pending.push((index, sums));
+                } else {
+                    decoded.pending_dropped += 1;
+                }
+                (None, Vec::new())
+            }
+            _ => (None, Vec::new()),
+        };
+        decoded.bars.push(frame_bars);
+        decoded.patches.push(patches);
+        decoded.readings.push(reading);
+        if let Some(n) = number {
+            // The unreadable pictures since the last readable one show a frame between the two:
+            // score them now if that span is short, as candidates() would.
+            if let (Some((last, before)), Some(bands)) = (last_readable, decoded.bands.as_ref())
+                && n >= before
+                && n - before <= 64
+            {
+                let span: Vec<u64> = (before.max(0)..=n)
+                    .filter_map(|m| u64::try_from(m).ok())
+                    .collect();
+                let waiting = decoded.pending.iter().position(|(i, _)| *i > last);
+                if let Some(from) = waiting {
+                    for (i, sums) in decoded.pending.drain(from..) {
+                        if let Some(slot) = decoded.bars.get_mut(i) {
+                            *slot = bars::judge_best(bands, &sums, span.clone());
+                        }
+                    }
+                }
+            }
+            last_readable = Some((index, n));
+        }
         ControlFlow::Continue(())
     });
-    Decoded {
-        kind: decoder.kind(),
-        licence: decoder.licence(),
-        stats,
-        readings,
+    decoded.stats = stats;
+    decoded
+}
+
+/// The frame numbers an unreadable picture may show: everything between its readable
+/// neighbours' when they are at most 64 apart, else the barcode line's estimate ± two output
+/// frames' worth (README §6.3 `content.bars`).
+fn candidates(
+    index: usize,
+    numbers: &[Option<i64>],
+    line: Option<&Line>,
+    pts: &[i64],
+    step: f64,
+) -> Vec<u64> {
+    let before = numbers[..index].iter().rev().find_map(|n| *n);
+    let after = numbers
+        .get(index + 1..)
+        .and_then(|rest| rest.iter().find_map(|n| *n));
+    if let (Some(a), Some(b)) = (before, after)
+        && b >= a
+        && b - a <= 64
+    {
+        return (a.max(0)..=b)
+            .filter_map(|n| u64::try_from(n).ok())
+            .collect();
     }
+    let (Some(line), Some(&t)) = (line, pts.get(index)) else {
+        return Vec::new();
+    };
+    let estimate = (t as f64 - line.alpha) / line.beta;
+    let spread = (2.0 * step).ceil().max(1.0);
+    let (from, to) = ((estimate - spread).floor(), (estimate + spread).ceil());
+    if !(from.is_finite() && to.is_finite()) || to - from > 4_096.0 {
+        return Vec::new();
+    }
+    (from.max(0.0) as u64..=to.max(0.0) as u64).collect()
 }
 
 /// Each picture's presentation time in media ticks, earliest first: decode time plus `ctts`.
@@ -183,9 +319,22 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         (Ok(line), Some(fps)) => step_error_p99(line, &numbers, timescale, fps),
         _ => None,
     };
+    let mut frame_bars = decoded.bars.clone();
+    if let Some(bands) = decoded.bands.as_ref() {
+        let step = source_fps
+            .zip(fps)
+            .map_or(1.0, |(fs, f)| f64::from(fs) / f64::from(f.max(1)));
+        for (index, sums) in &decoded.pending {
+            let numbers_near = candidates(*index, &numbers, line.as_ref().ok(), &pts, step);
+            if let Some(slot) = frame_bars.get_mut(*index) {
+                *slot = bars::judge_best(bands, sums, numbers_near);
+            }
+        }
+    }
     Analysis {
         numbers,
         line,
+        bars: frame_bars,
         source_fps,
         too_fast,
         refresh,
@@ -290,11 +439,19 @@ pub(crate) fn findings(
             ));
             continue;
         }
+        let hdr = plan.expect.as_ref().is_some_and(|e| e.hdr.is_some());
         let outcome = match id {
             "content.barcode" => barcode(plan, &decoded.readings),
             "cadence.drops_dups" => drops_dups(plan, &analysis),
             "cadence.judder" => judder(plan, &analysis),
             "content.flash" => flash(&analysis),
+            "content.bars" => bars_psnr(plan, decoded, &analysis),
+            "content.colour_matrix" => colour_matrix(decoded, &analysis),
+            "content.bars_lines" => bars_lines(decoded, &analysis),
+            "content.levels" if hdr => {
+                Outcome::skip("the patches are HDR: hdr.curve_levels judges them")
+            }
+            "content.levels" | "hdr.curve_levels" => patch_levels(decoded, hdr),
             _ => Outcome::skip("unknown check"),
         };
         out.push(weigh(id, outcome, mode));
@@ -654,6 +811,163 @@ fn flash(a: &Analysis) -> Outcome {
     outcome
 }
 
+/// The scored pictures, with their index.
+fn scored(a: &Analysis) -> impl Iterator<Item = (usize, &FrameBars)> {
+    a.bars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
+}
+
+fn bars_psnr(plan: &Plan, decoded: &Decoded, a: &Analysis) -> Outcome {
+    if decoded.bands.is_none() {
+        return Outcome::skip("the picture is too small for the bars band");
+    }
+    let limit = if plan.profile.is_share_export() {
+        profile::EXPORT_BARS_MIN_DB
+    } else {
+        profile::BARS_MIN_DB
+    };
+    let worst = scored(a).min_by(|x, y| x.1.score.min().total_cmp(&y.1.score.min()));
+    let unscored: Vec<usize> = a
+        .bars
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    let ramp = scored(a)
+        .map(|(_, b)| b.ramp_chroma)
+        .fold(0.0_f64, f64::max);
+    let mut outcome = Outcome {
+        value: json!({"frames": a.bars.len(), "scored": a.bars.len() - unscored.len(),
+                      "min_db": worst.map(|w| w.1.score.min()), "min_frame": worst.map(|w| w.0),
+                      "ramp_chroma_max": ramp}),
+        limit: json!({"min_db": limit, "every_frame": true, "ramp_chroma": profile::RAMP_CHROMA_TOLERANCE,
+                      "ramp_chroma_in_exports": "warning",
+                      "source": if limit < profile::BARS_MIN_DB { "README §2 item 14 (proposed)" } else { "PLAN:351" }}),
+        detail: worst.map_or("no frame scored".to_owned(), |w| {
+            format!("min {:.1} dB (frame {})", w.1.score.min(), w.0)
+        }),
+        ..Outcome::default()
+    };
+    for (i, b) in scored(a) {
+        let s = b.score;
+        outcome.require(s.min() >= limit, || {
+            format!(
+                "frame {i} (testbed frame {}): {:.1} dB (Y {:.1}, Cb {:.1}, Cr {:.1})",
+                b.frame,
+                s.min(),
+                s.y,
+                s.cb,
+                s.cr
+            )
+        });
+        // Exports keep to gross faults (README §2 item 14): there the ramp's chroma only warns.
+        if b.ramp_chroma > profile::RAMP_CHROMA_TOLERANCE {
+            outcome.violation(
+                !plan.profile.is_share_export(),
+                format!(
+                    "frame {i}: the ramp's chroma is {:.1} codes off grey",
+                    b.ramp_chroma
+                ),
+            );
+        }
+    }
+    // Corruption that also hits the barcode can't hide as unreadable (README §6.3).
+    for i in unscored {
+        outcome.fails.push(format!(
+            "frame {i}: no frame number to score its bars against"
+        ));
+    }
+    if decoded.pending_dropped > 0 {
+        outcome.fails.push(format!(
+            "{} more unreadable frames weren't kept for scoring",
+            decoded.pending_dropped
+        ));
+    }
+    outcome
+}
+
+fn colour_matrix(decoded: &Decoded, a: &Analysis) -> Outcome {
+    if decoded.bands.is_none() {
+        return Outcome::skip("the picture is too small for the bars band");
+    }
+    let margin = profile::COLOUR_MATRIX_MARGIN_DB;
+    let mut outcome = Outcome {
+        limit: json!({"margin_db": margin, "source": "README §2 item 14 (proposed)"}),
+        detail: "BT.709 limited fits best".to_owned(),
+        ..Outcome::default()
+    };
+    let mut worst: Option<(usize, &'static str, f64)> = None;
+    for (i, b) in scored(a) {
+        let gain = b.best_other.1 - b.score.min();
+        if worst.is_none_or(|w| gain > w.2) {
+            worst = Some((i, b.best_other.0.name(), gain));
+        }
+        outcome.require(gain < margin, || {
+            format!(
+                "frame {i}: {} fits {gain:.1} dB better than BT.709 limited",
+                b.best_other.0.name()
+            )
+        });
+    }
+    outcome.value = json!({"best_other": worst.map(|w| w.1), "gain_db": worst.map(|w| w.2)});
+    outcome
+}
+
+fn bars_lines(decoded: &Decoded, a: &Analysis) -> Outcome {
+    if decoded.bands.is_none() {
+        return Outcome::skip("the picture is too small for the bars band");
+    }
+    let limit = profile::BARS_LINES_MAX_CODES;
+    let worst = scored(a).map(|(_, b)| b.line).fold(0.0_f64, f64::max);
+    let mut outcome = Outcome {
+        value: json!({"max_codes": worst}),
+        limit: json!({"max_codes": limit, "source": "README §2 item 14 (proposed)"}),
+        detail: format!("largest row or column residual {worst:.2} codes"),
+        ..Outcome::default()
+    };
+    for (i, b) in scored(a) {
+        outcome.require(b.line <= limit, || {
+            format!("frame {i}: a row or column {:.1} codes off", b.line)
+        });
+    }
+    outcome
+}
+
+fn patch_levels(decoded: &Decoded, hdr: bool) -> Outcome {
+    let tolerance = profile::LEVELS_TOLERANCE;
+    let measured: usize = decoded.patches.iter().map(Vec::len).sum();
+    if measured == 0 {
+        return Outcome::skip("no whole patch on a readable frame");
+    }
+    let worst = decoded
+        .patches
+        .iter()
+        .flatten()
+        .map(|p| (p.measured - p.expected).abs())
+        .fold(0.0_f64, f64::max);
+    let mut outcome = Outcome {
+        value: json!({"patches": measured, "worst_error": worst}),
+        limit: json!({"codes": tolerance, "top": if hdr { "one-sided at 235" } else { "two-sided" },
+                      "source": if hdr { "PLAN:430, signals.md §4" } else { "README §6.5" }}),
+        detail: format!("{measured} patches within ±{tolerance} codes"),
+        ..Outcome::default()
+    };
+    for (i, patches) in decoded.patches.iter().enumerate() {
+        for p in patches {
+            outcome.require(levels::within(p, tolerance, hdr), || {
+                format!(
+                    "frame {i}: patch {} shows Y {:.1}, expected {:.1}",
+                    p.k, p.measured, p.expected
+                )
+            });
+        }
+    }
+    outcome
+}
+
 /// The content summary line, from the findings' values: barcodes read, drops and duplicates,
 /// judder; or what was decoded when the barcodes weren't judged. `None` when no decoder ran.
 pub(crate) fn summary(findings: &[Finding]) -> Option<String> {
@@ -681,6 +995,9 @@ pub(crate) fn summary(findings: &[Finding]) -> Option<String> {
     }
     if let Some(excess) = value("cadence.judder").and_then(|v| v.get("excess")?.as_f64()) {
         parts.push(format!("judder excess {:.1} pp", 100.0 * excess));
+    }
+    if let Some(min) = value("content.bars").and_then(|v| v.get("min_db")?.as_f64()) {
+        parts.push(format!("bars min {min:.1} dB"));
     }
     Some(parts.join(", "))
 }
@@ -715,6 +1032,7 @@ mod tests {
             ideal: Some((0.0, 0.0)),
             flashes: None,
             p99_step_error_hns: None,
+            bars: Vec::new(),
         }
     }
 

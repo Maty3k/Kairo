@@ -14,10 +14,15 @@ use super::{DecodeError, DecodeStats, Decoder, Picture, Planes};
 /// Pattern v1 as limited-range BT.709 4:2:0: Y and full-resolution Cb and Cr from the sRGB
 /// raster, then chroma subsampled with `chroma_sample_loc_type` 0 (README §4.5).
 pub fn render(scene: &Scene) -> Result<Picture, PatternError> {
+    render_as(scene, Matrix::Bt709, Range::Limited)
+}
+
+/// [`render`] with another matrix or range, for the colour defects.
+fn render_as(scene: &Scene, matrix: Matrix, range: Range) -> Result<Picture, PatternError> {
     let size = scene.size();
     let (w, h) = (size.width() as usize, size.height() as usize);
     let raster = scene.raster_srgb()?;
-    let (luma, cb, cr) = planes_of(&raster);
+    let (luma, cb, cr) = planes_of(&raster, matrix, range);
     let round = |v: f64| v.round().clamp(0.0, 255.0) as u8;
     Ok(Picture {
         width: w,
@@ -35,14 +40,14 @@ pub fn render(scene: &Scene) -> Result<Picture, PatternError> {
 }
 
 /// Full-resolution Y, Cb and Cr of an sRGB raster, unrounded.
-fn planes_of(raster: &[[u8; 3]]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+fn planes_of(raster: &[[u8; 3]], matrix: Matrix, range: Range) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut planes = (
         Vec::with_capacity(raster.len()),
         Vec::with_capacity(raster.len()),
         Vec::with_capacity(raster.len()),
     );
     for rgb in raster {
-        let [y, cb, cr] = testsig::ycbcr(rgb.map(f64::from), Matrix::Bt709, Range::Limited);
+        let [y, cb, cr] = testsig::ycbcr(rgb.map(f64::from), matrix, range);
         planes.0.push(y);
         planes.1.push(cb);
         planes.2.push(cr);
@@ -92,6 +97,17 @@ pub struct Damage {
     pub shift: f64,
     /// Luma rounded to multiples of this many codes, as coarse quantisation would leave it.
     pub quantise: u8,
+    /// Another matrix or range than BT.709 limited (signals.md §2.4's colour faults).
+    pub colour: Option<(Matrix, Range)>,
+    /// Cb and Cr swapped.
+    pub swap_chroma: bool,
+    /// 1 px luma lines every this many pixels, both ways, inside the bars band, this many codes
+    /// up (README §7.3's `bars` and `bars-sparse` defects).
+    pub gridlines: Option<(usize, i16)>,
+    /// Only these output frames get the gridlines; all of them when empty.
+    pub gridline_frames: Vec<usize>,
+    /// Cb this many codes off grey inside the ramp band, as a low bitrate can leave it.
+    pub ramp_chroma: i16,
 }
 
 /// A decoder that renders pattern v1: output frame `i` shows testbed frame `content[i]`.
@@ -122,7 +138,11 @@ impl Synthetic {
                 let scene = Scene::new(from, frame, &self.options)?;
                 let (fw, fh) = (from.width() as usize, from.height() as usize);
                 let (w, h) = (self.size.width() as usize, self.size.height() as usize);
-                let (luma, cb, cr) = planes_of(&scene.raster_srgb()?);
+                let (matrix, range) = self
+                    .damage
+                    .colour
+                    .unwrap_or((Matrix::Bt709, Range::Limited));
+                let (luma, cb, cr) = planes_of(&scene.raster_srgb()?, matrix, range);
                 let round = |v: f64| v.round().clamp(0.0, 255.0) as u8;
                 let chroma = |plane: Vec<f64>| -> Result<Vec<u8>, PatternError> {
                     let scaled = resample(&plane, (fw, fh), (w, h));
@@ -142,9 +162,45 @@ impl Synthetic {
                     cr: chroma(cr)?,
                 }
             }
-            _ => render(&Scene::new(self.size, frame, &self.options)?)?,
+            _ => {
+                let (matrix, range) = self
+                    .damage
+                    .colour
+                    .unwrap_or((Matrix::Bt709, Range::Limited));
+                render_as(&Scene::new(self.size, frame, &self.options)?, matrix, range)?
+            }
         };
         let scene = Scene::new(self.size, frame, &self.options)?;
+        if self.damage.swap_chroma {
+            std::mem::swap(&mut picture.cb, &mut picture.cr);
+        }
+        let gridded =
+            self.damage.gridline_frames.is_empty() || self.damage.gridline_frames.contains(&index);
+        if let Some((step, delta)) = self.damage.gridlines.filter(|_| gridded) {
+            let h = self.size.height();
+            let top = testsig::px_y(testsig::BARS_U.0, h).max(0) as usize;
+            let bottom = (testsig::px_y(testsig::BARS_U.1, h).max(0) as usize).min(picture.height);
+            let w = picture.width;
+            for y in top..bottom {
+                for x in 0..w {
+                    if step > 0 && (y % step == 0 || x % step == 0) {
+                        let v = &mut picture.y[y * w + x];
+                        *v = (i16::from(*v) + delta).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        if self.damage.ramp_chroma != 0 {
+            // Chroma rows are half the luma's: the ramp band's, in chroma rows.
+            let h = self.size.height();
+            let cw = picture.width.div_ceil(2);
+            let top = (testsig::px_y(testsig::RAMP_U.0, h).max(0) as usize) / 2;
+            let bottom = ((testsig::px_y(testsig::RAMP_U.1, h).max(0) as usize) / 2)
+                .min(picture.height.div_ceil(2));
+            for v in &mut picture.cb[top * cw..bottom * cw] {
+                *v = (i16::from(*v) + self.damage.ramp_chroma).clamp(0, 255) as u8;
+            }
+        }
         if self.damage.garble.contains(&index) {
             paint_cells(
                 &mut picture,

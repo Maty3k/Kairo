@@ -114,7 +114,7 @@ Across all 11,100 frames, the production copies had 0 unreadable frames and no b
 2. **Relative, every profile and bitrate.** Also compute PSNR against the BT.601-limited, BT.709-full, BT.601-full and Cb↔Cr-swapped references. If any of them beats BT.709-limited by ≥ 6 dB, fail and name it: "matrix BT.601", "full range", "Cb/Cr swapped". This check works at any bitrate.
 3. **Absolute, low-bitrate export profiles** (Discord 540p/720p rungs, WhatsApp; docs/PLAN.md:243–246): ≥ 30 dB [proposed]. It catches gross faults only; rule 2 covers the colour mistakes.
 4. **Decode errors.** Count libavcodec decode errors per stream. Any error fails the clip, matching research 09's "decodes cleanly, every track" (docs/research/09-encode-mux-rust.md:981).
-5. **Diagnostic only, never a gate.** For each frame, the largest mean residual of any row (and of any column) inside the band. On clean encodes, rows stay ≤ 0.24 code and columns ≤ 2.0 codes. A faint +6-code gridline every 64 px scored 6.3 on columns but only 50 dB PSNR, so the report shows it. Starved encodes reach 9–22 on columns, which is why it can't gate.
+5. **Diagnostic only, never a gate.** For each frame, the largest mean residual of any row (and of any column) inside the band. On clean encodes, rows stay ≤ 0.24 code and columns ≤ 2.0 codes, except the outermost 16 px, where scrolling brings new content in each frame (4.6 codes at x = 0 on VideoToolbox at 1080p, 25/40 Mbps): kairo-verify leaves those columns out [Mac, research 16's PR 4b]. A faint +6-code gridline every 64 px scored 6.3 on columns but only 50 dB PSNR, so the report shows it. Starved encodes reach 9–22 on columns, which is why it can't gate.
 
 ### 2.4 Measured
 
