@@ -258,7 +258,7 @@ fn header(head: &[u8]) -> Result<Header, String> {
 
 /// How many fixed bytes come before a box's children, or `None` if it holds no boxes this
 /// reader follows.
-fn children_start(kind: &[u8; 4], payload: &Bytes<'_>) -> Option<usize> {
+pub(crate) fn children_start(kind: &[u8; 4], payload: &Bytes<'_>) -> Option<usize> {
     match kind {
         b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"dinf" | b"edts" | b"udta" | b"mvex"
         | b"moof" | b"traf" | b"tref" | b"ilst" => Some(0),
@@ -476,6 +476,14 @@ impl Mp4 {
                 }
             };
             let size = parsed.size.unwrap_or(file_len - at);
+            if parsed.size.is_none() && size < parsed.header {
+                let what = format!(
+                    "{} box runs to the end of the file but is shorter than its {}-byte header",
+                    parsed.kind, parsed.header
+                );
+                file.problem(&parsed.kind.to_string(), at, what);
+                break;
+            }
             if size > file_len - at {
                 file.problem(
                     &parsed.kind.to_string(),
