@@ -1,0 +1,28 @@
+[package]
+name = "kairo-display"
+description = "The monitor by its device path, the adapter by its LUID (M1, research 16)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Devices_Display",     # QueryDisplayConfig, DisplayConfigGetDeviceInfo
+    "Win32_Foundation",          # LUID, RECT, errors
+    "Win32_Graphics_Dxgi",       # adapters, outputs and their LUIDs
+    "Win32_Graphics_Dxgi_Common", # the HDR colour space
+    "Win32_Graphics_Gdi",        # EnumDisplayMonitors, GetMonitorInfoW
+    "Win32_UI_HiDpi",            # SetProcessDpiAwarenessContext
+] }
+
+[lints]
+workspace = true

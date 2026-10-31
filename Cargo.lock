@@ -75,6 +75,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kairo-display"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "kairo-harness"
+version = "0.1.0"
+dependencies = [
+ "kairo-display",
+ "serde_json",
+]
+
+[[package]]
 name = "kairo-hello"
 version = "0.1.0"
 dependencies = [

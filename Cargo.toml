@@ -1,6 +1,7 @@
 # Kairo workspace (docs/PLAN.md §2.11; layout: docs/research/15-implementation-cookbook.md §1).
 # Crates: kairo-core (shared contract and media maths, tested everywhere), the PC-side dev-loop tools,
-# the Mac's mock engine and kairo-verify (the clip checker, research 16).
+# the Mac's mock engine, and M1's kairo-verify (the clip checker, research 16), kairo-display
+# (monitor by device path, adapter by LUID) and kairo-harness.
 # The research prototypes under docs/research/prototypes/ are standalone and not members.
 
 [workspace]
@@ -12,6 +13,8 @@ members = [
     "crates/kairo-cli",
     "crates/kairo-mock-engine",
     "crates/kairo-verify",
+    "crates/kairo-display",
+    "crates/kairo-harness",
 ]
 
 [workspace.package]
@@ -26,6 +29,7 @@ publish = false
 # which cargo-deny also requires. Checked on crates.io on 2026-10-21; all MIT OR Apache-2.0.
 [workspace.dependencies]
 kairo-core = { path = "crates/kairo-core" }
+kairo-display = { path = "crates/kairo-display" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # Each crate enables only the Win32 features it uses.
