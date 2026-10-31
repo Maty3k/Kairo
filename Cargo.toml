@@ -1,6 +1,6 @@
 # Kairo workspace (docs/PLAN.md §2.11; layout: docs/research/15-implementation-cookbook.md §1).
-# Crates: kairo-core (shared contract and media maths, tested everywhere), the PC-side dev-loop tools and
-# the Mac's mock engine.
+# Crates: kairo-core (shared contract and media maths, tested everywhere), the PC-side dev-loop tools,
+# the Mac's mock engine and kairo-verify (the clip checker, research 16).
 # The research prototypes under docs/research/prototypes/ are standalone and not members.
 
 [workspace]
@@ -11,6 +11,7 @@ members = [
     "crates/kairo-hello",
     "crates/kairo-cli",
     "crates/kairo-mock-engine",
+    "crates/kairo-verify",
 ]
 
 [workspace.package]

@@ -26,7 +26,7 @@ env:
 
 jobs:
   linux:
-    name: Linux (fmt, clippy, kairo-core and mock tests, house rules)
+    name: Linux (fmt, clippy, kairo-core, mock and verify tests, house rules)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -46,8 +46,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Test kairo-core and the mock engine
-        run: cargo test -p kairo-core -p kairo-mock-engine --locked
+      - name: Test kairo-core, the mock engine and kairo-verify
+        run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify --locked
 
       - name: House rules (forbidden APIs, sockets outside kairo-net)
         run: |
