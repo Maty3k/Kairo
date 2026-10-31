@@ -6,7 +6,8 @@
 //! - `src\`: a non-bare clone (`receive.denyCurrentBranch=updateInstead`, branch `snapshot`);
 //! - `bin\<build-id>\`: builds, with `bin\current` a junction to the active one (3 are kept);
 //! - `jobs\`, `logs\`, `tools\` (FFmpeg, PresentMon);
-//! - `state\`: `watch.json` and `bootstrap-report.json`.
+//! - `state\`: `watch.json` and `bootstrap-report.json`;
+//! - `build\target\`: the output of `pc build`, which runs as the owner (M1).
 //!
 //! Paths are Windows paths built as strings, so this module behaves the same in tests on any OS.
 

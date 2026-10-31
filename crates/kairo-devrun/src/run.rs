@@ -12,10 +12,12 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kairo_core::job::{self, ABORT_EXIT_CODE, EndReason, JobFile, JobResult, WindowMode};
+use kairo_core::job::{self, ABORT_EXIT_CODE, EndReason, JobFile, JobResult, Priority, WindowMode};
 use kairo_core::layout::Layout;
 use kairo_core::time;
-use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW};
+use windows::Win32::System::Threading::{
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, NORMAL_PRIORITY_CLASS,
+};
 
 use crate::app::{EXIT_BUSY, EXIT_FAILED};
 use crate::spawn::{self, StartError, Started};
@@ -107,12 +109,52 @@ pub fn main(layout: &Layout, job_file: &str) -> ExitCode {
     finish(layout, &result)
 }
 
+/// Jobs whose old logs are pruned, by id prefix, with how many earlier ones to keep: builds and
+/// `pc cli` calls (tools/mac/remote/build.ps1 and cli.ps1 name them `<prefix><UTC>`, so their
+/// ids sort by time). The elevated side never deletes anything in the logs folder, which the
+/// owner's account can write (M1 contract, Builds), so this owner-side process does.
+const PRUNED: [(&str, usize); 2] = [("build-", 10), ("cli-", 3)];
+
+/// Deletes the result and output logs of all but the newest `keep` jobs whose ids start with
+/// `prefix`.
+fn prune_logs(layout: &Layout, prefix: &str, keep: usize) {
+    let Ok(entries) = fs::read_dir(layout.logs_dir()) else {
+        return;
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|name| {
+            [".result.json", ".out.log", ".err.log"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix).map(str::to_owned))
+        })
+        .filter(|id| id.starts_with(prefix))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let old = ids.len().saturating_sub(keep);
+    for id in &ids[..old] {
+        for path in [
+            layout.job_result_file(id),
+            layout.job_stdout_file(id),
+            layout.job_stderr_file(id),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Runs a valid job to its end. Never fails: problems become the result's `reason`, with the
 /// details in `<id>.err.log`.
 pub fn execute(layout: &Layout, job: &JobFile) -> JobResult {
     let started_utc = time::now_utc();
     let _ = fs::create_dir_all(layout.logs_dir());
     let _ = fs::remove_file(layout.job_result_file(&job.id));
+    for (prefix, keep) in PRUNED {
+        if job.id.starts_with(prefix) {
+            prune_logs(layout, prefix, keep);
+        }
+    }
     let (reason, exit_code) = match supervise(layout, job) {
         Ok(outcome) => outcome,
         Err(failure) => {
@@ -153,6 +195,13 @@ fn supervise(layout: &Layout, job: &JobFile) -> Result<(EndReason, Option<u32>),
         WindowMode::Hidden => CREATE_NO_WINDOW,
         WindowMode::Visible => CREATE_NEW_CONSOLE,
     };
+    // Always a class: a process created without one inherits a below-normal parent's
+    // (CreateProcess docs), and kairo-devrun may itself run below normal (a CI runner does).
+    // The job's own children inherit the job's class either way.
+    let priority = match job.priority {
+        Priority::Normal => NORMAL_PRIORITY_CLASS,
+        Priority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+    };
     let mut command = Command::new(program);
     command
         .args(args)
@@ -163,7 +212,7 @@ fn supervise(layout: &Layout, job: &JobFile) -> Result<(EndReason, Option<u32>),
     let Started {
         mut child,
         job: processes,
-    } = spawn::start_in_job(&mut command, console.0).map_err(|error| match error {
+    } = spawn::start_in_job(&mut command, (console | priority).0).map_err(|error| match error {
         StartError::Spawn(error) => Failure {
             reason: EndReason::SpawnFailed,
             message: format!("cannot start {program} in {cwd}: {error}"),
@@ -277,6 +326,7 @@ mod tests {
             max_seconds,
             abort_on_input: false,
             window: WindowMode::Hidden,
+            priority: Priority::Normal,
         }
     }
 
@@ -289,6 +339,65 @@ mod tests {
         assert!(!result.aborted);
         let out = fs::read_to_string(layout.job_stdout_file("echo")).unwrap();
         assert!(out.contains("kairo-ok"), "{out}");
+    }
+
+    #[test]
+    fn below_normal_priority_reaches_the_job_and_its_children() {
+        // cmd starts PowerShell, a grandchild of kairo-devrun, which prints its own class.
+        let print = "[Diagnostics.Process]::GetCurrentProcess().PriorityClass";
+        for (priority, expected) in [
+            (Priority::BelowNormal, "BelowNormal"),
+            (Priority::Normal, "Normal"),
+        ] {
+            let layout = layout(expected);
+            let mut low = job(
+                "priority",
+                &["cmd", "/c", "powershell", "-NoProfile", "-Command", print],
+                60,
+            );
+            low.priority = priority;
+            let result = execute(&layout, &low);
+            assert_eq!(result.reason, EndReason::Exited);
+            let out = fs::read_to_string(layout.job_stdout_file("priority")).unwrap();
+            assert_eq!(out.trim(), expected, "{priority:?}");
+        }
+    }
+
+    #[test]
+    fn prunes_all_but_the_newest_build_and_cli_logs() {
+        let layout = layout("prune");
+        for n in 0..14 {
+            for path in [
+                layout.job_result_file(&format!("build-2026110{}-0000{n:02}", n % 2)),
+                layout.job_stdout_file(&format!("cli-20261101-0000{n:02}")),
+                layout.job_stdout_file(&format!("hello{n}")),
+            ] {
+                fs::write(path, "x").unwrap();
+            }
+        }
+        prune_logs(&layout, "build-", 10);
+        prune_logs(&layout, "cli-", 3);
+        let mut left: Vec<String> = fs::read_dir(layout.logs_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let builds = left.iter().filter(|n| n.starts_with("build-")).count();
+        let clis: Vec<&String> = left.iter().filter(|n| n.starts_with("cli-")).collect();
+        assert_eq!(builds, 10);
+        assert_eq!(
+            clis,
+            [
+                "cli-20261101-000011.out.log",
+                "cli-20261101-000012.out.log",
+                "cli-20261101-000013.out.log"
+            ]
+        );
+        // Other jobs' logs are never touched.
+        assert_eq!(left.iter().filter(|n| n.starts_with("hello")).count(), 14);
+        // The newest builds by id are the ones kept.
+        assert!(left.contains(&"build-20261101-000013.result.json".to_owned()));
+        assert!(!left.contains(&"build-20261100-000000.result.json".to_owned()));
     }
 
     #[test]

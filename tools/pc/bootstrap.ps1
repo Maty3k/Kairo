@@ -61,6 +61,11 @@ $JobsDir    = 'C:\kairo\jobs'
 $LogsDir    = 'C:\kairo\logs'
 $ToolsDir   = 'C:\kairo\tools'
 $StateDir   = 'C:\kairo\state'
+$BuildDir   = 'C:\kairo\build'
+# The folders your own programs write: nothing elevated ever walks, changes or deletes what is in them.
+$WritableDirs = @($LogsDir, $StateDir, $BuildDir)
+# The folders only administrators can change.
+$AdminDirs    = @($SrcDir, $BinDir, $JobsDir, $ToolsDir)
 $CurrentBin = 'C:\kairo\bin\current'
 $DevrunExe  = 'C:\kairo\bin\current\kairo-devrun.exe'
 $JobFile    = 'C:\kairo\jobs\next.json'
@@ -543,10 +548,12 @@ function Get-NodeExe {
 }
 
 function Get-NodeVersion {
+    # From node.exe's version resource, never by running it: with nvm, Program Files\nodejs is a link into
+    # your profile, which any program running as you can change.
     $node = Get-NodeExe
     if (-not $node) { return $null }
-    $r = Invoke-Native -FilePath $node -ArgumentList @('--version')
-    if ($r.Text -match '^v(\d+\.\d+\.\d+)') { return $Matches[1] }
+    $v = [string] (Get-Item -LiteralPath $node).VersionInfo.ProductVersion
+    if ($v.TrimStart('v') -match '^(\d+\.\d+\.\d+)') { return $Matches[1] }
     return $null
 }
 
@@ -556,13 +563,46 @@ function Get-NodeMajor {
     return 0
 }
 
+function Get-PnpmVersions {
+    # The pnpm versions in corepack's cache in your profile (COREPACK_HOME, by default
+    # %LOCALAPPDATA%\node\corepack), newest first. Read from the folders, never by running pnpm.cmd: that
+    # would run the pnpm there, and cmd.exe without /d would run your AutoRun command, both elevated here.
+    $corepackHome = [Environment]::GetEnvironmentVariable('COREPACK_HOME', 'User')
+    if (-not $corepackHome) { $corepackHome = [Environment]::GetEnvironmentVariable('COREPACK_HOME', 'Machine') }
+    if (-not $corepackHome) { $corepackHome = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'node\corepack' }
+    $versions = @()
+    foreach ($cache in @((Join-Path $corepackHome 'v1\pnpm'), (Join-Path $corepackHome 'pnpm'))) {
+        if (Test-Path -LiteralPath $cache) {
+            $versions += @(Get-ChildItem -LiteralPath $cache -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | ForEach-Object { [version] $_.Name })
+        }
+    }
+    return @($versions | Sort-Object -Descending | ForEach-Object { [string] $_ })
+}
+
 function Get-PnpmVersion {
-    $pnpm = Join-Path $env:ProgramFiles 'nodejs\pnpm.cmd'
-    if (-not (Test-Path -LiteralPath $pnpm)) { return $null }
-    $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
-    $r = Invoke-Native -FilePath $pnpm -ArgumentList @('--version')
-    if ($r.ExitCode -eq 0 -and $r.Text -match '(\d+\.\d+\.\d+)\s*$') { return $Matches[1] }
-    return $null
+    $versions = @(Get-PnpmVersions)
+    if ($versions.Count -eq 0) { return $null }
+    return $versions[0]
+}
+
+function Get-RustState {
+    # Whether the pinned toolchain, with clippy and rustfmt, is installed and the default: read from rustup's
+    # files in your profile, never by running rustup or rustc there (any program running as you can change
+    # them).
+    $rustupHome = [Environment]::GetEnvironmentVariable('RUSTUP_HOME', 'User')
+    if (-not $rustupHome) { $rustupHome = [Environment]::GetEnvironmentVariable('RUSTUP_HOME', 'Machine') }
+    if (-not $rustupHome) { $rustupHome = Join-Path $env:USERPROFILE '.rustup' }
+    $settings = Join-Path $rustupHome 'settings.toml'
+    $default = $null
+    if ((Test-Path -LiteralPath $settings) -and ((Get-Content -LiteralPath $settings -Raw) -match '(?m)^\s*default_toolchain\s*=\s*"([^"]+)"')) {
+        $default = $Matches[1]
+    }
+    $bin = Join-Path $rustupHome ('toolchains\{0}-x86_64-pc-windows-msvc\bin' -f $RustToolchain)
+    $installed = $true
+    foreach ($exe in @('rustc.exe', 'cargo.exe', 'cargo-clippy.exe', 'rustfmt.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $bin $exe))) { $installed = $false }
+    }
+    return New-Object psobject -Property @{ Default = $default; Installed = $installed; Ready = ($installed -and ($default -like ($RustToolchain + '*'))) }
 }
 
 function Test-FfmpegPinned {
@@ -1027,8 +1067,9 @@ function Get-ToolchainFacts {
     try { $pw = Get-PwshExe; if ($pw) { $t.pwsh = (Get-Item -LiteralPath $pw).VersionInfo.ProductVersion } } catch { $t.pwsh = 'error' }
     try { $t.msvc = Get-VsCppPath } catch { $t.msvc = 'error' }
     try {
-        $rustup = Get-RustupExe
-        if ($rustup) { $t.rustc = (Invoke-Native -FilePath (Join-Path (Split-Path -Parent $rustup) 'rustc.exe') -ArgumentList @('--version')).Text }
+        $rust = Get-RustState
+        if ($rust.Installed) { $t.rustc = 'rustc ' + $RustToolchain }
+        $t.rust_default = $rust.Default
     } catch { $t.rustc = 'error' }
     try { $t.node = Get-NodeVersion } catch { $t.node = 'error' }
     try { $t.pnpm = Get-PnpmVersion } catch { $t.pnpm = 'error' }
@@ -1076,9 +1117,16 @@ function Install-WingetPackage {
 }
 
 function Assert-NoOutsideLink([string] $LeftAlone) {
-    # Recursive icacls changes follow links, so they run only while C:\kairo holds none but bin\current, a junction
-    # to a build inside C:\kairo\bin.
-    $links = @(Find-ReparsePoint $KairoRoot | Where-Object { $_ -ne $CurrentBin })
+    # Recursive icacls changes follow links, so they run only on src, bin, jobs and tools, and only while
+    # those hold none but bin\current, a junction to a build inside C:\kairo\bin. They never walk logs,
+    # state or build, where your programs could make one.
+    $links = @()
+    foreach ($d in $AdminDirs) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        $item = Get-Item -LiteralPath $d -Force
+        if (([int] $item.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $links += $d; continue }
+        $links += @(Find-ReparsePoint $d | Where-Object { $_ -ne $CurrentBin })
+    }
     if ($links.Count -gt 0) {
         throw ('C:\kairo contains links that may point outside it ({0}), so {1}. Tell Claude.' -f ((@($links) | Select-Object -First 3) -join ', '), $LeftAlone)
     }
@@ -1095,9 +1143,10 @@ function Assert-NoOutsideLink([string] $LeftAlone) {
 
 function Initialize-KairoTree([string] $OwnerSid) {
     # C:\kairo (docs/milestones/M0.md): Administrators and SYSTEM have full control and own everything; you can
-    # read and run it all, but your own programs (kairo-devrun, kairo-hello, the watch agent) write only in logs
-    # and state. So nothing running as you can change what Claude's elevated SSH sessions run or trust (builds,
-    # scripts, Git settings, FFmpeg). Set-KairoOwnership keeps Administrators the owner of what later steps add.
+    # read and run it all, but your own programs (kairo-devrun, kairo-hello, the watch agent, the builds) write
+    # only in logs, state and build. So nothing running as you can change what Claude's elevated SSH sessions run
+    # or trust (scripts, Git settings, FFmpeg, the deployed builds). Set-KairoOwnership keeps Administrators the
+    # owner of what later steps add.
     $existed = Test-Path -LiteralPath $KairoRoot
     if ($existed) {
         if (Test-KairoAcl $OwnerSid) {
@@ -1124,27 +1173,61 @@ function Initialize-KairoTree([string] $OwnerSid) {
             throw 'C:\kairo appeared while this setup was creating it, so it is not trusted. Delete it, then run the command again.'
         }
     }
-    Invoke-Icacls @($KairoRoot, '/inheritance:r',
-        '/grant:r', ('*{0}:(OI)(CI)F' -f $SidAdministrators), '/grant:r', ('*{0}:(OI)(CI)F' -f $SidSystem),
-        '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/C', '/Q')
-    $allowed = @($SidAdministrators, $SidSystem, $OwnerSid)
-    $acl = Get-Acl -LiteralPath $KairoRoot
-    foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-        $sid = $rule.IdentityReference.Value
-        if ($allowed -notcontains $sid) { Invoke-Icacls @($KairoRoot, '/remove', ('*{0}' -f $sid), '/C', '/Q') }
+    # The root's own entries. Changing them makes Windows push the inheritable ones down the whole tree, so
+    # they change only when they are wrong, which only an administrator can make them.
+    $rootRules = @{}
+    $rootRules[$SidAdministrators] = $RightsFull
+    $rootRules[$SidSystem] = $RightsFull
+    $rootRules[$OwnerSid] = $RightsRead
+    if ((-not $existed) -or (Get-FolderAclProblem -Path $KairoRoot -Explicit $rootRules -Protected)) {
+        Invoke-Icacls @($KairoRoot, '/inheritance:r',
+            '/grant:r', ('*{0}:(OI)(CI)F' -f $SidAdministrators), '/grant:r', ('*{0}:(OI)(CI)F' -f $SidSystem),
+            '/grant:r', ('*{0}:(OI)(CI)RX' -f $OwnerSid), '/C', '/Q')
+        $allowed = @($SidAdministrators, $SidSystem, $OwnerSid)
+        $acl = Get-Acl -LiteralPath $KairoRoot
+        foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+            $sid = $rule.IdentityReference.Value
+            if ($allowed -notcontains $sid) { Invoke-Icacls @($KairoRoot, '/remove', ('*{0}' -f $sid), '/C', '/Q') }
+        }
     }
-    foreach ($d in @($SrcDir, $BinDir, $JobsDir, $LogsDir, $ToolsDir, $StateDir)) {
+    foreach ($d in $AdminDirs) {
         if (-not (Test-Path -LiteralPath $d)) { $null = New-Item -ItemType Directory -Path $d }
     }
-    # Everything below the root: inherited permissions only (a repair; a new tree has nothing else anyway).
-    if ($existed) { Invoke-Icacls @(($KairoRoot + '\*'), '/reset', '/T', '/C', '/Q') }
-    Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
-    foreach ($d in @($LogsDir, $StateDir)) { Invoke-Icacls @($d, '/grant', ('*{0}:(OI)(CI)M' -f $OwnerSid), '/C', '/Q') }
+    # src, bin, jobs and tools: inherited permissions only (a repair; a new tree has nothing else anyway) and
+    # Administrators as the owner. Only administrators can change what is in them.
+    Invoke-Icacls @($KairoRoot, '/setowner', ('*{0}' -f $SidAdministrators), '/C', '/Q')
+    foreach ($d in $AdminDirs) {
+        if ($existed) { Invoke-Icacls @($d, '/reset', '/T', '/C', '/Q') }
+        Invoke-Icacls @($d, '/setowner', ('*{0}' -f $SidAdministrators), '/T', '/C', '/Q')
+    }
+    foreach ($d in $WritableDirs) { Initialize-WritableDir $d $OwnerSid }
     $problem = Get-KairoAclProblem $OwnerSid
     if ($problem) { throw ('C:\kairo permissions are not as expected after icacls: ' + $problem) }
     $Ctx.TreeOk = $true
-    if ($existed) { return 'C:\kairo repaired: Administrators and SYSTEM full control; you read everything and write logs and state' }
-    return 'created C:\kairo: Administrators and SYSTEM full control; you read everything and write logs and state'
+    if ($existed) { return 'C:\kairo repaired: Administrators and SYSTEM full control; you read everything and write logs, state and build' }
+    return 'created C:\kairo: Administrators and SYSTEM full control; you read everything and write logs, state and build'
+}
+
+function Initialize-WritableDir([string] $Path, [string] $OwnerSid) {
+    # logs, state and build: owned by Administrators, inheriting C:\kairo's entries, plus Modify for you. One
+    # that already has exactly that keeps what is in it. Any other is renamed aside (a rename moves a link
+    # itself, never what it points to) and made again: first owned by Administrators with an empty list, so
+    # only administrators can touch it; then, still empty, it inherits C:\kairo's entries and gets your Modify
+    # entry. So nothing elevated changes permissions inside a folder you could already write. (An empty list,
+    # not none: .NET can turn a missing list into one that lets everyone in.)
+    $writable = @{}
+    $writable[$OwnerSid] = $RightsModify
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Get-FolderAclProblem -Path $Path -Explicit $writable)) { return }
+        $aside = '{0}.old-{1}' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmss')
+        [System.IO.Directory]::Move($Path, $aside)
+        Write-Note ('{0} had other permissions, so it was renamed {1} and made again (delete the old one when you like).' -f $Path, $aside)
+    }
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetSecurityDescriptorSddlForm('O:BAD:')
+    $null = [System.IO.Directory]::CreateDirectory($Path, $security)
+    Invoke-Icacls @($Path, '/inheritance:e', '/C', '/Q')
+    Invoke-Icacls @($Path, '/grant', ('*{0}:(OI)(CI)M' -f $OwnerSid), '/C', '/Q')
 }
 
 function Get-KairoAclProblem([string] $OwnerSid) {
@@ -1162,7 +1245,10 @@ function Get-KairoAclProblem([string] $OwnerSid) {
     }
     $writable = @{}
     $writable[$OwnerSid] = $RightsModify
-    foreach ($d in @($LogsDir, $StateDir)) {
+    # A PC set up before builds moved to your account (M1) gets build with its first pc build
+    # (tools/mac/remote/build.ps1), with the rights of logs and state.
+    foreach ($d in @($LogsDir, $StateDir, $BuildDir)) {
+        if (($d -eq $BuildDir) -and -not (Test-Path -LiteralPath $d)) { continue }
         $problem = Get-FolderAclProblem -Path $d -Explicit $writable
         if ($problem) { return $problem }
     }
@@ -1172,7 +1258,7 @@ function Get-KairoAclProblem([string] $OwnerSid) {
 function Test-KairoAcl([string] $OwnerSid) { return ((Get-KairoAclProblem $OwnerSid) -eq '') }
 
 function Set-KairoOwnership([string] $OwnerSid) {
-    # Administrators own everything in C:\kairo but logs and state, and nothing in src, bin, jobs or tools has
+    # Administrators own everything in C:\kairo but logs, state and build, and nothing in src, bin, jobs or tools has
     # permissions of its own (docs/milestones/M0.md). Depending on a Windows policy, files an elevated window creates
     # belong to Administrators or to your account, and an owner can always rewrite a file's permissions; so this runs
     # after the steps that add files (Git settings, the code folder, FFmpeg, PresentMon): first the owner, then a reset
@@ -1266,6 +1352,8 @@ function Install-Llvm {
 
 function Install-Rust {
     $rustup = Get-RustupExe
+    # Nothing runs from your profile when the pinned toolchain is already there and the default.
+    if ($rustup -and (Get-RustState).Ready) { return ('already installed: Rust ' + $RustToolchain) }
     if (-not $rustup) {
         $res = Install-WingetPackage -Id 'Rustlang.Rustup' -Override $RustupOverride
         $rustup = Get-RustupExe
@@ -1278,8 +1366,8 @@ function Install-Rust {
     $r = Invoke-Native -FilePath $rustup -ArgumentList @('default', $RustToolchain)
     if ($r.ExitCode -ne 0) { throw ('rustup default failed: {0}' -f $r.Text) }
     Update-SessionPath
-    $rustc = Join-Path (Split-Path -Parent $rustup) 'rustc.exe'
-    return (Invoke-Native -FilePath $rustc -ArgumentList @('--version')).Text
+    if (-not (Get-RustState).Ready) { throw ('Rust {0} with clippy and rustfmt is not the default toolchain after rustup.' -f $RustToolchain) }
+    return ('Rust ' + $RustToolchain)
 }
 
 function Select-NodeVersion {
@@ -1313,16 +1401,21 @@ function Install-Node {
 
 function Install-Pnpm {
     $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+    # Nothing runs when corepack's pnpm shim is there and the pinned pnpm is in its cache.
+    if ((Test-Path -LiteralPath (Join-Path $nodeDir 'pnpm.cmd')) -and (@(Get-PnpmVersions) -contains $PnpmVersion)) {
+        return ('already installed: pnpm ' + $PnpmVersion)
+    }
     $corepack = Join-Path $nodeDir 'corepack.cmd'
     if (-not (Test-Path -LiteralPath $corepack)) { throw 'corepack is missing (it comes with Node.js 24; see the Node.js step).' }
     $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
-    $r = Invoke-Native -FilePath $corepack -ArgumentList @('enable', 'pnpm')
+    # Through cmd.exe /d, so your AutoRun command doesn't run along with it.
+    $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $r = Invoke-Native -FilePath $cmd -ArgumentList @('/d', '/c', $corepack, 'enable', 'pnpm')
     if ($r.ExitCode -ne 0) { throw ('corepack enable pnpm failed: {0}' -f $r.Text) }
-    $r = Invoke-Native -FilePath $corepack -ArgumentList @('install', '-g', ('pnpm@{0}' -f $PnpmVersion))
+    $r = Invoke-Native -FilePath $cmd -ArgumentList @('/d', '/c', $corepack, 'install', '-g', ('pnpm@{0}' -f $PnpmVersion))
     if ($r.ExitCode -ne 0) { throw ('corepack install -g pnpm@{0} failed: {1}' -f $PnpmVersion, $r.Text) }
-    $v = Get-PnpmVersion
-    if (-not $v) { throw 'pnpm does not answer after corepack enable.' }
-    return ('pnpm ' + $v)
+    if (@(Get-PnpmVersions) -notcontains $PnpmVersion) { throw ('pnpm {0} is not in corepack''s cache after corepack install.' -f $PnpmVersion) }
+    return ('pnpm ' + $PnpmVersion)
 }
 
 function Install-Ffmpeg {
@@ -1369,7 +1462,7 @@ function Install-PresentMon {
 function Initialize-CargoGuard {
     # cargo also reads C:\.cargo\config.toml when it builds in C:\kairo\src, and C:\ lets any signed-in user create
     # folders. An empty C:\.cargo that only administrators can change keeps anyone from planting a build setting
-    # (a rustc wrapper, a linker) that Claude's elevated builds would run. tools/mac/remote/build.ps1 also refuses
+    # (a rustc wrapper, a linker) that Claude's builds would run as you. tools/mac/remote/build.ps1 also refuses
     # to build while C:\.cargo or C:\kairo\.cargo holds a config file.
     $sddl = 'O:BAD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)'
     if (-not (Test-Path -LiteralPath $CargoGuardDir)) {
@@ -1756,7 +1849,9 @@ function Initialize-SourceRepo {
 function Initialize-SourceRepoCore([string] $git) {
     $created = $false
     if (-not (Test-Path -LiteralPath (Join-Path $SrcDir '.git'))) {
-        $r = Invoke-Native -FilePath $git -ArgumentList @('init', '--initial-branch=snapshot', $SrcDir)
+        # An empty --template=: no hooks from a template folder your settings could name (GIT_TEMPLATE_DIR,
+        # init.templateDir) end up in the repository every elevated sync runs git in.
+        $r = Invoke-Native -FilePath $git -ArgumentList @('init', '--template=', '--initial-branch=snapshot', $SrcDir)
         if ($r.ExitCode -ne 0) { throw ('git init failed: {0}' -f $r.Text) }
         $created = $true
     }
@@ -1994,8 +2089,8 @@ function Show-Plan($Facts, $State, $OwnerInfo, $KeyInfo) {
     }
     if (-not $State.PerfGroup) { Write-Note ('- Add {0} to the "Performance Log Users" group (lets PresentMon run without admin).' -f $OwnerInfo.Name) }
     Write-Note '- Create C:\kairo with an empty code folder C:\kairo\src. Administrators and SYSTEM have full control;'
-    Write-Note '  you can read everything, and your own programs can write only C:\kairo\logs and C:\kairo\state.'
-    Write-Note '  The last step makes Administrators the owner of C:\kairo and of everything in it but logs and state.'
+    Write-Note '  you can read everything, and your own programs can write only C:\kairo\logs, \state and \build.'
+    Write-Note '  The last step makes Administrators the owner of C:\kairo and of everything in it but those three.'
     Write-Note '- Create an empty C:\.cargo that only administrators can change, so no other program can plant a'
     Write-Note '  Cargo setting there that Claude''s builds would read.'
     Write-Note '- Set three system variables: LIBCLANG_PATH and FFMPEG_DIR for builds, and'
@@ -2150,7 +2245,7 @@ function Invoke-Bootstrap {
 
         # ---- 3. Steps. SSH comes early so Claude can repair anything else remotely. ----------------------------
         # C:\kairo comes first, and nothing (this log included) goes into it unless it was set up safely.
-        Invoke-Step 'Create C:\kairo (Administrators and SYSTEM full control; you read, and write logs and state)' { Initialize-KairoTree $ownerInfo.Sid }
+        Invoke-Step 'Create C:\kairo (Administrators and SYSTEM full control; you read, and write logs, state and build)' { Initialize-KairoTree $ownerInfo.Sid }
         if ($transcribing -and $Ctx.TreeOk) {
             $null = Stop-Transcript
             $transcribing = $false
@@ -2188,7 +2283,7 @@ function Invoke-Bootstrap {
         Invoke-Step 'Download FFmpeg 9.0.2 LGPL (BtbN, SHA-256 checked)' { Assert-KairoTree; Install-Ffmpeg }
         Invoke-Step 'Download PresentMon 2.6.0 (SHA-256 checked)' { Assert-KairoTree; Install-PresentMon }
         Invoke-Step 'Set LIBCLANG_PATH and FFMPEG_DIR' { Set-BuildEnvironment }
-        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs and state)' { Assert-KairoTree; Set-KairoOwnership $ownerInfo.Sid }
+        Invoke-Step 'Make Administrators the owner of C:\kairo (all but logs, state and build)' { Assert-KairoTree; Set-KairoOwnership $ownerInfo.Sid }
 
         # ---- 4. Report -----------------------------------------------------------------------------------------
         Write-Title 'Write C:\kairo\state\bootstrap-report.json'

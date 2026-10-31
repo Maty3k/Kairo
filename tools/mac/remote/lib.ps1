@@ -31,12 +31,14 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 if (-not (Get-Variable -Name Pc -Scope 0 -ErrorAction SilentlyContinue)) { $Pc = @{} }
 
 # --- The M0 layout (crates/kairo-core/src/layout.rs) ---------------------------------------
-# Only logs and state are writable by the owner's own programs (tools/pc/bootstrap.ps1); records
-# that elevated verbs trust, such as the last build, live in the admin-only folders.
+# Only logs, state and build are writable by the owner's own programs (tools/pc/bootstrap.ps1,
+# build.ps1); records that elevated verbs trust, such as the last build, live in the admin-only
+# folders, and nothing elevated runs what the owner's account could change.
 $Kairo = @{
     Root      = 'C:\kairo'
     Src       = 'C:\kairo\src'
-    Target    = 'C:\kairo\src\target'
+    Build     = 'C:\kairo\build'
+    Target    = 'C:\kairo\build\target'
     Bin       = 'C:\kairo\bin'
     Current   = 'C:\kairo\bin\current'
     LastBuild = 'C:\kairo\bin\last-build.json'
@@ -63,8 +65,8 @@ $UserHome = [Environment]::GetEnvironmentVariable('USERPROFILE')
 if (-not $UserHome) { $UserHome = [Environment]::GetFolderPath('UserProfile') }
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $SchtasksExe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-# rustup lives in your profile (tools/pc/bootstrap.ps1), so build.ps1 runs it from there; docs/milestones/M0.md
-# records the plan to move builds to your limited token.
+# rustup lives in your profile (tools/pc/bootstrap.ps1), which any program running as you can change, so
+# this session never runs it: build.ps1 hands cargo to a \Kairo\Run job, which runs it as you.
 $CargoExe = Join-Path $UserHome '.cargo\bin\cargo.exe'
 
 # --- Output --------------------------------------------------------------------------------
@@ -88,15 +90,69 @@ function Send-KV([string]$Key, [string]$Value) {
 }
 
 # --- Files ---------------------------------------------------------------------------------
+# The owner's own programs write C:\kairo\logs, state and build (the M1 contract, Builds), so any
+# name there may be a link (a junction, a symbolic link, an object-manager link behind a
+# junction) to a file only Administrators may read or write. So this elevated session never
+# creates, renames or deletes anything in those folders (kairo-devrun prunes the old logs, as the
+# owner), and reads a file there only through a handle it has checked (Open-OwnedFile). Nor does
+# git-service.ps1, the other elevated script: its log goes to the admin-only C:\kairo\jobs.
+$OwnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+function Test-OwnerPath([string]$Path) {
+    # True for a path in logs, state or build.
+    $full = [IO.Path]::GetFullPath($Path)
+    foreach ($dir in @($Kairo.Logs, $Kairo.State, $Kairo.Build)) {
+        if ($full.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Open-Shared([string]$Path) {
     # Other processes (kairo-devrun, cargo) may be writing the file right now.
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
 }
 
-function Read-SharedText([string]$Path) {
+function Open-OwnedFile([string]$Path) {
+    # A file in an owner-writable folder, opened once and checked through that same handle: a
+    # disk file that the owner's account owns, so nothing it couldn't read itself. A link to an
+    # admin-only file reaches a file someone else owns and is refused. .NET opens files with
+    # anonymous impersonation, so a link to a named pipe gets no token from this session either.
     $stream = Open-Shared $Path
     try {
+        if (-not $stream.CanSeek) { throw ('not a file: ' + $Path) }
+        $owner = [IO.FileSystemAclExtensions]::GetAccessControl($stream).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -cne $OwnerSid) { throw ('not a file the owner''s account made: ' + $Path) }
+    } catch {
+        $stream.Dispose()
+        throw
+    }
+    return $stream
+}
+
+function Open-ReadFile([string]$Path) {
+    # Owner-writable folders through Open-OwnedFile; admin-only ones as they are.
+    if (Test-OwnerPath $Path) { return (Open-OwnedFile $Path) }
+    return (Open-Shared $Path)
+}
+
+function Read-SharedText([string]$Path, [long]$MaxBytes = 0) {
+    # The whole file as text. With $MaxBytes, a larger file is refused, measured on the open handle:
+    # the size of the name can be a link's, and a file can grow while it is read.
+    $stream = Open-ReadFile $Path
+    try {
+        if ($MaxBytes -gt 0) {
+            $buffer = [byte[]]::new($MaxBytes + 1)
+            $count = 0
+            while ($count -lt $buffer.Length) {
+                $n = $stream.Read($buffer, $count, $buffer.Length - $count)
+                if ($n -le 0) { break }
+                $count += $n
+            }
+            if ($count -gt $MaxBytes) { throw ('larger than ' + $MaxBytes + ' bytes') }
+            $stream.Dispose()
+            $stream = [IO.MemoryStream]::new($buffer, 0, $count)
+        }
         $reader = [IO.StreamReader]::new($stream, $Utf8NoBom, $true)
         return $reader.ReadToEnd()
     } finally {
@@ -106,13 +162,15 @@ function Read-SharedText([string]$Path) {
 
 function Write-TextFileAtomic([string]$Path, [string]$Text) {
     # Write a sibling temp file, then rename it over the target: readers never see half a file.
+    # Only in the admin-only folders: never where the owner's programs write.
+    if (Test-OwnerPath $Path) { Fail ('internal: ' + $Path + ' is in a folder the owner''s account can write') }
     $temp = $Path + '.tmp-' + $PID
     [IO.File]::WriteAllText($temp, $Text, $Utf8NoBom)
     [IO.File]::Move($temp, $Path, $true)
 }
 
 function Get-TailText([string]$Path, [int]$Lines = 200, [long]$MaxBytes = 1048576) {
-    $stream = Open-Shared $Path
+    $stream = Open-ReadFile $Path
     try {
         $length = $stream.Length
         $start = [Math]::Max([long]0, $length - $MaxBytes)
@@ -147,10 +205,20 @@ function Say-Indented([string]$Text) {
     foreach ($line in ($Text -split "`r?`n")) { Say ('  ' + $line) }
 }
 
-function Show-Tail([string]$Path, [int]$Lines = 200) {
-    # Prints the end of a log file under a header; prints nothing if the file does not exist.
+function Show-Tail([string]$Path, [int]$Lines = 200, [DateTime]$Since = [DateTime]::MinValue) {
+    # Prints the end of a log file under a header; prints nothing if the file does not exist, or
+    # was last written before $Since (UTC), so an earlier run's output never passes for this one's.
     if (-not [IO.File]::Exists($Path)) { return }
-    $tail = Get-TailText -Path $Path -Lines $Lines
+    if ([IO.File]::GetLastWriteTimeUtc($Path) -lt $Since) {
+        Say ('--- ' + $Path + ': from an earlier run, not shown ---')
+        return
+    }
+    try {
+        $tail = Get-TailText -Path $Path -Lines $Lines
+    } catch {
+        Say ('--- ' + $Path + ': not read (' + $_.Exception.Message + ') ---')
+        return
+    }
     $note = ''
     if ($tail.Cut) { $note = ' (last ' + $tail.Shown + ' lines of ' + $tail.Bytes + ' bytes)' }
     Say ('--- ' + $Path + $note + ' ---')
@@ -325,13 +393,15 @@ function Invoke-Native([string]$Exe, [string[]]$Arguments = @()) {
 }
 
 # Git for Windows' machine install (Inno Setup DefaultDirName={commonpf}\Git; winget Git.Git, scope
-# machine), as tools/pc/bootstrap.ps1 installs it; the machine PATH only as a fallback.
+# machine), as tools/pc/bootstrap.ps1 installs it, and nothing else: the machine PATH can hold
+# folders your account writes (nvm-windows puts one under your AppData).
 $GitExe = Join-Path $env:ProgramFiles 'Git\cmd\git.exe'
-if (-not [IO.File]::Exists($GitExe)) { $GitExe = Find-Exe 'git.exe' }
+if (-not [IO.File]::Exists($GitExe)) { $GitExe = $null }
 
 function Invoke-Git([string[]]$GitArgs) {
     if (-not $GitExe) {
-        return [pscustomobject]@{ Code = 9009; Lines = @('git is not installed on the PC'); Text = 'git is not installed on the PC' }
+        $missing = 'Git for Windows is missing from Program Files on the PC'
+        return [pscustomobject]@{ Code = 9009; Lines = @($missing); Text = $missing }
     }
     return (Invoke-Native -Exe $GitExe -Arguments $GitArgs)
 }
@@ -432,6 +502,157 @@ function Remove-OldBuilds {
             Say ('  kept old build ' + $dir.Name + ' for now (in use?): ' + $_.Exception.Message)
         }
     }
+}
+
+# --- Jobs (crates/kairo-core/src/job.rs) ----------------------------------------------------
+function Test-KairoJob([string]$Text) {
+    # The same rules as crates/kairo-core/src/job.rs, checked again here so that a bad file
+    # never reaches C:\kairo\jobs\next.json.
+    try { $job = Read-JsonText $Text } catch { Fail ('the job is not valid JSON: ' + $_.Exception.Message) 2 }
+    if (-not ($job -is [Collections.IDictionary])) { Fail 'the job must be a JSON object' 2 }
+    $known = @('id', 'cmd', 'cwd', 'max_seconds', 'abort_on_input', 'window', 'priority')
+    foreach ($key in @($job.Keys)) {
+        if ($known -cnotcontains $key) { Fail ('the job has an unknown field "' + $key + '" (kairo-devrun rejects unknown fields)') 2 }
+    }
+    foreach ($key in @('id', 'cmd', 'max_seconds')) {
+        if (-not $job.Contains($key)) { Fail ('the job has no "' + $key + '"') 2 }
+    }
+    $id = $job['id']
+    if (-not ($id -is [string]) -or ($id -cnotmatch $JobIdRegex)) { Fail 'the job "id" must match ^[A-Za-z0-9_-]{1,64}$' 2 }
+    $cmd = $job['cmd']
+    if (-not ($cmd -is [object[]]) -or $cmd.Count -eq 0) { Fail 'the job "cmd" must be a non-empty list of strings' 2 }
+    foreach ($part in $cmd) {
+        if (-not ($part -is [string]) -or ($part -match '[\x00-\x1f]')) { Fail 'every "cmd" entry must be a string without control characters' 2 }
+    }
+    if ([string]$cmd[0] -eq '') { Fail 'the job "cmd" starts with an empty program' 2 }
+    $cwd = $null
+    if ($job.Contains('cwd') -and ($null -ne $job['cwd'])) {
+        $cwd = $job['cwd']
+        if (-not ($cwd -is [string]) -or ($cwd -eq '') -or ($cwd -match '[\x00-\x1f]')) { Fail 'the job "cwd" must be null or a folder' 2 }
+    }
+    $max = $job['max_seconds']
+    if (-not ($max -is [long]) -or ($max -lt 1) -or ($max -gt 86400)) { Fail 'the job "max_seconds" must be a whole number from 1 to 86400' 2 }
+    $abort = $true
+    if ($job.Contains('abort_on_input')) {
+        $abort = $job['abort_on_input']
+        if (-not ($abort -is [bool])) { Fail 'the job "abort_on_input" must be true or false' 2 }
+    }
+    $window = 'hidden'
+    if ($job.Contains('window')) {
+        $window = $job['window']
+        if (-not ($window -is [string]) -or (@('visible', 'hidden') -cnotcontains $window)) { Fail 'the job "window" must be "visible" or "hidden"' 2 }
+    }
+    $priority = 'normal'
+    if ($job.Contains('priority')) {
+        $priority = $job['priority']
+        if (-not ($priority -is [string]) -or (@('normal', 'below_normal') -cnotcontains $priority)) { Fail 'the job "priority" must be "normal" or "below_normal"' 2 }
+    }
+    return [pscustomobject]@{
+        Id           = $id
+        Program      = [string]$cmd[0]
+        MaxSeconds   = [int]$max
+        AbortOnInput = $abort
+        Window       = $window
+        Priority     = $priority
+        Cwd          = $cwd
+    }
+}
+
+function Start-KairoJob([string]$JobText) {
+    # Checks the job, writes C:\kairo\jobs\next.json and starts \Kairo\Run, which runs it in the owner's
+    # session with the owner's limited token. Returns the job and the files its result and output go to.
+    $job = Test-KairoJob $JobText
+    $devrun = Join-Path $Kairo.Current 'kairo-devrun.exe'
+    if (-not [IO.File]::Exists($devrun)) {
+        Fail ('there is no ' + $devrun + ' yet: build and deploy first (tools/mac/pc build, then tools/mac/pc deploy)')
+    }
+    $task = Get-KairoTask 'Run'
+    if (-not $task.Exists) { Fail 'the scheduled task \Kairo\Run is not registered (the bootstrap creates it)' }
+    if ($task.State -eq 'disabled') { Fail 'the scheduled task \Kairo\Run is disabled' }
+    if ($task.State -eq 'running') {
+        Fail 'another \Kairo\Run job is still running, and \Kairo\Run ignores new starts until it ends; wait for it (tools/mac/pc logs) and try again'
+    }
+    if ([IO.Path]::IsPathRooted($job.Program) -and -not [IO.File]::Exists($job.Program)) {
+        Say ('warning: ' + $job.Program + ' does not exist on the PC')
+    }
+    if ($job.AbortOnInput -and $Pc['Force'] -and ((Get-KairoWatch).State -eq 'busy')) {
+        Say 'note: abort_on_input is true and the owner is active, so kairo-devrun will probably stop the job at the next input'
+    }
+    $run = [pscustomobject]@{
+        Job        = $job
+        Started    = [DateTime]::UtcNow
+        ResultFile = Join-Path $Kairo.Logs ($job.Id + '.result.json')
+        OutFile    = Join-Path $Kairo.Logs ($job.Id + '.out.log')
+        ErrFile    = Join-Path $Kairo.Logs ($job.Id + '.err.log')
+        OwnLog     = Join-Path $Kairo.Logs ($job.Id + '.log')
+    }
+    # An earlier run's files for this id stay: kairo-devrun replaces them as the owner, and
+    # Wait-KairoJob takes only a result that started after this one.
+    [void](New-Item -ItemType Directory -Force -Path $Kairo.Jobs)
+    Write-TextFileAtomic $Kairo.NextJob $JobText
+    $run.Started = [DateTime]::UtcNow
+    # TODO(verify): schtasks /run takes the folder form \Kairo\Run (the M0 contract; documented for /create).
+    $trigger = Invoke-Native -Exe $SchtasksExe -Arguments @('/run', '/tn', '\Kairo\Run')
+    if ($trigger.Code -ne 0) { Fail ('schtasks /run /tn \Kairo\Run failed: ' + $trigger.Text) }
+    return $run
+}
+
+function Stop-KairoRun {
+    # Ends the running \Kairo\Run instance: kairo-devrun dies and its kill-on-close job object takes the
+    # job's whole process tree with it.
+    $null = Invoke-Native -Exe $SchtasksExe -Arguments @('/end', '/tn', '\Kairo\Run')
+}
+
+function Test-ResultOf($Run, $Result) {
+    # Whether a result file is this run's: it started no earlier than the job was handed over,
+    # not an earlier run's under the same id. Both times come from this PC's clock, and
+    # kairo-devrun stamps after the hand-over; 2 ms allow for started_utc's whole milliseconds.
+    $text = [string](Get-Field $Result 'started_utc')
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+    $started = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$started)) { return $false }
+    return ($started -ge $Run.Started.AddMilliseconds(-2))
+}
+
+function Wait-KairoJob($Run, [int]$WaitSeconds, [scriptblock]$StopWhen = $null) {
+    # Waits for the job's result file and returns it; $null if the job is still running at the deadline,
+    # or \Kairo\Run ended without writing one. $StopWhen runs about every 2 s; a non-empty string it returns
+    # stops the job (Stop-KairoRun), and the reason comes back as StoppedFor.
+    $deadline = $Run.Started.AddSeconds($WaitSeconds)
+    $sawRunning = $false
+    $idleSince = $null
+    $nextNote = 60
+    $tick = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 1000
+        if ([IO.File]::Exists($Run.ResultFile)) {
+            $result = Read-JsonFile $Run.ResultFile
+            if (($null -ne $result) -and (Test-ResultOf $Run $result)) { return [pscustomobject]@{ Result = $result; StoppedFor = '' } }
+        }
+        $tick += 1
+        if ($StopWhen -and ($tick % 2 -eq 0)) {
+            $why = [string](& $StopWhen)
+            if ($why) {
+                Stop-KairoRun
+                return [pscustomobject]@{ Result = $null; StoppedFor = $why }
+            }
+        }
+        if ((Get-KairoTask 'Run').State -eq 'running') {
+            $sawRunning = $true
+            $idleSince = $null
+        } else {
+            if ($null -eq $idleSince) { $idleSince = [DateTime]::UtcNow }
+            $grace = 5
+            if (-not $sawRunning) { $grace = 20 }   # the task may take a moment to start
+            if (([DateTime]::UtcNow - $idleSince).TotalSeconds -gt $grace) { break }
+        }
+        $elapsed = ([DateTime]::UtcNow - $Run.Started).TotalSeconds
+        if ($elapsed -ge $nextNote) {
+            Say ('... job ' + $Run.Job.Id + ' is still running (' + [int]$elapsed + ' s)')
+            $nextNote += 60
+        }
+    }
+    return [pscustomobject]@{ Result = $null; StoppedFor = '' }
 }
 
 function Test-RunTaskBusy {

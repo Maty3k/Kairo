@@ -11,8 +11,8 @@
 #
 # Exit code (when run as a file): 0 = green, 1 = problems (listed in "problems"), 2 = the doctor itself failed.
 # Everything is read-only except -TestPresentMon: it registers a temporary task \Kairo\DoctorPresentMon (S4U logon,
-# limited token, no window on your desktop), runs PresentMon for 2 seconds, deletes the task and the CSV again, and
-# skips itself while C:\kairo\state\watch.json says you are busy.
+# limited token, no window on your desktop), runs PresentMon for 2 seconds (the task itself deletes the CSV, as you),
+# deletes the task again, and skips itself while C:\kairo\state\watch.json says you are busy.
 #
 # Names and checks mirror tools/pc/bootstrap.ps1; keep the two in step. Windows PowerShell 5.1 syntax, ASCII only.
 
@@ -34,6 +34,7 @@ $JobsDir       = 'C:\kairo\jobs'
 $LogsDir       = 'C:\kairo\logs'
 $ToolsDir      = 'C:\kairo\tools'
 $StateDir      = 'C:\kairo\state'
+$BuildDir      = 'C:\kairo\build'
 $CurrentBin    = 'C:\kairo\bin\current'
 $DevrunExe     = 'C:\kairo\bin\current\kairo-devrun.exe'
 $JobFile       = 'C:\kairo\jobs\next.json'
@@ -170,11 +171,22 @@ function Format-Utc($When) {
 }
 
 function Get-GitExe {
+    # Git for Windows' machine install, and nothing else: the PATH can hold folders your account writes.
     $machine = Join-Path $env:ProgramFiles 'Git\cmd\git.exe'
     if (Test-Path -LiteralPath $machine) { return $machine }
-    $cmd = Get-Command -Name 'git.exe' -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
     return $null
+}
+
+function Get-UserHome([string] $Name, [string] $Default) {
+    # A tool's folder setting from your user variables, used only when it lies in your profile, where those
+    # tools keep their files; otherwise $Default.
+    $value = [Environment]::GetEnvironmentVariable($Name, 'User')
+    if (-not $value) { $value = [Environment]::GetEnvironmentVariable($Name, 'Machine') }
+    if (-not $value) { return $Default }
+    try { $full = [System.IO.Path]::GetFullPath($value).TrimEnd('\') + '\' } catch { return $Default }
+    $profileDir = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\') + '\'
+    if ($full.StartsWith($profileDir, [System.StringComparison]::OrdinalIgnoreCase)) { return $value }
+    return $Default
 }
 
 function Get-VsInstancePath([string[]] $VswhereArgs, [string] $Property = 'installationPath') {
@@ -271,7 +283,10 @@ function Get-KairoAclProblem([string] $OwnerSid) {
     }
     $writable = @{}
     $writable[$OwnerSid] = $RightsModify
-    foreach ($d in @($LogsDir, $StateDir)) {
+    # A PC set up before builds moved to your account (M1) gets build with its first pc build
+    # (tools/mac/remote/build.ps1), with the rights of logs and state.
+    foreach ($d in @($LogsDir, $StateDir, $BuildDir)) {
+        if (($d -eq $BuildDir) -and -not (Test-Path -LiteralPath $d)) { continue }
         $problem = Get-FolderAclProblem -Path $d -Explicit $writable
         if ($problem) { return $problem }
     }
@@ -334,13 +349,37 @@ function Get-HostKeyFingerprint {
     }
 }
 
+function Read-OwnedText([string] $Path) {
+    # A file your own programs write (in logs or state), opened once and checked through that same handle: a
+    # disk file your account owns, so an elevated doctor reads nothing you couldn't read yourself, whatever
+    # link may sit at that name. $null when it isn't one.
+    try {
+        $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
+    } catch {
+        return $null
+    }
+    try {
+        if (-not $stream.CanSeek) { return $null }
+        # .NET Framework (Windows PowerShell 5.1) has the method; .NET (PowerShell 7) the extension.
+        if ($stream.PSObject.Methods['GetAccessControl']) { $security = $stream.GetAccessControl() } else { $security = [System.IO.FileSystemAclExtensions]::GetAccessControl($stream) }
+        if ($security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $MeSid) { return $null }
+        return (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+    } catch {
+        return $null
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Read-WatchState {
     # C:\kairo\state\watch.json, written every second by the watch agent (M0 contract).
     $path = Join-Path $StateDir 'watch.json'
     $res = [ordered]@{ present = $false; fresh = $false; age_s = $null; busy = $null; last_input_ms_ago = $null; foreground_fullscreen = $null }
     if (-not (Test-Path -LiteralPath $path)) { return $res }
     $res.present = $true
-    $j = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $text = Read-OwnedText $path
+    if ($null -eq $text) { return $res }
+    $j = $text | ConvertFrom-Json
     $ts = $j.ts_utc
     if ($ts -isnot [datetime]) {
         # PowerShell 7 turns ISO dates into [datetime] by itself; 5.1 leaves a string.
@@ -414,9 +453,12 @@ function Test-PresentMonUnelevated {
     $name = 'DoctorPresentMon'
     $csv = Join-Path $LogsDir 'doctor-presentmon.csv'
     $log = Join-Path $LogsDir 'doctor-presentmon.log'
-    foreach ($f in @($csv, $log)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
-    # Paths have no spaces, so cmd.exe needs no quotes here.
-    $cmdArgs = '/d /c {0} --session_name KairoDoctor --stop_existing_session --timed 2 --terminate_after_timed --no_console_stats --output_file {1} > {2} 2>&1' -f $exe, $csv, $log
+    # The elevated doctor never writes or deletes in logs, which your programs write: the task, running as you,
+    # deletes any CSV an earlier test left, overwrites the log, notes PresentMon's exit code ("pm-exit=N", with
+    # delayed expansion) and "csv-ok" if this run wrote a non-empty CSV, and deletes the CSV (it lists every
+    # program that drew frames in those 2 seconds; nothing needs it). Paths have no spaces, so no quotes.
+    $cmdArgs = ('/d /v:on /c del /q {1} 2>nul & {0} --session_name KairoDoctor --stop_existing_session --timed 2 --terminate_after_timed --no_console_stats --output_file {1} > {2} 2>&1' +
+        ' & echo pm-exit=!errorlevel!>> {2} & (if exist {1} for %A in ({1}) do @if %~zA GTR 0 echo csv-ok>> {2}) & del /q {1} 2>nul') -f $exe, $csv, $log
     $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $cmdArgs -WorkingDirectory $LogsDir
     $principal = New-ScheduledTaskPrincipal -UserId $Me.Name -LogonType S4U -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -433,15 +475,18 @@ function Test-PresentMonUnelevated {
             $ran = ($info.LastRunTime -ge $started.AddSeconds(-2))
             $finished = $ran -and ([string] $task.State -ne 'Running') -and ($info.LastTaskResult -ne $TaskRunning) -and ($info.LastTaskResult -ne $TaskNeverRan)
         } while (-not $finished -and (Get-Date) -lt $deadline)
-        $res.exit_code = $info.LastTaskResult
         $text = ''
-        if (Test-Path -LiteralPath $log) { $text = [string] (Get-Content -LiteralPath $log -Raw) }
-        $res.output = (@($text -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 6) -join ' | '
-        $csvOk = (Test-Path -LiteralPath $csv) -and ((Get-Item -LiteralPath $csv).Length -gt 0)
+        if ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).LastWriteTime -ge $started.AddSeconds(-2))) { $text = [string] (Read-OwnedText $log) }
+        $lines = @($text -split "`r?`n" | Where-Object { $_.Trim() })
+        $csvOk = $lines -contains 'csv-ok'
+        # PresentMon's own exit code: the task's result is the last command's.
+        $exitLine = @($lines | Where-Object { $_ -match '^pm-exit=(-?\d+)\s*$' }) | Select-Object -Last 1
+        if ($exitLine -and ($exitLine -match '^pm-exit=(-?\d+)')) { $res.exit_code = [int] $Matches[1] }
+        $res.output = (@($lines | Where-Object { ($_ -ne 'csv-ok') -and ($_ -notmatch '^pm-exit=') }) | Select-Object -First 6) -join ' | '
         if (-not $finished) {
             $res.status = 'failed'
             $res.detail = 'The test task did not finish within 45 seconds.'
-        } elseif ($info.LastTaskResult -eq 0 -and $csvOk) {
+        } elseif ($res.exit_code -eq 0 -and $csvOk) {
             $res.status = 'passed'
             $res.detail = 'PresentMon recorded 2 seconds with a limited token.'
         } elseif ($text -match '(?i)access denied|Performance Log Users') {
@@ -449,15 +494,13 @@ function Test-PresentMonUnelevated {
             $res.detail = 'Access denied: the account is not (yet) in Performance Log Users.'
         } else {
             $res.status = 'failed'
-            $res.detail = ('PresentMon exit code {0}.' -f $info.LastTaskResult)
+            $res.detail = ('PresentMon exit code {0}.' -f $res.exit_code)
         }
     } catch {
         $res.status = 'error'
         $res.detail = ('Could not run the test task: {0}' -f $_.Exception.Message)
     } finally {
         try { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false -ErrorAction Stop } catch { }
-        # The CSV lists every program that drew frames in those 2 seconds; nothing needs it, so it goes.
-        if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv -Force -ErrorAction SilentlyContinue }
     }
     return $res
 }
@@ -494,15 +537,24 @@ function Invoke-Doctor {
         $t.git = $null
         if ($git) { $t.git = Get-FirstLine (Invoke-Native -FilePath $git -ArgumentList @('--version')) '^git version' } else { Add-Problem 'Git is missing' }
 
+        # rustup, cargo and rustc live in your profile, which any program running as you can change, so an
+        # elevated session never runs them (builds run as you: tools/mac/remote/build.ps1). Their files say
+        # which toolchain is there.
         $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
-        $rustup = Join-Path $cargoBin 'rustup.exe'
+        $rustupHome = Get-UserHome 'RUSTUP_HOME' (Join-Path $env:USERPROFILE '.rustup')
         $t.rustup = $null; $t.rust_active = $null; $t.rustc = $null; $t.cargo = $null
-        if (Test-Path -LiteralPath $rustup) {
-            $t.rustup = Get-FirstLine (Invoke-Native -FilePath $rustup -ArgumentList @('--version')) '^rustup '
-            $t.rust_active = Get-FirstLine (Invoke-Native -FilePath $rustup -ArgumentList @('show', 'active-toolchain'))
-            $t.rustc = Get-FirstLine (Invoke-Native -FilePath (Join-Path $cargoBin 'rustc.exe') -ArgumentList @('--version')) '^rustc '
-            $t.cargo = Get-FirstLine (Invoke-Native -FilePath (Join-Path $cargoBin 'cargo.exe') -ArgumentList @('--version')) '^cargo '
-            if (-not ([string] $t.rustc).StartsWith('rustc ' + $RustToolchain)) { Add-Problem ('rustc is "{0}", expected {1}' -f $t.rustc, $RustToolchain) }
+        if (Test-Path -LiteralPath (Join-Path $cargoBin 'rustup.exe')) {
+            $t.rustup = 'installed'
+            $settings = Join-Path $rustupHome 'settings.toml'
+            # Through a checked handle (it is your file), and only a toolchain's name comes out.
+            $text = Read-OwnedText $settings
+            if ($text -and ($text -match '(?m)^\s*default_toolchain\s*=\s*"([A-Za-z0-9._-]{1,64})"')) {
+                $t.rust_active = $Matches[1]
+            }
+            $toolchain = Join-Path $rustupHome ('toolchains\{0}-x86_64-pc-windows-msvc\bin' -f $RustToolchain)
+            if (Test-Path -LiteralPath (Join-Path $toolchain 'rustc.exe')) { $t.rustc = 'rustc ' + $RustToolchain }
+            if (Test-Path -LiteralPath (Join-Path $toolchain 'cargo.exe')) { $t.cargo = 'cargo ' + $RustToolchain }
+            if (-not $t.rustc) { Add-Problem ('the Rust {0} toolchain (x86_64-pc-windows-msvc) is not installed' -f $RustToolchain) }
         } else {
             Add-Problem 'rustup is missing'
         }
@@ -540,18 +592,41 @@ function Invoke-Doctor {
 
         $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
         $node = Join-Path $nodeDir 'node.exe'
-        $t.node = $null; $t.corepack = $null; $t.pnpm = $null
+        $t.node = $null; $t.corepack = $null; $t.pnpm = $null; $t.node_is_link = $false
         if (Test-Path -LiteralPath $node) {
-            $t.node = Get-FirstLine (Invoke-Native -FilePath $node -ArgumentList @('--version')) '^v\d'
-            if (-not ([string] $t.node).StartsWith(('v{0}.' -f $NodeMajor))) { Add-Problem ('Node.js is {0}, expected {1}.x' -f $t.node, $NodeMajor) }
-            $corepack = Join-Path $nodeDir 'corepack.cmd'
-            if (Test-Path -LiteralPath $corepack) { $t.corepack = Get-FirstLine (Invoke-Native -FilePath $corepack -ArgumentList @('--version')) '\d+\.\d+' }
-            $pnpm = Join-Path $nodeDir 'pnpm.cmd'
-            if (Test-Path -LiteralPath $pnpm) {
-                $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
-                $t.pnpm = Get-FirstLine (Invoke-Native -FilePath $pnpm -ArgumentList @('--version')) '^\d+\.\d+\.\d+'
+            # Never run: with nvm, Program Files\nodejs is a link into your profile, which any program
+            # running as you can change. node.exe's version resource has the version.
+            $nodeItem = Get-Item -LiteralPath $nodeDir -Force
+            if (([int] $nodeItem.Attributes -band [int] [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $t.node_is_link = $true
+                Add-Concern ('{0} is a link (nvm): its programs live where your account can change them, so elevated sessions never run them' -f $nodeDir)
             }
-            if (-not $t.pnpm) { Add-Problem 'pnpm (through corepack) does not answer' }
+            $productVersion = (Get-Item -LiteralPath $node).VersionInfo.ProductVersion
+            if ($productVersion) { $t.node = 'v' + $productVersion.TrimStart('v') }
+            if (-not ([string] $t.node).StartsWith(('v{0}.' -f $NodeMajor))) { Add-Problem ('Node.js is {0}, expected {1}.x' -f $t.node, $NodeMajor) }
+            # Not corepack.cmd: Windows runs a .cmd through cmd.exe without /d, which would run the AutoRun
+            # command in your registry elevated. Corepack's package.json has the version.
+            # Behind an nvm link it is your file: read only through a checked handle.
+            $corepackJson = Join-Path $nodeDir 'node_modules\corepack\package.json'
+            if (Test-Path -LiteralPath $corepackJson) {
+                try {
+                    if ($t.node_is_link) { $json = Read-OwnedText $corepackJson } else { $json = Get-Content -LiteralPath $corepackJson -Raw }
+                    $version = [string] ($json | ConvertFrom-Json).version
+                    if ($version -match '^\d+\.\d+\.\d+$') { $t.corepack = $version }
+                } catch { $t.corepack = $null }
+            }
+            # pnpm.cmd would run the pnpm corepack keeps in your profile: read the versions in its cache
+            # instead (COREPACK_HOME, by default %LOCALAPPDATA%\node\corepack).
+            # This session's environment is the machine's (tools/mac/remote/stub.ps1): read your own setting.
+            $corepackHome = Get-UserHome 'COREPACK_HOME' (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'node\corepack')
+            $versions = @()
+            foreach ($cache in @((Join-Path $corepackHome 'v1\pnpm'), (Join-Path $corepackHome 'pnpm'))) {
+                if (Test-Path -LiteralPath $cache) {
+                    $versions += @(Get-ChildItem -LiteralPath $cache -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | ForEach-Object { [version] $_.Name })
+                }
+            }
+            if ($versions.Count -gt 0) { $t.pnpm = [string] ($versions | Sort-Object -Descending | Select-Object -First 1) }
+            if (-not $t.pnpm) { Add-Problem 'pnpm is not in corepack''s cache (run pnpm once in your own session)' }
         } else {
             Add-Problem ('Node.js {0} is missing' -f $NodeMajor)
         }
@@ -851,7 +926,7 @@ function Invoke-Doctor {
         }
         $res.acl_problem = Get-KairoAclProblem $MeSid
         $res.acl_ok = ($res.acl_problem -eq '')
-        if (-not $res.acl_ok) { Add-Problem ('C:\kairo permissions differ from the M0 layout (Administrators and SYSTEM full control and owner; you read, and write only logs and state): {0}. Run the bootstrap again' -f $res.acl_problem) }
+        if (-not $res.acl_ok) { Add-Problem ('C:\kairo permissions differ from the M0 layout (Administrators and SYSTEM full control and owner; you read, and write only logs, state and build): {0}. Run the bootstrap again' -f $res.acl_problem) }
 
         # The admin-only Git settings of the SSH sessions, and files elevated sessions run or trust.
         $res.git_config = [ordered]@{ path = $GitConfigFile; present = (Test-Path -LiteralPath $GitConfigFile); safe_directory = $false; admin_only = $false }
@@ -879,7 +954,7 @@ function Invoke-Doctor {
             }
         }
         if (-not $guard.ok) { Add-Problem 'C:\.cargo is missing or others can change it (the bootstrap makes it admin-only)' }
-        if ($guard.configs.Count -gt 0) { Add-Problem ('Cargo config files that elevated builds would read: ' + ($guard.configs -join ', ')) }
+        if ($guard.configs.Count -gt 0) { Add-Problem ('Cargo config files that builds would read: ' + ($guard.configs -join ', ')) }
         $res.cargo_guard = $guard
 
         $current = [ordered]@{ exists = (Test-Path -LiteralPath $CurrentBin); junction = $false; target = $null }

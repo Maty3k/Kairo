@@ -175,6 +175,26 @@ jobs:
           }
           if ($bad -gt 0) { exit 1 }
 
+      # PowerShell 7 lists the user's Documents\PowerShell\Modules first and loads a module from it on
+      # a command's first use, so the elevated scripts may run no command before they set PSModulePath.
+      - name: The elevated scripts run no command before PSModulePath is admin-only
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in 'tools/mac/remote/stub.ps1', 'tools/mac/remote/git-service.ps1') {
+            $t = $null; $e = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$t, [ref]$e)
+            $set = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$env:PSModulePath' }, $true)
+            if (-not $set) { Write-Host "::error file=$f::no PSModulePath assignment"; $bad++; continue }
+            $commands = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+            foreach ($c in $commands) {
+              if ($c.Extent.StartOffset -lt $set.Extent.EndOffset) {
+                Write-Host "::error file=$f,line=$($c.Extent.StartLineNumber)::a command runs before PSModulePath is set: $($c.Extent.Text)"; $bad++
+              }
+            }
+          }
+          if ($bad -gt 0) { exit 1 }
+
       # Read-only; this also compiles the bootstrap's Add-Type C# block. Both scripts run from
       # RUNNER_TEMP: in the checkout, rust-toolchain.toml would make rustup download the toolchain.
       - name: bootstrap.ps1 -ReportOnly prints valid JSON
