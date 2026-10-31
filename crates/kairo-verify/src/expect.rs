@@ -137,6 +137,11 @@ impl Expect {
         if !(1..=1000).contains(&expect.fps) {
             return bad(format!("fps {} is not 1–1000", expect.fps));
         }
+        if let Some(hz) = expect.source_hz
+            && !(1..=1000).contains(&hz)
+        {
+            return bad(format!("source_hz {hz} is not 1–1000"));
+        }
         if expect.seconds == 0 || expect.seconds > 24 * 3600 {
             return bad(format!("seconds {} is not 1–86400", expect.seconds));
         }
@@ -211,6 +216,8 @@ mod tests {
         for bad in [
             r#"{"kairo_expect":1,"fps":0,"seconds":30,"tracks":[]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":0,"tracks":[]}"#,
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"source_hz":0,"tracks":[]}"#,
+            r#"{"kairo_expect":1,"fps":60,"seconds":30,"source_hz":100000,"tracks":[]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"size":[0,1080],"tracks":[]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[{"title":"Mic","channels":3,"default":false}]}"#,
             r#"{"kairo_expect":1,"fps":60,"seconds":30,"tracks":[{"title":"Mic","channels":1,"default":false,"tones":{"beep":"any"}}]}"#,

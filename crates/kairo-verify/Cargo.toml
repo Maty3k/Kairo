@@ -1,6 +1,6 @@
 [package]
 name = "kairo-verify"
-description = "Checks Kairo's clips: container structure now, decoded content next (M1, research 16)."
+description = "Checks Kairo's clips: container structure, and decoded content as research 16's PRs add it (M1)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["dev-tools"]
+# The CLI decoder, which spawns an FFmpeg given with --ffmpeg (research 16 README section 3.3).
+# Never in a shipped build.
+dev-tools = []
+
 [dependencies]
+kairo-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

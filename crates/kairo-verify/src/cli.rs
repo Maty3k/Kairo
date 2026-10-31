@@ -21,6 +21,20 @@ use crate::profile::{Plan, Profile};
 use crate::{Clip, boxes};
 
 /// The usage text.
+#[cfg(feature = "dev-tools")]
+pub const USAGE: &str =
+    "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
+                    [--decoder none|cli] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
+       kairo-verify boxes <clip.mp4>
+       kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
+                           |set-default TRACK|perturb-stts S D  IN OUT
+       kairo-verify --version | --help
+profiles: test capture smoke engine share discord whatsapp reels original
+The cli decoder (--ffmpeg PATH) decodes for the barcode, cadence and flash checks; the other
+content checks and the linked decoder come with research 16's next PRs.";
+
+/// The usage text.
+#[cfg(not(feature = "dev-tools"))]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
                     [--decoder none] [--json FILE|-] [--summary FILE|-]
@@ -29,7 +43,8 @@ pub const USAGE: &str =
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
-This build checks structure only; the content checks and the linked and cli decoders come later.";
+This build checks structure only: the content checks need a decoder, and the linked one comes
+with research 16's PR 6.";
 
 /// Where a report goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +61,7 @@ enum Command {
         profile: Profile,
         gate_m3: bool,
         expect: Option<PathBuf>,
+        ffmpeg: Option<PathBuf>,
         json: Option<Output>,
         summary: Option<Output>,
     },
@@ -82,15 +98,14 @@ fn safe_word(word: &str) -> bool {
     word.len() <= 32 && !word.contains(['/', '\\', ':']) && !word.chars().any(char::is_control)
 }
 
-/// Options README §6.1 documents for the content checks, which come with research 16's PRs 4
-/// to 6.
-const LATER_OPTIONS: [&str; 6] = [
+/// Options README §6.1 documents for the audio and A/V checks, which come with research 16's
+/// PR 5.
+const LATER_OPTIONS: [&str; 5] = [
     "--testbed-log",
     "--voice-log",
     "--cue",
     "--av-tight",
     "--voice-included",
-    "--ffmpeg",
 ];
 
 /// Parses the arguments, without the program name.
@@ -115,6 +130,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut profile = None;
     let mut gate_m3 = false;
     let mut expect = None;
+    let mut ffmpeg = None;
+    // An explicit --decoder wins over --ffmpeg, in either order.
+    let mut chosen: Option<bool> = None;
     let mut json = None;
     let mut summary = None;
     let mut words = rest.iter();
@@ -141,17 +159,24 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             },
             "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
             "--decoder" => match value("--decoder")?.to_str() {
-                Some("none") => {}
-                Some("linked" | "cli") => {
-                    return Err("this build has no decoder: only --decoder none".to_owned());
+                Some("none") => chosen = Some(false),
+                Some("cli") if cfg!(feature = "dev-tools") => chosen = Some(true),
+                Some("cli") => {
+                    return Err("this build has no cli decoder (feature dev-tools)".to_owned());
+                }
+                Some("linked") => {
+                    return Err("the linked decoder comes with research 16's PR 6; use --decoder cli --ffmpeg PATH".to_owned());
                 }
                 _ => return Err(format!("--decoder takes linked, cli or none\n{USAGE}")),
             },
+            "--ffmpeg" if cfg!(feature = "dev-tools") => {
+                ffmpeg = Some(PathBuf::from(value("--ffmpeg")?));
+            }
             "--json" => json = Some(output(value("--json")?)),
             "--summary" => summary = Some(output(value("--summary")?)),
             _ if LATER_OPTIONS.contains(&flag) => {
                 return Err(format!(
-                    "{flag} comes with the content checks, which this build doesn't have yet"
+                    "{flag} comes with the audio and A/V checks, which this build doesn't have yet"
                 ));
             }
             _ if flag.starts_with('-') && flag.len() > 1 => {
@@ -168,6 +193,10 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         }
     }
     let clip = clip.ok_or_else(|| format!("check needs a clip\n{USAGE}"))?;
+    let cli_decoder = chosen.unwrap_or(ffmpeg.is_some());
+    if cli_decoder && ffmpeg.is_none() {
+        return Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}"));
+    }
     let profile = profile.ok_or_else(|| format!("check needs --profile\n{USAGE}"))?;
     if json == Some(Output::Stdout) && summary == Some(Output::Stdout) {
         return Err("--json - and --summary - can't both use stdout".to_owned());
@@ -177,6 +206,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         profile,
         gate_m3,
         expect,
+        ffmpeg: ffmpeg.filter(|_| cli_decoder),
         json,
         summary,
     })
@@ -277,6 +307,7 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         profile,
         gate_m3,
         expect,
+        ffmpeg,
         json,
         summary,
     } = command
@@ -310,8 +341,16 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             return 2;
         }
     };
+    let mut decoder = make_decoder(ffmpeg, &clip);
     let report = match File::open(&clip) {
-        Ok(mut file) => crate::check(&mut file, &name, &plan),
+        Ok(mut file) => crate::check_with(
+            &mut file,
+            &name,
+            &plan,
+            decoder
+                .as_mut()
+                .map(|d| d as &mut dyn crate::decode::Decoder),
+        ),
         Err(error) => {
             say(err, &format!("{name}: {error}"));
             return 3;
@@ -331,6 +370,35 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         }
     }
     report.verdict.exit_code()
+}
+
+/// The decoder `--ffmpeg` asks for.
+#[cfg(feature = "dev-tools")]
+fn make_decoder(ffmpeg: Option<PathBuf>, clip: &Path) -> Option<crate::decode::cli::Cli> {
+    ffmpeg.map(|program| crate::decode::cli::Cli::new(program, clip))
+}
+
+#[cfg(not(feature = "dev-tools"))]
+fn make_decoder(_: Option<PathBuf>, _: &Path) -> Option<NoDecoder> {
+    None
+}
+
+/// The decoder a build without `dev-tools` never has.
+#[cfg(not(feature = "dev-tools"))]
+enum NoDecoder {}
+
+#[cfg(not(feature = "dev-tools"))]
+impl crate::decode::Decoder for NoDecoder {
+    fn kind(&self) -> &'static str {
+        match *self {}
+    }
+
+    fn video(
+        &mut self,
+        _: &mut dyn FnMut(usize, &crate::decode::Planes<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<crate::decode::DecodeStats, crate::decode::DecodeError> {
+        match *self {}
+    }
 }
 
 fn show_boxes(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -472,6 +540,7 @@ mod tests {
                 profile: Profile::Engine,
                 gate_m3: true,
                 expect: None,
+                ffmpeg: None,
                 json: Some(Output::Stdout),
                 summary: Some(Output::File(PathBuf::from("s.txt"))),
             })
@@ -542,6 +611,7 @@ mod tests {
             "check a.mp4 --profile clip",
             "check a.mp4 --profile engine --gate m4",
             "check a.mp4 --profile engine --decoder cli",
+            "check a.mp4 --profile engine --decoder linked --ffmpeg f",
             "check a.mp4 --profile engine --json - --summary -",
             "check a.mp4 b.mp4 --profile engine",
             "check a.mp4 --profile engine --frobnicate",

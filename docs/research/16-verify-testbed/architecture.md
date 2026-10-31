@@ -176,7 +176,7 @@ pub trait Decoder {
 ```
 
 - **`linked`** (Windows). It opens the file with `format::input_with_dictionary` and `ignore_editlist=1` (ffmpeg-next `src/format/mod.rs:176`), sets frame threading with `Context::set_threading` (`src/codec/context.rs:114`), and lowers the FFmpeg log level. It reads `frame::Video::data(i)` and `stride(i)` in place. The safe API covers all of this, so the crate stays `forbid(unsafe_code)`. If a gap ever appears, the FFI goes into a `platform` module with `// SAFETY:` (CLAUDE:32).
-- **`cli`** (all OSes, dev only). For video it runs `ffmpeg -v error -nostdin -ignore_editlist 1 -i F -map 0:v:0 -fps_mode passthrough -f rawvideo -pix_fmt yuv420p -`. For audio it runs `… -map 0:a:N -f f32le -ac 1 -`, one process per track, one after another. Both commands' frame and sample counts were verified to equal the sample tables **[Verified: EXP-2, EXP-3]**. It refuses any `-vf` or `-af`: it decodes only.
+- **`cli`** (all OSes, dev only). For video it runs `ffmpeg -v warning -nostdin -ignore_editlist 1 -i F -map 0:v:0 -fps_mode passthrough -f rawvideo -pix_fmt yuv420p -` (`-v warning`, not `error`: a concealed frame is only a warning; README §3.3 has the full command). For audio it runs `… -map 0:a:N -f f32le -ac 1 -`, one process per track, one after another. Both commands' frame and sample counts were verified to equal the sample tables **[Verified: EXP-2, EXP-3]**. It refuses any `-vf` or `-af`: it decodes only.
 - **`synthetic`** (tests). It renders frames straight from `testsig` with optional distortions (block noise, ±k code quantization, bilinear scaling, a shift by a fraction of a pixel) and makes PCM from `burst()` with optional noise and delay.
 
 ### 2.4 Build, deploy and CI

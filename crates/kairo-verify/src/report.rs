@@ -48,7 +48,7 @@ pub struct FileInfo {
 /// The decoder used for the content checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Decoder {
-    /// `linked`, `cli` or `none`.
+    /// `linked`, `cli`, `synthetic` or `none`.
     pub kind: &'static str,
 }
 
@@ -73,6 +73,8 @@ pub struct Summary {
 pub struct Timings {
     /// Reading the boxes and the NAL headers.
     pub parse: u64,
+    /// Decoding the pictures, readings included.
+    pub decode: u64,
     /// Running the checks.
     pub analysis: u64,
 }
