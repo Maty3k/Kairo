@@ -111,6 +111,7 @@ dependencies = [
 name = "kairo-verify"
 version = "0.1.0"
 dependencies = [
+ "kairo-core",
  "serde",
  "serde_json",
 ]

@@ -1,0 +1,814 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! The content checks this build runs on decoded pictures (docs/research/16-verify-testbed/
+//! README.md §6.3, §6.5): `decode.clean` for the video, `content.barcode`,
+//! `cadence.drops_dups`, `cadence.judder` and `content.flash`. Bars, levels, HDR and audio come
+//! with research 16's next PRs; until then a profile that needs them ends in `error`.
+//!
+//! Every picture's time comes from Kairo's sample tables, never from the decoder.
+
+use std::ops::ControlFlow;
+
+use serde_json::json;
+
+use super::{Ctx, Finding, Outcome, Status, skipped, weigh};
+use crate::analyze::cadence::{self, Counts, Event};
+use crate::analyze::flash::{self, Flashes};
+use crate::analyze::{self, Geometry, Line, NoLine, Reading};
+use crate::decode::{DecodeError, DecodeStats, Decoder};
+use crate::profile::{self, Content, Mode, Plan, Profile};
+
+/// What the decoder gave: its kind, how the decode went and each picture's reading.
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    /// `synthetic`, `cli` or `linked`.
+    pub kind: &'static str,
+    /// A spawned decoder's licence, when it says.
+    pub licence: Option<&'static str>,
+    /// The decode's outcome.
+    pub stats: Result<DecodeStats, DecodeError>,
+    /// One reading per picture, in presentation order.
+    pub readings: Vec<Reading>,
+}
+
+/// The checks this build runs.
+pub(crate) const RUNS: [&str; 5] = [
+    "decode.clean",
+    "content.barcode",
+    "cadence.drops_dups",
+    "cadence.judder",
+    "content.flash",
+];
+
+/// What the readings add up to.
+struct Analysis {
+    /// Each picture's testbed frame number, unwrapped.
+    numbers: Vec<Option<i64>>,
+    /// The barcode line, or why none fits.
+    line: Result<Line, NoLine>,
+    /// The testbed's nominal rate: the barcode line's rounded.
+    source_fps: Option<u32>,
+    /// The line's testbed rate when it is faster than the expect file's `source_hz` allows.
+    too_fast: Option<(f64, u32)>,
+    /// The display's refresh rate and how many vblanks each testbed frame lasts.
+    refresh: Option<(f64, u32)>,
+    fps: Option<u32>,
+    counts: Option<Counts>,
+    /// The ideal's (drop-and-duplicate share, judder share).
+    ideal: Option<(f64, f64)>,
+    /// The flash at the nominal rate F the lit frames fit best (F or F ± 1), with that F.
+    flashes: Option<(u32, Flashes)>,
+    /// The 99th percentile of |step − tick| between consecutive readable frames, in 100 ns, from
+    /// the line's slope (README §6.3 `cadence.judder`).
+    p99_step_error_hns: Option<f64>,
+}
+
+/// How far the line's testbed rate may exceed the expect file's `source_hz`: a timer-paced
+/// testbed runs at or below its display's rate (README §4.3).
+const SOURCE_RATE_SLACK: f64 = 0.005;
+
+/// The fastest display the cadence ideal is replayed for, in Hz.
+const MAX_IDEAL_HZ: f64 = 2_000.0;
+
+/// Runs `decoder` over the clip's video, reading each picture's barcodes and flash.
+pub(crate) fn decode(decoder: &mut dyn Decoder) -> Decoded {
+    let mut readings = Vec::new();
+    let mut geometry: Option<(usize, usize, Option<Geometry>)> = None;
+    let stats = decoder.video(&mut |_, planes| {
+        let size = (planes.width(), planes.height());
+        if geometry.as_ref().is_none_or(|g| (g.0, g.1) != size) {
+            let layout = u32::try_from(size.0)
+                .ok()
+                .zip(u32::try_from(size.1).ok())
+                .and_then(|(w, h)| Geometry::new(w, h).ok());
+            geometry = Some((size.0, size.1, layout));
+        }
+        readings.push(match geometry.as_ref().and_then(|g| g.2.as_ref()) {
+            Some(layout) => analyze::read(layout, planes),
+            None => Reading::default(),
+        });
+        ControlFlow::Continue(())
+    });
+    Decoded {
+        kind: decoder.kind(),
+        licence: decoder.licence(),
+        stats,
+        readings,
+    }
+}
+
+/// Each picture's presentation time in media ticks, earliest first: decode time plus `ctts`.
+fn presentation_times(ctx: &Ctx<'_>) -> Vec<i64> {
+    let mut offsets = Vec::with_capacity(ctx.samples.len());
+    match &ctx.video.ctts {
+        Some(runs) => {
+            for &(count, offset) in runs {
+                offsets.extend(std::iter::repeat_n(offset, count as usize));
+            }
+        }
+        None => offsets.resize(ctx.samples.len(), 0),
+    }
+    let mut times: Vec<i64> = ctx
+        .samples
+        .iter()
+        .zip(offsets.into_iter().chain(std::iter::repeat(0)))
+        .map(|(s, offset)| {
+            i64::try_from(s.dts)
+                .unwrap_or(i64::MAX)
+                .saturating_add(offset)
+        })
+        .collect();
+    times.sort_unstable();
+    times
+}
+
+fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
+    let numbers = analyze::frame_numbers(&decoded.readings);
+    let pts = presentation_times(ctx);
+    let line = analyze::barcode_line(&pts, &numbers);
+    let timescale = ctx.timing.timescale;
+    let rate = line.as_ref().ok().map(|l| l.rate(timescale));
+    let source_fps = rate
+        .map(f64::round)
+        .filter(|&r| (1.0..=10_000.0).contains(&r))
+        .map(|r| r as u32);
+    let source_hz = ctx.plan.expect.as_ref().and_then(|e| e.source_hz);
+    let too_fast = rate
+        .zip(source_hz)
+        .filter(|&(rate, hz)| rate > f64::from(hz) * (1.0 + SOURCE_RATE_SLACK));
+    let refresh = rate.zip(source_fps).map(|(rate, fs)| {
+        // With the testbed's refresh rate known, each frame lasts that many vblanks of it (more
+        // than four for a timer-paced testbed, 72 fps on 360 Hz; README §4.3); without, one: a
+        // testbed running at its display's refresh rate.
+        let every = source_hz.map_or(1, |hz| {
+            ((f64::from(hz) / f64::from(fs)).round() as u32).max(1)
+        });
+        let measured = rate * f64::from(every);
+        // The expect file's rate when it agrees within 0.5%: on a short clip the line's
+        // estimate is off by a fraction of a percent, which would move the ideal.
+        let hz = source_hz
+            .map(f64::from)
+            .filter(|&hz| (hz - measured).abs() <= SOURCE_RATE_SLACK * hz)
+            .unwrap_or(measured);
+        (hz, every)
+    });
+    let fps = ctx
+        .timing
+        .measured
+        .and_then(|m| (m.fps.1 == 1).then_some(m.fps.0))
+        .and_then(|f| u32::try_from(f).ok());
+    let counts = source_fps
+        .zip(fps)
+        .and_then(|(fs, f)| cadence::count(&numbers, fs, f));
+    // The ideal replays every vblank for 10 s: bounded to displays up to 2 kHz.
+    let ideal = refresh
+        .filter(|&(hz, _)| hz <= MAX_IDEAL_HZ)
+        .zip(source_fps)
+        .zip(fps.and_then(cadence::pacer_rate))
+        .and_then(|(((hz, every), fs), rate)| cadence::ideal(hz, every, fs, rate));
+    // F from the line, checked against the lit frames: F ± 1 when it fits them better
+    // (README §6.3 `content.flash`).
+    let flashes = source_fps.map(|fs| {
+        let mut best = (fs, flash::flashes(&decoded.readings, &numbers, fs));
+        for f in [fs.saturating_sub(1), fs + 1] {
+            if f > 0 {
+                let other = flash::flashes(&decoded.readings, &numbers, f);
+                if other.wrong.len() < best.1.wrong.len() {
+                    best = (f, other);
+                }
+            }
+        }
+        best
+    });
+    let p99_step_error_hns = match (&line, fps) {
+        (Ok(line), Some(fps)) => step_error_p99(line, &numbers, timescale, fps),
+        _ => None,
+    };
+    Analysis {
+        numbers,
+        line,
+        source_fps,
+        too_fast,
+        refresh,
+        fps,
+        counts,
+        ideal,
+        flashes,
+        p99_step_error_hns,
+    }
+}
+
+/// The 99th percentile (nearest rank) of |β·ΔN − one output frame| over the steps between
+/// consecutive readable frames, in 100 ns.
+fn step_error_p99(line: &Line, numbers: &[Option<i64>], timescale: u64, fps: u32) -> Option<f64> {
+    let hns = 10_000_000.0 / timescale as f64;
+    let tick = 10_000_000.0 / f64::from(fps);
+    let mut errors: Vec<f64> = numbers
+        .windows(2)
+        .filter_map(|pair| {
+            let (a, b) = (pair[0]?, pair[1]?);
+            Some((line.beta * (b - a) as f64 * hns - tick).abs())
+        })
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    errors.sort_by(f64::total_cmp);
+    let rank = ((0.99 * errors.len() as f64).ceil() as usize).clamp(1, errors.len());
+    Some(errors[rank - 1])
+}
+
+/// The content findings, in the order of [`profile::CONTENT_CHECKS`].
+pub(crate) fn findings(
+    ctx: Option<&Ctx<'_>>,
+    plan: &Plan,
+    decoded: Option<&Decoded>,
+) -> Vec<Finding> {
+    let (Some(ctx), Some(decoded)) = (ctx, decoded) else {
+        return super::content_findings(plan);
+    };
+    let started = decoded.stats.as_ref().ok();
+    // A clip that needn't hold the pattern is judged on it only if it shows it early on.
+    let shows_pattern = decoded
+        .readings
+        .iter()
+        .take(profile::PATTERN_PROBE_FRAMES)
+        .any(|r| r.code.is_some());
+    let analysis = analyse(ctx, decoded);
+    let mut out = Vec::with_capacity(profile::CONTENT_CHECKS.len());
+    for id in profile::CONTENT_CHECKS {
+        let mode = plan.content_mode(id);
+        let required = mode == Mode::Required;
+        if mode == Mode::Off {
+            out.push(skipped(
+                id,
+                false,
+                format!("not in the {} profile", plan.profile),
+            ));
+            continue;
+        }
+        if id == "build.lgpl" {
+            let detail = match decoded.licence {
+                Some(licence) => format!(
+                    "spawned, not linked: the {} decoder ({licence})",
+                    decoded.kind
+                ),
+                None => format!("nothing linked: the {} decoder", decoded.kind),
+            };
+            out.push(Finding {
+                status: Status::Pass,
+                detail,
+                value: json!({"linked": false, "decoder": decoded.kind, "spawned_licence": decoded.licence}),
+                limit: json!({"licence": "LGPL", "source": "CLAUDE.md, M1:12"}),
+                ..skipped(id, required, String::new())
+            });
+            continue;
+        }
+        if !RUNS.contains(&id) {
+            out.push(not_yet(id, mode, plan, shows_pattern));
+            continue;
+        }
+        if id == "decode.clean" {
+            out.push(weigh(id, decode_clean(ctx, &decoded.stats), mode));
+            continue;
+        }
+        if started.is_none() {
+            out.push(skipped(
+                id,
+                required,
+                "the decode failed (decode.clean)".to_owned(),
+            ));
+            continue;
+        }
+        if plan.content == Content::IfPattern && !shows_pattern {
+            out.push(skipped(
+                id,
+                required,
+                format!(
+                    "no testbed pattern in the first {} frames",
+                    profile::PATTERN_PROBE_FRAMES
+                ),
+            ));
+            continue;
+        }
+        let outcome = match id {
+            "content.barcode" => barcode(plan, &decoded.readings),
+            "cadence.drops_dups" => drops_dups(plan, &analysis),
+            "cadence.judder" => judder(plan, &analysis),
+            "content.flash" => flash(&analysis),
+            _ => Outcome::skip("unknown check"),
+        };
+        out.push(weigh(id, outcome, mode));
+    }
+    out
+}
+
+/// A content check this build can't run yet: an error when it is required and the clip must
+/// show the pattern, or does.
+fn not_yet(id: &'static str, mode: Mode, plan: &Plan, shows_pattern: bool) -> Finding {
+    let required = mode == Mode::Required;
+    if required && (plan.content == Content::Required || plan.gate_m3 || shows_pattern) {
+        Finding {
+            status: Status::Error,
+            detail: "this build can't run it yet (research 16's next PRs)".to_owned(),
+            ..skipped(id, true, String::new())
+        }
+    } else {
+        skipped(id, required, "this build can't run it yet".to_owned())
+    }
+}
+
+fn decode_clean(ctx: &Ctx<'_>, stats: &Result<DecodeStats, DecodeError>) -> Outcome {
+    let samples = ctx.samples.len();
+    let mut outcome = Outcome {
+        limit: json!({"errors": 0, "frames": "one per video sample", "audio": "comes with research 16's PR 5", "source": "R09:981"}),
+        ..Outcome::default()
+    };
+    match stats {
+        // The tool couldn't run, which says nothing about the clip (README §6.6: exit 3).
+        Err(error @ DecodeError::Start(_)) => {
+            return Outcome {
+                value: json!({"samples": samples}),
+                ..Outcome::cannot(error.to_string())
+            };
+        }
+        Err(error) => {
+            outcome.value = json!({"samples": samples});
+            outcome.fails.push(error.to_string());
+        }
+        Ok(stats) => {
+            outcome.value =
+                json!({"frames": stats.frames, "samples": samples, "errors": stats.errors});
+            outcome.require(stats.errors == 0, || {
+                format!(
+                    "{} decode errors; the last: {}",
+                    stats.errors,
+                    stats.last_error.as_deref().unwrap_or("?")
+                )
+            });
+            outcome.require(stats.frames == samples, || {
+                format!(
+                    "{} pictures decoded from {samples} video samples",
+                    stats.frames
+                )
+            });
+            outcome.detail = format!("video: {} of {samples} pictures, no errors", stats.frames);
+        }
+    }
+    outcome
+}
+
+fn barcode(plan: &Plan, readings: &[Reading]) -> Outcome {
+    let frames = readings.len();
+    let readable = readings.iter().filter(|r| r.code.is_some()).count();
+    let torn = readings.iter().filter(|r| r.torn.is_some()).count();
+    let share = if frames == 0 {
+        0.0
+    } else {
+        readable as f64 / frames as f64
+    };
+    let min_share = if plan.profile == Profile::Test {
+        1.0
+    } else {
+        profile::BARCODE_MIN_READABLE
+    };
+    let margin = readings
+        .iter()
+        .filter_map(|r| r.code.map(|c| c.margin))
+        .min_by(f64::total_cmp);
+    let tag = plan
+        .expect
+        .as_ref()
+        .and_then(|e| e.run_tag)
+        .and_then(|t| u8::try_from(t).ok());
+    let mut outcome = Outcome {
+        value: json!({"frames": frames, "readable": readable, "share": share, "torn": torn,
+                      "min_margin": margin, "run_tag": tag}),
+        limit: json!({"min_share": min_share, "run_tag": tag, "margin_warn": profile::BARCODE_MARGIN_WARN,
+                      "source": "README §6.5 (proposed outside test)"}),
+        detail: format!("{readable}/{frames} barcodes, {torn} torn"),
+        ..Outcome::default()
+    };
+    outcome.require(frames > 0, || "no pictures".to_owned());
+    if frames > 0 && readable == 0 {
+        // README §4.6 step 1: the layout assumes the clip shows the testbed's client area scaled
+        // with its aspect kept, or centre-cropped.
+        outcome.fails.push(
+            "barcode not found: check geometry (the clip must show the testbed's client area \
+             scaled with its aspect kept, or centre-cropped)"
+                .to_owned(),
+        );
+    } else if share < min_share {
+        for (index, reading) in readings.iter().enumerate() {
+            match (reading.torn, reading.error) {
+                (Some((a, b)), _) => outcome.fails.push(format!(
+                    "frame {index} is torn: barcode A shows {a}, B shows {b}"
+                )),
+                (None, Some(error)) => outcome.fails.push(format!("frame {index}: {error}")),
+                _ => {}
+            }
+        }
+        outcome.fails.insert(
+            0,
+            format!(
+                "{} of {frames} frames have no readable barcode ({:.2}%, limit {:.2}%)",
+                frames - readable,
+                100.0 * (1.0 - share),
+                100.0 * (1.0 - min_share)
+            ),
+        );
+    }
+    if let Some(tag) = tag {
+        let wrong: Vec<usize> = readings
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.code.is_some_and(|c| c.tag != tag))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(&first) = wrong.first() {
+            outcome.fails.push(format!(
+                "{} frames carry another run tag than {tag}, from frame {first}: a clip of another run?",
+                wrong.len()
+            ));
+        }
+    }
+    if let Some(m) = margin {
+        outcome.prefer(m >= profile::BARCODE_MARGIN_WARN, || {
+            format!(
+                "a barcode read with margin {m:.2}, under {}",
+                profile::BARCODE_MARGIN_WARN
+            )
+        });
+    }
+    outcome
+}
+
+fn describe(e: &Event, what: &str) -> String {
+    format!(
+        "frame {}: testbed frame {} → {} ({what})",
+        e.frame, e.from, e.to
+    )
+}
+
+fn drops_dups(plan: &Plan, a: &Analysis) -> Outcome {
+    let Some(fps) = a.fps else {
+        return Outcome::skip("no whole frame rate to step at");
+    };
+    let (counts, fs) = match (&a.line, a.counts.as_ref(), a.source_fps) {
+        (Ok(_), Some(counts), Some(fs)) => (counts, fs),
+        (Err(stall @ (NoLine::Frozen(_) | NoLine::NoAdvance)), _, _) => {
+            return stalled(&a.numbers, *stall);
+        }
+        (Err(reason), _, _) => return Outcome::cannot(format!("no barcode line: {reason}")),
+        (Ok(_), _, _) => return Outcome::cannot("the steps couldn't be counted at this rate"),
+    };
+    let ideal = a.ideal.map_or(0.0, |i| i.0);
+    let share = counts.drop_dup_share();
+    let excess = share - ideal;
+    let test = plan.profile == Profile::Test;
+    let mut outcome = Outcome {
+        value: json!({"steps": counts.steps, "repeats": counts.repeats, "skipped": counts.skipped,
+                      "backwards": counts.backwards, "share": share, "ideal_share": ideal,
+                      "excess": excess, "longest_hold": counts.longest_hold,
+                      "max_step_ticks": counts.max_step_ticks, "source_fps": fs, "fps": fps,
+                      "refresh_hz": a.refresh.map(|r| r.0)}),
+        limit: json!({"max_excess": if test { 0.0 } else { profile::DROPS_DUPS_MAX_EXCESS },
+                      "backwards": 0,
+                      "source": if test { "M1:188, README §2 item 11" } else { "PLAN:351, README §2 item 11 (proposed)" }}),
+        detail: format!(
+            "{} steps: {} repeats, {} skipped, {} backward; ideal {:.2}%",
+            counts.steps,
+            counts.repeats,
+            counts.skipped,
+            counts.backwards,
+            100.0 * ideal
+        ),
+        ..Outcome::default()
+    };
+    if let Some((rate, hz)) = a.too_fast {
+        outcome.fails.push(format!(
+            "the barcodes show a {rate:.2} fps testbed, faster than the expect file's {hz} Hz"
+        ));
+    }
+    let events = || {
+        counts.events.iter().map(|e| {
+            let what = if e.to == e.from {
+                "repeat"
+            } else if e.to < e.from {
+                "backward"
+            } else {
+                "skip"
+            };
+            describe(e, what)
+        })
+    };
+    if test {
+        // Gate 1's synthetic clips: not one event (M1:188).
+        outcome.fails.extend(events());
+    } else {
+        outcome.require(excess <= profile::DROPS_DUPS_MAX_EXCESS, || {
+            format!(
+                "{:.2}% repeated or skipped, {:.2}% above the ideal's {:.2}%",
+                100.0 * share,
+                100.0 * excess,
+                100.0 * ideal
+            )
+        });
+        outcome.require(counts.backwards == 0, || {
+            format!("{} steps go back in time", counts.backwards)
+        });
+        if plan.profile == Profile::Engine {
+            let (hold, step) = profile::ENGINE_MAX_HOLD;
+            outcome.require(counts.longest_hold <= hold, || {
+                format!("one picture held for {} frames", counts.longest_hold)
+            });
+            outcome.require(counts.max_step_ticks <= step, || {
+                format!("a step of {} ticks", counts.max_step_ticks)
+            });
+        }
+        if !outcome.fails.is_empty() {
+            outcome.fails.extend(events());
+        }
+    }
+    outcome
+}
+
+/// `cadence.drops_dups` for a clip whose testbed frame number never advances: each step between
+/// readable frames repeats or goes back, at any rate.
+fn stalled(numbers: &[Option<i64>], stall: NoLine) -> Outcome {
+    let (mut steps, mut repeats, mut backwards) = (0, 0, 0);
+    let mut events = Vec::new();
+    for (i, pair) in numbers.windows(2).enumerate() {
+        let (Some(from), Some(to)) = (pair[0], pair[1]) else {
+            continue;
+        };
+        steps += 1;
+        if to == from {
+            repeats += 1;
+        } else if to < from {
+            backwards += 1;
+            events.push(describe(
+                &Event {
+                    frame: i + 1,
+                    from,
+                    to,
+                },
+                "backward",
+            ));
+        }
+    }
+    let mut outcome = Outcome {
+        value: json!({"steps": steps, "repeats": repeats, "backwards": backwards, "skipped": 0}),
+        limit: json!({"advance": "the testbed frame number advances", "source": "README §6.3"}),
+        ..Outcome::default()
+    };
+    outcome.fails.push(format!(
+        "{stall}: {repeats} of {steps} steps repeat a picture and {backwards} go back"
+    ));
+    outcome.fails.extend(events);
+    outcome
+}
+
+fn judder(plan: &Plan, a: &Analysis) -> Outcome {
+    let Some(fps) = a.fps else {
+        return Outcome::skip("no whole frame rate to step at");
+    };
+    if let Err(reason) = &a.line {
+        return Outcome::cannot(format!("no barcode line: {reason}"));
+    }
+    let Some(counts) = a.counts.as_ref() else {
+        return Outcome::cannot("the steps couldn't be counted at this rate");
+    };
+    let Some((_, ideal)) = a.ideal else {
+        return Outcome::skip(format!("no pacer ideal at {fps} fps"));
+    };
+    let share = counts.judder_share();
+    let excess = share - ideal;
+    // test wants no excess; one step's worth of slack absorbs the ideal's quantisation over a
+    // short clip.
+    let limit = if plan.profile == Profile::Test {
+        1.0 / counts.steps.max(1) as f64
+    } else {
+        profile::JUDDER_MAX_EXCESS
+    };
+    let mut outcome = Outcome {
+        value: json!({"judder_steps": counts.judder, "steps": counts.steps, "share": share,
+                      "ideal_share": ideal, "excess": excess, "refresh_hz": a.refresh.map(|r| r.0),
+                      "source_fps": a.source_fps, "p99_step_error_hns": a.p99_step_error_hns}),
+        limit: json!({"max_excess": limit, "source": "README §2 item 12 (proposed outside test; test: one step)"}),
+        detail: format!(
+            "judder {:.1}%, ideal {:.1}%: excess {:.1} pp",
+            100.0 * share,
+            100.0 * ideal,
+            100.0 * excess
+        ),
+        ..Outcome::default()
+    };
+    // A tiny tolerance for the shares' floating-point division.
+    outcome.require(excess <= limit + 1e-9, || {
+        format!(
+            "judder steps {:.1}% against an ideal {:.1}%: {:.1} pp over",
+            100.0 * share,
+            100.0 * ideal,
+            100.0 * excess
+        )
+    });
+    if !outcome.fails.is_empty() {
+        outcome
+            .fails
+            .extend(counts.judder_events.iter().map(|e| describe(e, "judder")));
+    }
+    outcome
+}
+
+fn flash(a: &Analysis) -> Outcome {
+    let Some((f, flashes)) = a.flashes.as_ref() else {
+        return match &a.line {
+            Err(reason) => Outcome::cannot(format!("no barcode line: {reason}")),
+            Ok(_) => Outcome::cannot("no testbed rate for the flash"),
+        };
+    };
+    if flashes.frames == 0 {
+        return Outcome::cannot("no readable frames");
+    }
+    let mut outcome = Outcome {
+        value: json!({"frames": flashes.frames, "lit": flashes.lit, "onsets": flashes.onsets,
+                      "wrong": flashes.wrong.len(), "flash_fps": f, "source_fps": a.source_fps}),
+        limit: json!({"lit": "N mod F < round(0.1 F)", "F": "the line's rate, or ± 1 where the lit frames fit that better",
+                      "source": "README §2 item 8, §6.3"}),
+        detail: format!(
+            "{} lit frames, {} flashes at F = {f}",
+            flashes.lit, flashes.onsets
+        ),
+        ..Outcome::default()
+    };
+    for &(frame, n, lit) in &flashes.wrong {
+        outcome.fails.push(format!(
+            "frame {frame} (testbed frame {n}) is {}",
+            if lit {
+                "lit but shouldn't be"
+            } else {
+                "dark but should be lit"
+            }
+        ));
+    }
+    outcome
+}
+
+/// The content summary line, from the findings' values: barcodes read, drops and duplicates,
+/// judder; or what was decoded when the barcodes weren't judged. `None` when no decoder ran.
+pub(crate) fn summary(findings: &[Finding]) -> Option<String> {
+    let finding = |id: &str| findings.iter().find(|f| f.id == id);
+    let value = |id: &str| finding(id).map(|f| &f.value);
+    let Some(barcode) = value("content.barcode").filter(|v| v.get("readable").is_some()) else {
+        let clean = finding("decode.clean").filter(|f| f.status != Status::Skip)?;
+        let why = finding("content.barcode").map_or("", |f| f.detail.as_str());
+        return Some(match clean.value.get("frames") {
+            Some(frames) => format!("{frames} pictures decoded; barcodes not judged: {why}"),
+            None => format!("not decoded: {}", clean.detail),
+        });
+    };
+    let mut parts = vec![format!(
+        "{}/{} barcodes",
+        barcode.get("readable")?,
+        barcode.get("frames")?
+    )];
+    if let Some(d) = value("cadence.drops_dups").filter(|v| v.get("steps").is_some()) {
+        parts.push(format!(
+            "{} skipped, {} repeats",
+            d.get("skipped")?,
+            d.get("repeats")?
+        ));
+    }
+    if let Some(excess) = value("cadence.judder").and_then(|v| v.get("excess")?.as_f64()) {
+        parts.push(format!("judder excess {:.1} pp", 100.0 * excess));
+    }
+    Some(parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expect::Expect;
+    use kairo_core::testsig::Barcode;
+
+    fn plan(profile: Profile) -> Plan {
+        let text = r#"{"kairo_expect":1,"pattern":1,"fps":60,"source_hz":180,"seconds":20,
+            "tracks":[]}"#;
+        Plan::new(profile, false, Some(Expect::parse(text).unwrap())).unwrap()
+    }
+
+    /// What 20 s of 180 fps content at 60 fps adds up to, with these frame numbers.
+    fn analysis(numbers: Vec<Option<i64>>) -> Analysis {
+        let counts = cadence::count(&numbers, 180, 60);
+        Analysis {
+            numbers,
+            line: Ok(Line {
+                alpha: 0.0,
+                beta: 256.0 / 3.0,
+                inliers: 1_200,
+            }),
+            source_fps: Some(180),
+            too_fast: None,
+            refresh: Some((180.0, 1)),
+            fps: Some(60),
+            counts,
+            ideal: Some((0.0, 0.0)),
+            flashes: None,
+            p99_step_error_hns: None,
+        }
+    }
+
+    fn numbers(n: impl Fn(i64) -> i64) -> Vec<Option<i64>> {
+        (0..1_200).map(|k| Some(n(k))).collect()
+    }
+
+    fn status(outcome: Outcome) -> Status {
+        weigh("x", outcome, Mode::Required).status
+    }
+
+    #[test]
+    fn capture_and_engine_tolerate_what_test_does_not() {
+        // One drop in 1,199 steps (0.08%) and judder on 1% of the steps pass capture and fail
+        // test; a picture held for three frames fails engine only (review F10).
+        let dropped = analysis(numbers(|k| 1_000 + 3 * (k + i64::from(k >= 600))));
+        let juddering = analysis(numbers(|k| 1_000 + 3 * k - i64::from(k % 100 == 50)));
+        let hold = analysis(numbers(|k| match k {
+            601 | 602 => 1_000 + 3 * 600,
+            _ => 1_000 + 3 * k,
+        }));
+        for (profile, want) in [
+            (Profile::Capture, Status::Pass),
+            (Profile::Test, Status::Fail),
+        ] {
+            let plan = plan(profile);
+            assert_eq!(status(drops_dups(&plan, &dropped)), want, "{profile}: drop");
+            assert_eq!(status(judder(&plan, &juddering)), want, "{profile}: judder");
+        }
+        assert_eq!(
+            status(drops_dups(&plan(Profile::Capture), &hold)),
+            Status::Pass
+        );
+        assert_eq!(
+            status(drops_dups(&plan(Profile::Engine), &hold)),
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn one_unreadable_frame_in_a_thousand_passes_capture() {
+        let code = Barcode {
+            frame24: 0,
+            hdr: false,
+            tag: 0,
+            margin: 1.0,
+            white: 235.0,
+            black: 16.0,
+        };
+        let mut readings: Vec<Reading> = (0..1_200)
+            .map(|_| Reading {
+                code: Some(code),
+                ..Reading::default()
+            })
+            .collect();
+        readings[700].code = None;
+        assert_eq!(
+            status(barcode(&plan(Profile::Capture), &readings)),
+            Status::Pass
+        );
+        assert_eq!(
+            status(barcode(&plan(Profile::Test), &readings)),
+            Status::Fail
+        );
+        // None readable: the geometry is named.
+        let blank = vec![Reading::default(); 10];
+        let outcome = barcode(&plan(Profile::Capture), &blank);
+        assert!(outcome.fails[0].starts_with("barcode not found: check geometry"));
+    }
+
+    #[test]
+    fn checks_that_cannot_run_say_why() {
+        let mut frozen = analysis(numbers(|_| 1_000));
+        frozen.line = Err(NoLine::Frozen(1_000));
+        frozen.counts = None;
+        let plan = plan(Profile::Engine);
+        let outcome = drops_dups(&plan, &frozen);
+        assert!(
+            outcome.fails[0].starts_with("every readable frame after frame 0 shows"),
+            "{:?}",
+            outcome.fails
+        );
+        assert_eq!(status(judder(&plan, &frozen)), Status::Error);
+        assert_eq!(status(flash(&frozen)), Status::Error);
+        let mut few = analysis(vec![Some(1_000)]);
+        few.line = Err(NoLine::TooFew);
+        few.counts = None;
+        assert_eq!(status(drops_dups(&plan, &few)), Status::Error);
+        // Not required, it skips.
+        let outcome = weigh("x", judder(&plan, &frozen), Mode::Warning);
+        assert_eq!(outcome.status, Status::Skip);
+        // A testbed faster than the expect file says fails.
+        let mut fast = analysis(numbers(|k| 1_000 + 3 * k));
+        fast.too_fast = Some((200.0, 180));
+        assert_eq!(status(drops_dups(&plan, &fast)), Status::Fail);
+    }
+}

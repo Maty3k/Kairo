@@ -158,6 +158,22 @@ pub const GATE_M3_CHECKS: [&str; 10] = [
 
 /// One GOP in seconds: "a 1 s closed IDR GOP with `gop_size` = fps" (PLAN:166).
 pub const GOP_SECONDS: u32 = 1;
+/// `content.barcode`: the least share of frames with a readable barcode outside `test`, which
+/// needs every frame (README §6.5, proposed).
+pub const BARCODE_MIN_READABLE: f64 = 0.999;
+/// A barcode read with a margin below this warns (README §4.6 step 4).
+pub const BARCODE_MARGIN_WARN: f64 = 0.5;
+/// `cadence.drops_dups`: the most (repeats + skipped) / steps above the ideal delivery's,
+/// outside `test`, which allows none (PLAN:351, README §2 item 11, proposed).
+pub const DROPS_DUPS_MAX_EXCESS: f64 = 0.005;
+/// `engine`'s longest hold and largest step, in ticks (M3 task 4, core/cadence.rs).
+pub const ENGINE_MAX_HOLD: (usize, i128) = (2, 2);
+/// `cadence.judder`: the most judder steps above the ideal delivery's, as a share, outside
+/// `test`, which allows none (README §2 item 12, proposed).
+pub const JUDDER_MAX_EXCESS: f64 = 0.05;
+/// How many first frames are searched for the pattern in a clip that needn't hold it
+/// (README §6.1).
+pub const PATTERN_PROBE_FRAMES: usize = 60;
 /// The AAC lead the cut gives a clip, in samples: one priming packet plus up to one more
 /// (PLAN:179, cookbook P8, core/cut.rs).
 pub const LEAD_SAMPLES: (u64, u64) = (1024, 2047);

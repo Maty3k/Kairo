@@ -5,6 +5,7 @@
 //! rest: when it fails, they report `skip`.
 
 mod container;
+mod content;
 mod export;
 mod tracks;
 mod video;
@@ -21,6 +22,8 @@ use crate::profile::{self, Content, Mode, Plan};
 use crate::report::{Summary, Verdict};
 
 pub(crate) use container::structure_problems;
+pub use content::Decoded;
+pub(crate) use content::decode;
 
 /// How many violations a finding lists; the count covers the rest.
 pub const MAX_EVENTS: usize = 100;
@@ -71,6 +74,9 @@ pub(crate) struct Outcome {
     pub warns: Vec<String>,
     /// Set when the check couldn't apply, with the reason.
     pub skip: Option<String>,
+    /// Set when the check applies but couldn't be computed, with the reason: an error when it
+    /// is required (README §6.1), a skip otherwise.
+    pub cannot: Option<String>,
     /// What was measured, in a few words.
     pub detail: String,
     /// What was measured, in full.
@@ -84,6 +90,14 @@ impl Outcome {
     pub fn skip(reason: impl Into<String>) -> Self {
         Self {
             skip: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A check that applies but couldn't be computed.
+    pub fn cannot(reason: impl Into<String>) -> Self {
+        Self {
+            cannot: Some(reason.into()),
             ..Self::default()
         }
     }
@@ -269,6 +283,15 @@ fn weigh(id: &'static str, outcome: Outcome, mode: Mode) -> Finding {
         .collect();
     let (status, detail) = if let Some(reason) = outcome.skip {
         (Status::Skip, reason)
+    } else if let Some(reason) = outcome.cannot {
+        (
+            if required {
+                Status::Error
+            } else {
+                Status::Skip
+            },
+            reason,
+        )
     } else if let Some(first) = outcome.fails.first() {
         let status = if required { Status::Fail } else { Status::Warn };
         (status, first.clone())
@@ -302,9 +325,15 @@ fn skipped(id: &'static str, required: bool, reason: String) -> Finding {
     }
 }
 
-/// Runs every check on `clip` under `plan`. `video` is the index of the H.264 track, which
-/// [`crate::check`] has made sure exists unless the structure failed.
-pub(crate) fn run(clip: &Clip, plan: &Plan, video: Option<usize>) -> Vec<Finding> {
+/// Runs every check on `clip` under `plan`, the content checks on `decoded` when a decoder ran.
+/// `video` is the index of the H.264 track, which [`crate::check`] has made sure exists unless
+/// the structure failed.
+pub(crate) fn run(
+    clip: &Clip,
+    plan: &Plan,
+    video: Option<usize>,
+    decoded: Option<&Decoded>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let structure_ok = clip.problems.is_empty();
     let ctx = clip
@@ -360,12 +389,16 @@ pub(crate) fn run(clip: &Clip, plan: &Plan, video: Option<usize>) -> Vec<Finding
         };
         findings.push(weigh(id, outcome, mode));
     }
-    findings.extend(content_findings(plan));
+    findings.extend(content::findings(
+        ctx.as_ref().filter(|_| structure_ok),
+        plan,
+        decoded,
+    ));
     findings
 }
 
-/// The content checks, which this build can't run: a required one is an `error`, so a profile
-/// that needs them can't pass on structure alone (README §6.1).
+/// The content checks when no decoder ran: a required one is an `error`, so a profile that
+/// needs them can't pass on structure alone (README §6.1).
 fn content_findings(plan: &Plan) -> Vec<Finding> {
     profile::CONTENT_CHECKS
         .into_iter()
@@ -375,7 +408,7 @@ fn content_findings(plan: &Plan) -> Vec<Finding> {
             if id == "build.lgpl" {
                 return Finding {
                     status: Status::Pass,
-                    detail: "nothing linked: this build has no decoder".to_owned(),
+                    detail: "nothing linked: no decoder ran".to_owned(),
                     value: json!({"linked": false}),
                     limit: json!({"licence": "LGPL", "source": "CLAUDE.md, M1:12"}),
                     ..skipped(id, required, String::new())
@@ -387,14 +420,13 @@ fn content_findings(plan: &Plan) -> Vec<Finding> {
                 // can't be judged, whatever the clip holds.
                 Mode::Required if plan.content == Content::Required || plan.gate_m3 => Finding {
                     status: Status::Error,
-                    detail: "needs decoded frames or audio; this build has no decoder".to_owned(),
+                    detail: "needs decoded frames or audio, and no decoder ran".to_owned(),
                     ..skipped(id, true, String::new())
                 },
                 _ => skipped(
                     id,
                     required,
-                    "structure only: this build has no decoder to look for the testbed pattern"
-                        .to_owned(),
+                    "structure only: no decoder ran to look for the testbed pattern".to_owned(),
                 ),
             }
         })
@@ -459,7 +491,8 @@ pub(crate) fn summarize(
             box_order(&order),
             clip.movie.as_ref().map_or(0, |m| m.tracks.len())
         ),
-        content: "not checked: this build has no decoder".to_owned(),
+        content: content::summary(findings)
+            .unwrap_or_else(|| "not checked: no decoder ran".to_owned()),
         ..Summary::default()
     };
     let Some(ctx) = clip

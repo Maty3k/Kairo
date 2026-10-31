@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `kairo-verify`: checks Kairo's clips (docs/research/16-verify-testbed/, M1).
 //!
-//! This version reads the container and the H.264 and AAC headers with its own parser and runs
-//! the structure checks: moov first, no edit list, `colr`, CFR, start alignment, no reordering,
-//! IDR at 0, the closed 1 s GOP, the track layout, AAC LC at 48 kHz, durations, one encoder
-//! session, the bitrate, and the export limits that need no decoding (README §6.2, §6.5). The
-//! checks that need decoded pictures and audio come with research 16's PRs 4 to 6. Until then,
-//! a clip that should hold the testbed pattern (profiles `test`, `capture` and `smoke`, or an
-//! expect file that names a pattern) ends in `error`, and so does `--gate m3`, whose list holds
-//! A/V: such a clip can't pass on structure alone. Other `engine` and export checks, as for a
-//! real game clip, are structure only.
+//! It reads the container and the H.264 and AAC headers with its own parser and runs the
+//! structure checks: moov first, no edit list, `colr`, CFR, start alignment, no reordering, IDR
+//! at 0, the closed 1 s GOP, the track layout, AAC LC at 48 kHz, durations, one encoder session,
+//! the bitrate, and the export limits that need no decoding (README §6.2, §6.5).
 //!
-//! It needs no FFmpeg and no `ffprobe`, so it runs on the Mac, on Linux CI and, later, inside
-//! the engine for its post-save check (PLAN:179) and in "Test my setup" (PLAN:271). Reports
-//! name the file only, never its folder (CLAUDE.md).
+//! Given a [`decode::Decoder`] ([`check_with`]), it also reads pattern v1 in the decoded
+//! pictures: each frame's barcode and flash, the testbed frame numbers, and from them
+//! `decode.clean` (video), `content.barcode`, `cadence.drops_dups`, `cadence.judder` and
+//! `content.flash` (README §6.3). The bars, levels, HDR and audio checks come with research
+//! 16's next PRs; until then a clip that should hold the testbed pattern (profiles `test`,
+//! `capture` and `smoke`, or an expect file that names a pattern) ends in `error`, and so does
+//! `--gate m3`, whose list holds A/V, and so does any other clip whose first 60 frames show the
+//! pattern. Other `engine` and export clips, such as a real game clip, are judged on what runs.
+//! A required check that can't be computed (no barcode line, a decoder that didn't start) is an
+//! `error`, never a pass; a clip whose testbed frame never advances fails `cadence.drops_dups`.
+//!
+//! Structure needs no FFmpeg and no `ffprobe`, so it runs on the Mac, on Linux CI and, later,
+//! inside the engine for its post-save check (PLAN:179) and in "Test my setup" (PLAN:271). The
+//! decoders: synthetic (tests), the CLI pipe (`dev-tools`, a spawned FFmpeg), and the linked
+//! one with research 16's PR 6. Reports name the file only, never its folder (CLAUDE.md).
 //!
 //! [`mutate`] makes the bad clips that are one box-level change from a good one (README §7.3):
 //! moov after the media, an edit list, a wrong or missing `colr`, a second default track, and
@@ -22,9 +29,13 @@
 #![forbid(unsafe_code)]
 
 pub mod aac;
+pub mod analyze;
 pub mod boxes;
 pub mod checks;
 pub mod cli;
+#[cfg(test)]
+mod content_tests;
+pub mod decode;
 pub mod expect;
 pub mod h264;
 pub mod mp4;
@@ -39,6 +50,7 @@ mod tests;
 
 use std::time::Instant;
 
+use crate::decode::Decoder;
 use crate::mp4::tracks::{MAX_VIDEO_SAMPLES, Movie, Sample, SampleEntry};
 use crate::mp4::{Mp4, Problem, ReadError, Source};
 use crate::profile::Plan;
@@ -123,8 +135,19 @@ impl Clip {
     }
 }
 
-/// Checks the clip in `source`, called `name` in the report, under `plan`.
+/// Checks the clip in `source`, called `name` in the report, under `plan`, on structure alone.
 pub fn check(source: &mut dyn Source, name: &str, plan: &Plan) -> Report {
+    check_with(source, name, plan, None)
+}
+
+/// Checks the clip in `source`, called `name` in the report, under `plan`, running the content
+/// checks on what `decoder` decodes when one is given and the structure is sound.
+pub fn check_with(
+    source: &mut dyn Source,
+    name: &str,
+    plan: &Plan,
+    decoder: Option<&mut dyn Decoder>,
+) -> Report {
     let started = Instant::now();
     let mut report = Report {
         kairo_verify: report::VERSION,
@@ -161,9 +184,23 @@ pub fn check(source: &mut dyn Source, name: &str, plan: &Plan) -> Report {
         report.error = Some("no H.264 (avc1) video track".to_owned());
         return report;
     }
-    report.checks = checks::run(&clip, plan, clip.video);
+    let decoded = match decoder {
+        Some(decoder) if clip.problems.is_empty() => {
+            report.decoder.kind = decoder.kind();
+            let decode_started = Instant::now();
+            let decoded = checks::decode(decoder);
+            report.timings_ms.decode = decode_started.elapsed().as_millis() as u64;
+            Some(decoded)
+        }
+        _ => None,
+    };
+    report.checks = checks::run(&clip, plan, clip.video, decoded.as_ref());
     report.verdict = checks::verdict(&report.checks);
     report.summary = checks::summarize(&clip, plan, clip.video, &report.checks);
-    report.timings_ms.analysis = started.elapsed().saturating_sub(parsed).as_millis() as u64;
+    report.timings_ms.analysis = started
+        .elapsed()
+        .saturating_sub(parsed)
+        .saturating_sub(std::time::Duration::from_millis(report.timings_ms.decode))
+        .as_millis() as u64;
     report
 }
