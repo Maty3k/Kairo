@@ -30,8 +30,8 @@ pub const USAGE: &str =
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
-The cli decoder (--ffmpeg PATH) decodes for the barcode, cadence and flash checks; the other
-content checks and the linked decoder come with research 16's next PRs.";
+The cli decoder (--ffmpeg PATH) decodes for the content checks; the audio checks and the linked
+decoder come with research 16's next PRs.";
 
 /// The usage text.
 #[cfg(not(feature = "dev-tools"))]
@@ -98,14 +98,25 @@ fn safe_word(word: &str) -> bool {
     word.len() <= 32 && !word.contains(['/', '\\', ':']) && !word.chars().any(char::is_control)
 }
 
-/// Options README §6.1 documents for the audio and A/V checks, which come with research 16's
-/// PR 5.
-const LATER_OPTIONS: [&str; 5] = [
-    "--testbed-log",
-    "--voice-log",
-    "--cue",
-    "--av-tight",
-    "--voice-included",
+/// Options README §6.1 documents that this build doesn't take yet, with what brings them.
+const LATER_OPTIONS: [(&str, &str); 5] = [
+    (
+        "--testbed-log",
+        "source.stability and the testbed log (research 16's PR 8)",
+    ),
+    (
+        "--voice-log",
+        "the audio and A/V checks (research 16's PR 5)",
+    ),
+    ("--cue", "the audio and A/V checks (research 16's PR 5)"),
+    (
+        "--av-tight",
+        "the audio and A/V checks (research 16's PR 5)",
+    ),
+    (
+        "--voice-included",
+        "the audio and A/V checks (research 16's PR 5)",
+    ),
 ];
 
 /// Parses the arguments, without the program name.
@@ -174,9 +185,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             }
             "--json" => json = Some(output(value("--json")?)),
             "--summary" => summary = Some(output(value("--summary")?)),
-            _ if LATER_OPTIONS.contains(&flag) => {
+            _ if let Some((_, with)) = LATER_OPTIONS.iter().find(|(f, _)| *f == flag) => {
                 return Err(format!(
-                    "{flag} comes with the audio and A/V checks, which this build doesn't have yet"
+                    "{flag} comes with {with}, which this build doesn't have yet"
                 ));
             }
             _ if flag.starts_with('-') && flag.len() > 1 => {

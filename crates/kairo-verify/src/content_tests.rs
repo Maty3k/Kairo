@@ -4,7 +4,7 @@
 //! `engine`. A good clip passes every content check this build runs; each content defect
 //! (drop, duplicate, judder, unreadable, torn, wrong run tag, wrong flash) fails its own.
 
-use kairo_core::testsig::{Load, Options, Patches, Pattern, Size};
+use kairo_core::testsig::{Curve, Load, Matrix, Options, Patches, Pattern, Range, Size};
 
 use crate::checks::Status;
 use crate::decode::synthetic::{Damage, Synthetic};
@@ -80,6 +80,10 @@ fn a_good_clip_passes_every_content_check_this_build_runs() {
         "cadence.drops_dups",
         "cadence.judder",
         "content.flash",
+        "content.bars",
+        "content.colour_matrix",
+        "content.bars_lines",
+        "content.levels",
         "build.lgpl",
     ] {
         assert_eq!(
@@ -93,11 +97,12 @@ fn a_good_clip_passes_every_content_check_this_build_runs() {
     assert_eq!(report.decoder.kind, "synthetic");
     assert_eq!(
         report.summary.content,
-        "120/120 barcodes, 0 skipped, 0 repeats, judder excess 0.0 pp"
+        "120/120 barcodes, 0 skipped, 0 repeats, judder excess 0.0 pp, bars min 59.5 dB"
     );
-    // Bars, levels and audio come later: `test` can't pass yet.
-    assert_eq!(status(&report, "content.bars"), Status::Error);
-    // Noise and scaling don't change it.
+    // Audio comes later: `test` can't pass yet.
+    assert_eq!(status(&report, "av.offset"), Status::Error);
+    // Noise and scaling don't stop the barcodes, cadence or flash. The bars are stricter:
+    // ±6 codes of noise alone is about 37 dB, under the 40 dB a recording must keep.
     let damage = Damage {
         noise: 6,
         scale_from: Some(Size::new(480, 270).unwrap()),
@@ -118,6 +123,7 @@ fn a_good_clip_passes_every_content_check_this_build_runs() {
             rough.to_text()
         );
     }
+    assert_eq!(status(&rough, "content.bars"), Status::Fail);
 }
 
 #[test]
@@ -436,7 +442,8 @@ fn a_clip_that_shows_the_pattern_is_held_to_every_required_check() {
     // errors, not skips (review F3).
     let report = run(content(), Damage::default(), options(), &engine_plan());
     assert_eq!(status(&report, "content.barcode"), Status::Pass);
-    assert_eq!(status(&report, "content.bars"), Status::Error);
+    assert_eq!(status(&report, "content.bars"), Status::Pass);
+    assert_eq!(status(&report, "av.offset"), Status::Error);
     assert_eq!(
         report.verdict,
         crate::Verdict::Error,
@@ -535,6 +542,173 @@ fn testbeds_near_the_clip_rate_pass_capture() {
     }
 }
 
+#[test]
+fn picture_defects_fail_the_bars_and_level_checks() {
+    // README §7.3 and signals.md §2.4: each fault, what it must fail.
+    let cases: Vec<(&str, Damage, &[&str])> = vec![
+        (
+            "BT.601 tagged BT.709",
+            Damage {
+                colour: Some((Matrix::Bt601, Range::Limited)),
+                ..Damage::default()
+            },
+            &[
+                "content.bars",
+                "content.colour_matrix",
+                "content.bars_lines",
+            ],
+        ),
+        (
+            "full range tagged limited",
+            Damage {
+                colour: Some((Matrix::Bt709, Range::Full)),
+                ..Damage::default()
+            },
+            &[
+                "content.bars",
+                "content.colour_matrix",
+                "content.bars_lines",
+                "content.levels",
+            ],
+        ),
+        (
+            "Cb and Cr swapped",
+            Damage {
+                swap_chroma: true,
+                ..Damage::default()
+            },
+            &["content.bars", "content.colour_matrix"],
+        ),
+        (
+            "gridlines ±48 every 16 px (bars)",
+            Damage {
+                gridlines: Some((16, 48)),
+                ..Damage::default()
+            },
+            &["content.bars", "content.bars_lines"],
+        ),
+        (
+            "an unreadable frame whose bars are corrupt too",
+            Damage {
+                garble: vec![30],
+                gridlines: Some((16, 48)),
+                gridline_frames: vec![30],
+                ..Damage::default()
+            },
+            &["content.barcode", "content.bars", "content.bars_lines"],
+        ),
+    ];
+    for (name, damage, fails) in cases {
+        let report = run(content(), damage, options(), &plan(Profile::Test, 5));
+        assert_eq!(failing(&report), fails, "{name}: {}", report.to_text());
+    }
+    // +24 every 64 px shows as lines; its PSNR may pass or not (README §7.3 bars-sparse).
+    let sparse = Damage {
+        gridlines: Some((64, 24)),
+        ..Damage::default()
+    };
+    let report = run(content(), sparse, options(), &plan(Profile::Test, 5));
+    assert_eq!(
+        status(&report, "content.bars_lines"),
+        Status::Fail,
+        "{}",
+        report.to_text()
+    );
+}
+
+#[test]
+fn the_ramp_chroma_rule_only_warns_in_exports() {
+    // Low export bitrates leave the ramp's chroma a few codes off grey (review F2 of PR 4b).
+    let off = Damage {
+        ramp_chroma: 3,
+        ..Damage::default()
+    };
+    let test = run(content(), off.clone(), options(), &plan(Profile::Test, 5));
+    assert_eq!(
+        status(&test, "content.bars"),
+        Status::Fail,
+        "{}",
+        test.to_text()
+    );
+    let share = run(content(), off, options(), &plan(Profile::Share, 5));
+    assert_eq!(
+        status(&share, "content.bars"),
+        Status::Warn,
+        "{}",
+        share.to_text()
+    );
+}
+
+#[test]
+fn many_short_unreadable_runs_are_all_scored() {
+    // 140 unreadable frames in runs of one, more than the queue for the barcode line holds:
+    // each is scored as soon as its next neighbour reads (review F3 of PR 4b).
+    let frames = 420_u64;
+    let content: Vec<u64> = (0..frames).map(|k| 1_000 + 3 * k).collect();
+    let garble = Damage {
+        garble: (0..frames as usize).filter(|i| i % 3 == 1).collect(),
+        ..Damage::default()
+    };
+    let report = run_spec(
+        &spec(60, 7),
+        content,
+        garble,
+        options(),
+        &plan_for(Profile::Capture, 60, 7, 180),
+    );
+    let bars = report
+        .checks
+        .iter()
+        .find(|f| f.id == "content.bars")
+        .unwrap();
+    assert_eq!(bars.status, Status::Pass, "{}", report.to_text());
+    assert_eq!(bars.value.get("scored"), bars.value.get("frames"));
+}
+
+#[test]
+fn hdr_patches_are_judged_against_the_expected_curve() {
+    let plan_for = |curve: &str| {
+        let text = format!(
+            r#"{{"kairo_expect":1,"pattern":1,"size":[320,180],"fps":60,"source_hz":180,"seconds":2,
+                "run_tag":5,"hdr":{{"curve":"{curve}","lw_nits":1000,"sdr_white_nits":240}},"tracks":[
+                {{"title":"Mix","channels":2,"default":true}},
+                {{"title":"Game","channels":2,"default":false}},
+                {{"title":"Mic","channels":1,"default":false}}]}}"#
+        );
+        Plan::new(Profile::Test, false, Some(Expect::parse(&text).unwrap())).unwrap()
+    };
+    let shown = |curve| Options {
+        patches: Patches::ExpectedSdr {
+            curve,
+            peak_nits: 1_000.0,
+            sdr_white_nits: 240.0,
+        },
+        ..options()
+    };
+    let natural = run(
+        content(),
+        Damage::default(),
+        shown(Curve::Natural),
+        &plan_for("natural"),
+    );
+    assert_eq!(
+        status(&natural, "hdr.curve_levels"),
+        Status::Pass,
+        "{}",
+        natural.to_text()
+    );
+    assert_eq!(status(&natural, "content.levels"), Status::Skip);
+    assert!(failing(&natural).is_empty(), "{}", natural.to_text());
+    // A clip made with Match SDR apps fails the Natural expectation.
+    let wrong = run(
+        content(),
+        Damage::default(),
+        shown(Curve::MatchSdrApps),
+        &plan_for("natural"),
+    );
+    assert_eq!(failing(&wrong), ["hdr.curve_levels"], "{}", wrong.to_text());
+}
+
 /// A scratch folder for the opt-in tests, removed when dropped, failures included.
 #[cfg(feature = "dev-tools")]
 struct Scratch(std::path::PathBuf);
@@ -563,17 +737,18 @@ fn ffmpeg() -> std::ffi::OsString {
         .expect("set KAIRO_FFMPEG to an FFmpeg to spawn, e.g. /opt/homebrew/bin/ffmpeg")
 }
 
-/// Encodes `count` synthetic frames at 640x360 with `h264_videotoolbox` into `dir/name`
-/// (spawned, never libx264): a GOP of 60 at 8 Mbps, no edit list. The raw frames are BT.709
-/// limited, and FFmpeg must be told so: untagged, it takes a picture this size for BT.601 and
-/// converts it to the output's BT.709 before encoding (FFmpeg 8.0.1 on the Mac).
+/// Encodes `count` synthetic frames of `size` with `h264_videotoolbox` into `dir/name`
+/// (spawned, never libx264): a GOP of 60, no B-frames, `rate` (`-b:v`, `-maxrate`), no edit
+/// list. The raw frames are BT.709 limited, and FFmpeg must be told so: untagged, it takes a
+/// picture this size for BT.601 and converts it to the output's BT.709 before encoding (FFmpeg
+/// 8.0.1 on the Mac).
 #[cfg(feature = "dev-tools")]
 fn videotoolbox(
     ffmpeg: &std::ffi::OsStr,
     dir: &std::path::Path,
     name: &str,
     frames: &Synthetic,
-    count: usize,
+    (count, size, rate): (usize, &str, [&str; 2]),
 ) -> std::path::PathBuf {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -591,19 +766,10 @@ fn videotoolbox(
     let mut child = Command::new(ffmpeg)
         .current_dir(dir)
         .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .args(["-s", "640x360"])
+        .args(["-s", size])
         .args(tags)
-        .args([
-            "-r",
-            "60",
-            "-i",
-            "-",
-            "-c:v",
-            "h264_videotoolbox",
-            "-b:v",
-            "8M",
-        ])
-        .args(["-g", "60"])
+        .args(["-r", "60", "-i", "-", "-c:v", "h264_videotoolbox"])
+        .args(["-b:v", rate[0], "-maxrate", rate[1], "-g", "60", "-bf", "0"])
         .args(tags)
         .args(["-movflags", "+faststart", "-use_editlist", "0", "-an", name])
         .stdin(Stdio::piped())
@@ -644,7 +810,13 @@ fn a_videotoolbox_clip_reads_back_through_the_cli_decoder() {
         content(),
         Damage::default(),
     );
-    let clip = videotoolbox(&ffmpeg, &dir.0, "vt.mp4", &frames, FRAMES as usize);
+    let clip = videotoolbox(
+        &ffmpeg,
+        &dir.0,
+        "vt.mp4",
+        &frames,
+        (FRAMES as usize, "640x360", ["8M", "8M"]),
+    );
     let mut decoder = crate::decode::cli::Cli::new(&ffmpeg, &clip);
     let mut file = std::fs::File::open(&clip).unwrap();
     let report = check_with(&mut file, "vt.mp4", &vt_plan(), Some(&mut decoder));
@@ -654,6 +826,9 @@ fn a_videotoolbox_clip_reads_back_through_the_cli_decoder() {
         "cadence.drops_dups",
         "cadence.judder",
         "content.flash",
+        "content.bars",
+        "content.colour_matrix",
+        "content.levels",
     ] {
         assert_eq!(
             status(&report, id),
@@ -679,7 +854,13 @@ fn a_corrupted_idr_fails_decode_clean() {
         content(),
         Damage::default(),
     );
-    let clip = videotoolbox(&ffmpeg, &dir.0, "corrupt.mp4", &frames, FRAMES as usize);
+    let clip = videotoolbox(
+        &ffmpeg,
+        &dir.0,
+        "corrupt.mp4",
+        &frames,
+        (FRAMES as usize, "640x360", ["8M", "8M"]),
+    );
     let mut bytes = std::fs::read(&clip).unwrap();
     let parsed = crate::Clip::read(&mut bytes.as_slice()).unwrap();
     let idr = parsed.video_samples[60];
@@ -703,4 +884,42 @@ fn a_corrupted_idr_fails_decode_clean() {
         "{}",
         report.to_text()
     );
+}
+
+/// Opt-in, as above: research 16 §7.2's Mac recipe at 1080p (25/40 Mbps) passes the `test`
+/// profile's 4-code line rule, now that the columns where new content enters are left out
+/// (review F1 of PR 4b: 4.6 codes at x = 0 before).
+#[cfg(feature = "dev-tools")]
+#[test]
+#[ignore = "needs KAIRO_FFMPEG"]
+fn a_1080p_videotoolbox_clip_passes_the_line_rule() {
+    let ffmpeg = ffmpeg();
+    let dir = Scratch::new("vt-1080");
+    let frames = Synthetic::new(
+        Size::new(1920, 1080).unwrap(),
+        options(),
+        content(),
+        Damage::default(),
+    );
+    let clip = videotoolbox(
+        &ffmpeg,
+        &dir.0,
+        "vt1080.mp4",
+        &frames,
+        (FRAMES as usize, "1920x1080", ["25M", "40M"]),
+    );
+    let text = r#"{"kairo_expect":1,"pattern":1,"size":[1920,1080],"fps":60,"source_hz":180,
+        "seconds":2,"run_tag":5,"tracks":[]}"#;
+    let plan = Plan::new(Profile::Test, false, Some(Expect::parse(text).unwrap())).unwrap();
+    let mut decoder = crate::decode::cli::Cli::new(&ffmpeg, &clip);
+    let mut file = std::fs::File::open(&clip).unwrap();
+    let report = check_with(&mut file, "vt1080.mp4", &plan, Some(&mut decoder));
+    for id in ["content.bars", "content.bars_lines", "content.levels"] {
+        assert_eq!(
+            status(&report, id),
+            Status::Pass,
+            "{id}: {}",
+            report.to_text()
+        );
+    }
 }

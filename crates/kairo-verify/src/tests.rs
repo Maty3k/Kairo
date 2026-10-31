@@ -1158,7 +1158,7 @@ mod cli {
         ]);
         assert_eq!(code, 2);
         assert!(
-            err.contains("--av-tight comes with the audio and A/V checks"),
+            err.contains("--av-tight comes with the audio and A/V checks (research 16's PR 5)"),
             "{err}"
         );
     }

@@ -8,14 +8,16 @@
 //!
 //! Given a [`decode::Decoder`] ([`check_with`]), it also reads pattern v1 in the decoded
 //! pictures: each frame's barcode and flash, the testbed frame numbers, and from them
-//! `decode.clean` (video), `content.barcode`, `cadence.drops_dups`, `cadence.judder` and
-//! `content.flash` (README §6.3). The bars, levels, HDR and audio checks come with research
-//! 16's next PRs; until then a clip that should hold the testbed pattern (profiles `test`,
-//! `capture` and `smoke`, or an expect file that names a pattern) ends in `error`, and so does
-//! `--gate m3`, whose list holds A/V, and so does any other clip whose first 60 frames show the
-//! pattern. Other `engine` and export clips, such as a real game clip, are judged on what runs.
-//! A required check that can't be computed (no barcode line, a decoder that didn't start) is an
-//! `error`, never a pass; a clip whose testbed frame never advances fails `cadence.drops_dups`.
+//! `decode.clean` (video), `content.barcode`, `cadence.drops_dups`, `cadence.judder`,
+//! `content.flash`, the bars (`content.bars`, `content.colour_matrix`, `content.bars_lines`) and
+//! the grey patches (`content.levels`, `hdr.curve_levels`) (README §6.3). The audio checks come
+//! with research 16's PR 5, and `source.stability`, which reads the testbed log, with its PR 8.
+//! Until then `test` and `engine` clips that show the pattern (or must), pattern-bearing exports
+//! and `--gate m3`, whose list holds A/V, end in `error`, and so does `capture`, on
+//! `source.stability`; `smoke` is judged on what runs, and so are clips without the pattern, such
+//! as a real game clip. A required check that can't be computed (no barcode line, a decoder that didn't start)
+//! is an `error`, never a pass; a clip whose testbed frame never advances fails
+//! `cadence.drops_dups`.
 //!
 //! Structure needs no FFmpeg and no `ffprobe`, so it runs on the Mac, on Linux CI and, later,
 //! inside the engine for its post-save check (PLAN:179) and in "Test my setup" (PLAN:271). The
@@ -188,7 +190,7 @@ pub fn check_with(
         Some(decoder) if clip.problems.is_empty() => {
             report.decoder.kind = decoder.kind();
             let decode_started = Instant::now();
-            let decoded = checks::decode(decoder);
+            let decoded = checks::decode(decoder, plan);
             report.timings_ms.decode = decode_started.elapsed().as_millis() as u64;
             Some(decoded)
         }
