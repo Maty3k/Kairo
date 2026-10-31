@@ -76,7 +76,7 @@ cleanup() {
     done
 }
 trap cleanup EXIT
-make_temp() { # make_temp file|dir -> prints the new path and registers it for cleanup
+make_temp() { # make_temp file|dir -> prints the new path; the caller must register_temp it (this runs in a subshell)
     local path
     if [ "$1" = dir ]; then
         path=$(mktemp -d "$TMP_BASE/kairo-pc.XXXXXX") || return 1
@@ -108,6 +108,11 @@ is_package() { # a cargo package name
     case "$1" in '' | -* | *[!A-Za-z0-9_-]*) return 1 ;; esac
     [ "${#1}" -le 64 ]
 }
+is_alias() { # a monitor alias: ^[a-z0-9][a-z0-9_-]{0,31}$ (byte ranges: LC_ALL=C above)
+    case "$1" in '' | [!a-z0-9]* | *[!a-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 32 ]
+}
+
 is_pipe_name() { # NAME or \\.\pipe\NAME with NAME in [A-Za-z0-9._-]{1,200} (kairo-core hello.rs)
     local name=$1
     # shellcheck disable=SC1003 # the backslashes are literal: '\\.\pipe\'
@@ -308,6 +313,14 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            (default: max_seconds + 30 s) and prints it with the job's output.
   logs [ID] [--tail N] [--force]
                            List the newest job and build results, or show one id's result and logs.
+  harness displays [--alias NAME=DISPLAYn]... [--force]
+                           Run "kairo-harness displays" as a hidden job and keep its displays.json
+                           (every display's device path, GDI and model names, size, refresh, HDR
+                           state and mirroring, and every adapter's LUID, PCI ids and model name)
+                           in .dogfood/pc/. Aliases such as 180hz and oled map to device paths in
+                           .dogfood/pc/monitors.json: --alias names a display by the GDI name in
+                           the last table, which must still be the same display; aliases whose
+                           display is off are kept.
   cli ping|keys [--pipe NAME] [--force]
                            Run kairo-cli on the PC (it talks to kairo-hello over its named pipe).
   ssh                      Interactive shell on the PC (cmd.exe; type pwsh for PowerShell 7), for
@@ -681,6 +694,173 @@ cmd_run() {
     run_ps run
 }
 
+# --- harness -------------------------------------------------------------------------------
+# research 16 README section 8.7. The job runs kairo-harness from the current build; it writes
+# C:\kairo\logs\harness-displays.json, which comes back through the read-only
+# remote/harness-fetch.ps1, and prints only a count, so no model name reaches this terminal.
+HARNESS_DISPLAYS_FILE='harness-displays.json'
+HARNESS_DISPLAYS_JOB='{"id":"harness-displays","cmd":["C:\\kairo\\bin\\current\\kairo-harness.exe","displays","--out","C:\\kairo\\logs\\harness-displays.json"],"cwd":null,"max_seconds":30,"abort_on_input":true,"window":"hidden"}'
+
+# monitors.json from displays.json ($d, slurped), the old monitors.json ($m, or null) and the new aliases
+# ($new, {"name": "DISPLAYn"}): every old alias stays (a display that is off or asleep may be
+# missing from the list), and each new one is set by its GDI name now. A display that mirrors
+# another (Duplicate mode) can't get one: a window meant for it would show on both.
+# shellcheck disable=SC2016 # a jq program: its $d, $m, $new, $t, $e and $hits must not expand
+JQ_MONITORS='
+($d[0].targets) as $t
+| reduce ($new | to_entries[]) as $e (($m.aliases // {});
+    [$t[] | select(.gdi_name == ("\\\\.\\" + $e.value))] as $hits
+    | if ($hits | length) == 0 then
+        error("no active display " + $e.value + " (active: "
+          + ([$t[].gdi_name | ltrimstr("\\\\.\\")] | if length == 0 then "none" else join(", ") end) + ")")
+      elif ($hits | length) > 1 or ($hits[0].cloned // false) then
+        error($e.value + " is mirrored on another display (Duplicate mode): switch Windows to Extend, then run again")
+      elif $hits[0].device_path == "" then
+        error($e.value + " is active, but Windows reported no device path for it, so it cannot have an alias")
+      else . + {($e.key): $hits[0].device_path} end)
+| {kairo_monitors: 1, aliases: .}
+'
+
+# The new aliases' DISPLAYn ($new) that name a display in the fetched list ($cur, slurped) other
+# than the one in the table last shown ($prev, slurped), or one that table lacked: GDI numbers change across
+# reboots and re-plugs. A DISPLAYn that isn't active now is JQ_MONITORS' to report.
+# shellcheck disable=SC2016 # a jq program: its $prev, $cur and $new must not expand
+JQ_STALE='
+def path($doc; $g): [$doc.targets[] | select(.gdi_name == ("\\\\.\\" + $g)) | .device_path | ascii_downcase] | first;
+$prev[0] as $prev | $cur[0] as $cur
+| [$new[] | select(path($cur; .) != null and path($prev; .) != path($cur; .))] | unique | join(", ")
+'
+
+# Aliases that would name one display twice, e.g. "180hz and oled".
+JQ_SHARED='[.aliases | to_entries | group_by(.value | ascii_downcase)[] | select(length > 1) | map(.key) | join(" and ")] | join("; ")'
+
+# The aliases whose display isn't in the list now ($d, slurped).
+# shellcheck disable=SC2016 # a jq program: its $d, $m and $t must not expand
+JQ_ABSENT='
+$d[0].targets as $t | ($m.aliases // {}) | to_entries[]
+| select(.value as $p | $t | all(.device_path | ascii_downcase != ($p | ascii_downcase))) | .key
+'
+
+# One line per display ($d, slurped): GDI name, size, refresh, primary, HDR, mirroring and its
+# aliases, with any control character from the PC turned into a space.
+# shellcheck disable=SC2016 # a jq program: its $m, $a, $d and $t must not expand
+JQ_DISPLAY_TABLE='
+($m.aliases // {}) as $a
+| $d[0].targets[]
+| . as $t
+| [ (.gdi_name | ltrimstr("\\\\.\\")),
+    "\(.rect.right - .rect.left)x\(.rect.bottom - .rect.top)",
+    (if .refresh.denominator > 0
+     then "\((.refresh.numerator / .refresh.denominator * 100 | round) / 100) Hz" else "? Hz" end),
+    (if .primary then "primary" else "-" end),
+    (if .hdr.active then "HDR on" else "HDR off" end),
+    (if .cloned // false then "mirrored" else "-" end),
+    ([$a | to_entries[] | select(.value | ascii_downcase == ($t.device_path | ascii_downcase)) | .key]
+     | if length == 0 then "-" else join(",") end) ]
+| join("  ") | gsub("[[:cntrl:]]"; " ")
+'
+
+harness_displays() {
+    local force=0 aliases='' arg name gdi encoded rc out dir displays monitors fetched new old merged
+    local stale shared absent written
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        --alias)
+            need_value "$1" $#
+            arg=$2
+            name=${arg%%=*}
+            gdi=${arg#*=}
+            [ "$name" != "$arg" ] || usage_error "harness displays: --alias takes NAME=DISPLAYn"
+            is_alias "$name" || usage_error "harness displays: an alias matches ^[a-z0-9][a-z0-9_-]{0,31}\$: $name"
+            case "$gdi" in
+            DISPLAY[0-9] | DISPLAY[0-9][0-9]) ;;
+            *) usage_error "harness displays: name the display by its GDI name now, DISPLAYn: $gdi" ;;
+            esac
+            aliases="$aliases$name=$gdi$NL"
+            shift
+            ;;
+        *) usage_error "harness displays: unknown argument $1" ;;
+        esac
+        shift
+    done
+    [ -x /usr/bin/jq ] || die "harness displays needs /usr/bin/jq"
+    # PC details: .dogfood/ only (CLAUDE.md), readable by this account alone.
+    dir="$REPO_ROOT/.dogfood/pc"
+    displays="$dir/displays.json"
+    monitors="$dir/monitors.json"
+    new=$(printf '%s' "$aliases" | /usr/bin/jq -R -s 'split("\n") | map(select(length > 0) | split("=") | {(.[0]): .[1]}) | add // {}') ||
+        die "harness displays: bad --alias values"
+    # An alias names a display from a table someone has read.
+    if [ "$new" != '{}' ] && [ ! -f "$displays" ]; then
+        die "harness displays: run it once without --alias and read its table first" 2
+    fi
+    encoded=$(printf '%s' "$HARNESS_DISPLAYS_JOB" | /usr/bin/base64 | tr -d '\n') || die "base64 failed"
+    pre_reset
+    pre_bool Force "$force"
+    pre_str JobB64 "$encoded"
+    say "job harness-displays (kairo-harness displays, max_seconds 30)"
+    run_ps run
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    pre_reset
+    pre_bool Force "$force"
+    pre_str Id harness-displays
+    pre_str File "$HARNESS_DISPLAYS_FILE"
+    run_ps harness-fetch
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    out=$(kv_get out)
+    [ -n "$out" ] || die "harness displays: the PC sent no file"
+    (umask 077 && mkdir -p "$dir") || die "cannot create $dir"
+    # Decoded beside its target, never in the shared temp folder, then moved into place whole.
+    fetched=$(mktemp "$dir/.displays.json.XXXXXX") || die "mktemp failed"
+    register_temp "$fetched"
+    printf '%s' "$out" | /usr/bin/base64 -D >"$fetched" 2>/dev/null || die "harness displays: the file isn't Base64"
+    /usr/bin/jq -e '.kairo_displays == 1 and (.targets | type) == "array"' "$fetched" >/dev/null 2>&1 ||
+        die "harness displays: the file isn't displays.json version 1"
+    [ "$(/usr/bin/jq '.targets | length' "$fetched")" -gt 0 ] ||
+        die "harness displays: the PC reports no active display (screens off or asleep?); the old files stay"
+    if [ "$new" != '{}' ]; then
+        stale=$(/usr/bin/jq -r -n --slurpfile prev "$displays" --slurpfile cur "$fetched" --argjson new "$new" "$JQ_STALE") ||
+            die "harness displays: cannot compare the tables"
+        [ -z "$stale" ] ||
+            die "harness displays: $stale names another display than in the last table; run it without --alias, read the table and run again" 2
+    fi
+    mv -f "$fetched" "$displays" || die "cannot write $displays"
+    old=null
+    [ ! -f "$monitors" ] || old=$(cat "$monitors")
+    if ! merged=$(/usr/bin/jq -n --slurpfile d "$displays" --argjson m "$old" --argjson new "$new" "$JQ_MONITORS" 2>&1); then
+        say "kept ${displays#"$REPO_ROOT"/}; ${monitors#"$REPO_ROOT"/} is unchanged:"
+        /usr/bin/jq -r -n --slurpfile d "$displays" --argjson m "$old" "$JQ_DISPLAY_TABLE" | sed 's/^/  /'
+        die "harness displays: $(printf '%s' "$merged" | sed 's/^jq: error[^:]*: //')"
+    fi
+    shared=$(printf '%s' "$merged" | /usr/bin/jq -r "$JQ_SHARED") || die "harness displays: cannot read the aliases"
+    [ -z "$shared" ] || die "harness displays: $shared would name the same display; ${monitors#"$REPO_ROOT"/} is unchanged" 2
+    written=$(mktemp "$dir/.monitors.json.XXXXXX") || die "mktemp failed"
+    register_temp "$written"
+    printf '%s\n' "$merged" >"$written" || die "cannot write $monitors"
+    mv -f "$written" "$monitors" || die "cannot write $monitors"
+    say "kept ${displays#"$REPO_ROOT"/} and ${monitors#"$REPO_ROOT"/}:"
+    /usr/bin/jq -r -n --slurpfile d "$displays" --argjson m "$merged" "$JQ_DISPLAY_TABLE" | sed 's/^/  /'
+    absent=$(/usr/bin/jq -r -n --slurpfile d "$displays" --argjson m "$merged" "$JQ_ABSENT" | tr '\n' ' ')
+    [ -z "$absent" ] || say "not active now, kept: ${absent% }"
+    if [ "$(printf '%s' "$merged" | /usr/bin/jq '.aliases | length')" = 0 ]; then
+        say "no aliases yet: run again with --alias 180hz=DISPLAYn (and --alias oled=DISPLAYm)"
+    fi
+    return 0
+}
+
+cmd_harness() {
+    [ $# -gt 0 ] || usage_error "harness: name a verb (this version has: displays)"
+    local verb=$1
+    shift
+    case "$verb" in
+    displays) harness_displays "$@" ;;
+    *) usage_error "harness: unknown verb $verb (this version has: displays)" ;;
+    esac
+}
+
 # --- logs, cli, ssh ------------------------------------------------------------------------
 cmd_logs() {
     local force=0 tail='' id=''
@@ -768,6 +948,7 @@ deploy) cmd_deploy "$@" ;;
 rollback) cmd_rollback "$@" ;;
 run) cmd_run "$@" ;;
 logs) cmd_logs "$@" ;;
+harness) cmd_harness "$@" ;;
 cli) cmd_cli "$@" ;;
 ssh) cmd_ssh "$@" ;;
 help | -h | --help) usage ;;

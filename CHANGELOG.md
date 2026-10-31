@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kairo-core` pattern v1, the test signal the testbed draws and `kairo-verify` reads back: a block barcode with a CRC-16, whitened so no cell holds a level for long, moving bars, a grey ramp, a flash, drifting patches, a load band, a motion variant without barcodes or flash, −30 dBFS tone bursts, BT.709 and 4:2:0 maths, and the PQ and BT.2390 curves for HDR patches (#18).
 - `kairo-core` testbed and tone logs (ground truth written by `testbed.exe` and `kairo-tone.exe` in QPC time) and per-step cadence in any content unit at any output rate, with the judder-step rule (#19).
 - `kairo-verify`, the clip checker, with its own MP4, H.264 and AAC header parser and the structure checks: moov first, no edit list, `colr`, the parameter sets, CFR, start alignment, no reordering, IDR at 0, the closed 1 s GOP, the track layout, AAC LC at 48 kHz, durations, one encoder session, bitrate, and the export limits that need no decoding; profiles, a versioned JSON report naming the file only, exit codes, and `boxes` (#20).
+- `kairo-display`, the monitor by its device path and the adapter by its LUID for M1's Windows programs (display configuration API and DXGI: GDI name, rectangle, refresh rate, HDR state, mirroring, adapter index and PCI ids), and `kairo-harness displays` with `pc harness displays`, which keeps what it finds and the monitor aliases in `.dogfood/pc/` and refuses an alias whose GDI number moved or whose display is mirrored (#21).
 
 ### Changed
 
