@@ -258,7 +258,7 @@ fn header(head: &[u8]) -> Result<Header, String> {
 
 /// How many fixed bytes come before a box's children, or `None` if it holds no boxes this
 /// reader follows.
-fn children_start(kind: &[u8; 4], payload: &Bytes<'_>) -> Option<usize> {
+pub(crate) fn children_start(kind: &[u8; 4], payload: &Bytes<'_>) -> Option<usize> {
     match kind {
         b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"dinf" | b"edts" | b"udta" | b"mvex"
         | b"moof" | b"traf" | b"tref" | b"ilst" => Some(0),

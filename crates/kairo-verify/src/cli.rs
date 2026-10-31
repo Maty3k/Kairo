@@ -4,15 +4,18 @@
 //!
 //! Exit codes for `check`: 0 pass (warnings allowed), 1 fail, 2 usage, 3 cannot evaluate (not
 //! an MP4, no H.264 track, unreadable, a non-UTF-8 file name, or a required check this build
-//! can't run), 4 internal (the report couldn't be written). Messages and reports name the file
-//! only.
+//! can't run), 4 internal (the report couldn't be written). For `mutate`: 0 written, 1 the change
+//! doesn't apply to this clip, 2 usage, 3 the input can't be read or rebuilt, 4 the output can't
+//! be written (it never replaces an existing file). Messages and reports name the file only.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::expect::Expect;
+use crate::mutate::{MutateError, Op};
 use crate::profile::{Plan, Profile};
 use crate::{Clip, boxes};
 
@@ -21,6 +24,8 @@ pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
                     [--decoder none] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
+       kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
+                           |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
 This build checks structure only; the content checks and the linked and cli decoders come later.";
@@ -44,6 +49,11 @@ enum Command {
         summary: Option<Output>,
     },
     Boxes(PathBuf),
+    Mutate {
+        op: Op,
+        input: PathBuf,
+        output: PathBuf,
+    },
     Version,
     Help,
 }
@@ -96,6 +106,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
                 _ => Err(format!("boxes takes one clip\n{USAGE}")),
             };
         }
+        Some("mutate") => return parse_mutate(rest),
         Some("check") => {}
         _ => return Err(format!("unknown command {}\n{USAGE}", shown(verb))),
     }
@@ -168,6 +179,66 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         json,
         summary,
     })
+}
+
+/// A whole number from the command line.
+fn number<T: FromStr>(word: &OsStr, what: &str) -> Result<T, String> {
+    word.to_str()
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(|| format!("{what}, not {}\n{USAGE}", shown(word)))
+}
+
+/// `mutate OP [VALUES] IN OUT`.
+fn parse_mutate(rest: &[OsString]) -> Result<Command, String> {
+    let usage = || format!("mutate takes a change, its values, the input and the output\n{USAGE}");
+    let Some((name, rest)) = rest.split_first() else {
+        return Err(usage());
+    };
+    let (op, files) = match (name.to_str(), rest) {
+        (Some("undo-faststart"), files) => (Op::UndoFaststart, files),
+        (Some("add-elst"), files) => (Op::AddElst, files),
+        (Some("remove-colr"), files) => (Op::RemoveColr, files),
+        (Some("set-colr"), [p, t, m, r, files @ ..]) => {
+            let code = "set-colr's P, T and M are codes from 0 to 65535";
+            let full_range = match r.to_str() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => return Err(format!("set-colr's R is 0 or 1\n{USAGE}")),
+            };
+            let op = Op::SetColr {
+                primaries: number(p, code)?,
+                transfer: number(t, code)?,
+                matrix: number(m, code)?,
+                full_range,
+            };
+            (op, files)
+        }
+        (Some("set-default"), [title, files @ ..]) => {
+            let title = title
+                .to_str()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| format!("set-default takes a track title\n{USAGE}"))?;
+            (Op::SetDefault(title.to_owned()), files)
+        }
+        (Some("perturb-stts"), [sample, ticks, files @ ..]) => {
+            let sample = number(sample, "perturb-stts's S is a sample number from 1")?;
+            let ticks = number(ticks, "perturb-stts's D is a number of ticks from 1")?;
+            if sample == 0 || ticks == 0 {
+                return Err(format!("perturb-stts's S and D start at 1\n{USAGE}"));
+            }
+            (Op::PerturbStts { sample, ticks }, files)
+        }
+        (Some("set-colr" | "set-default" | "perturb-stts"), _) => return Err(usage()),
+        _ => return Err(format!("unknown change {}\n{USAGE}", shown(name))),
+    };
+    match files {
+        [input, output] if !input.is_empty() && !output.is_empty() => Ok(Command::Mutate {
+            op,
+            input: PathBuf::from(input),
+            output: PathBuf::from(output),
+        }),
+        _ => Err(usage()),
+    }
 }
 
 /// The file's name for messages and reports, or `None` if it isn't UTF-8.
@@ -274,6 +345,54 @@ fn show_boxes(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     }
 }
 
+fn mutate_file(
+    op: &Op,
+    input: &Path,
+    output: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let (Some(in_name), Some(out_name)) = (file_name(input), file_name(output)) else {
+        say(err, "the file names must be UTF-8");
+        return 3;
+    };
+    let mut source = match File::open(input) {
+        Ok(file) => file,
+        Err(error) => {
+            say(err, &format!("{in_name}: {error}"));
+            return 3;
+        }
+    };
+    // Never over an existing file, the input included.
+    let file = match File::create_new(output) {
+        Ok(file) => file,
+        Err(error) => {
+            say(err, &format!("{out_name}: {error}"));
+            return 4;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let result = crate::mutate::mutate(&mut source, op, &mut writer)
+        .and_then(|()| writer.flush().map_err(MutateError::Write));
+    match result {
+        Ok(()) => {
+            let _ = writeln!(out, "{out_name}: {in_name} with {op}");
+            0
+        }
+        Err(error) => {
+            drop(writer);
+            let _ = std::fs::remove_file(output);
+            let name = if matches!(error, MutateError::Write(_)) {
+                out_name
+            } else {
+                in_name
+            };
+            say(err, &format!("{name}: {error}"));
+            error.exit_code()
+        }
+    }
+}
+
 /// Runs the command line `args` (without the program name), writing to `out` and `err`, and
 /// returns the exit code.
 pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -287,6 +406,7 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             0
         }
         Ok(Command::Boxes(path)) => show_boxes(&path, out, err),
+        Ok(Command::Mutate { op, input, output }) => mutate_file(&op, &input, &output, out, err),
         Ok(command) => check(command, out, err),
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -324,6 +444,40 @@ mod tests {
                 summary: Some(Output::File(PathBuf::from("s.txt"))),
             })
         );
+        let mutate = |line: &str, op: Op| {
+            assert_eq!(
+                parse_args(&args(line)),
+                Ok(Command::Mutate {
+                    op,
+                    input: PathBuf::from("in.mp4"),
+                    output: PathBuf::from("out.mp4"),
+                }),
+                "{line}"
+            );
+        };
+        mutate("mutate undo-faststart in.mp4 out.mp4", Op::UndoFaststart);
+        mutate("mutate add-elst in.mp4 out.mp4", Op::AddElst);
+        mutate("mutate remove-colr in.mp4 out.mp4", Op::RemoveColr);
+        mutate(
+            "mutate set-colr 6 6 6 1 in.mp4 out.mp4",
+            Op::SetColr {
+                primaries: 6,
+                transfer: 6,
+                matrix: 6,
+                full_range: true,
+            },
+        );
+        mutate(
+            "mutate set-default Game in.mp4 out.mp4",
+            Op::SetDefault("Game".to_owned()),
+        );
+        mutate(
+            "mutate perturb-stts 100 128 in.mp4 out.mp4",
+            Op::PerturbStts {
+                sample: 100,
+                ticks: 128,
+            },
+        );
         assert!(matches!(
             parse_args(&args(
                 "check --profile test --expect e.json --decoder none c.mp4"
@@ -346,6 +500,19 @@ mod tests {
             "check a.mp4 --profile",
             "boxes",
             "boxes a b",
+            "mutate",
+            "mutate add-elst",
+            "mutate add-elst a.mp4",
+            "mutate add-elst a.mp4 b.mp4 c.mp4",
+            "mutate frobnicate a.mp4 b.mp4",
+            "mutate set-colr 1 1 1 a.mp4 b.mp4",
+            "mutate set-colr 1 1 1 2 a.mp4 b.mp4",
+            "mutate set-colr 1 1 70000 0 a.mp4 b.mp4",
+            "mutate set-colr -1 1 1 0 a.mp4 b.mp4",
+            "mutate set-default a.mp4 b.mp4",
+            "mutate perturb-stts 0 128 a.mp4 b.mp4",
+            "mutate perturb-stts 100 0 a.mp4 b.mp4",
+            "mutate perturb-stts 100 a.mp4 b.mp4",
             "synth --preset 1080p60",
             "--version extra",
         ] {

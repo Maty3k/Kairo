@@ -959,6 +959,61 @@ mod cli {
     }
 
     #[test]
+    fn mutate_writes_a_new_file_and_never_replaces_one() {
+        let dir = Dir::new();
+        let good = dir.file("good.mp4", &Spec::good().build());
+        let out = dir.0.join("nocolr.mp4");
+        let (code, said, err) = run(&[
+            os("mutate"),
+            os("remove-colr"),
+            good.as_os_str(),
+            out.as_os_str(),
+        ]);
+        assert_eq!((code, err.as_str()), (0, ""), "{said}");
+        assert_eq!(said, "nocolr.mp4: good.mp4 with remove-colr\n");
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(written, Spec::with(|s| s.colr = Vec::new()).build());
+        // An existing output is never replaced, the input included.
+        for target in [&out, &good] {
+            let before = std::fs::read(target).unwrap();
+            let (code, _, err) = run(&[
+                os("mutate"),
+                os("add-elst"),
+                good.as_os_str(),
+                target.as_os_str(),
+            ]);
+            assert_eq!(code, 4, "{err}");
+            assert_eq!(std::fs::read(target).unwrap(), before);
+        }
+        // A change that doesn't apply exits 1 and leaves no file behind.
+        let again = dir.0.join("again.mp4");
+        let (code, _, err) = run(&[
+            os("mutate"),
+            os("remove-colr"),
+            out.as_os_str(),
+            again.as_os_str(),
+        ]);
+        assert_eq!(code, 1, "{err}");
+        assert!(
+            err.starts_with("kairo-verify: nocolr.mp4: the change doesn't apply"),
+            "{err}"
+        );
+        assert!(!again.exists());
+        // Unreadable input exits 3; no folder appears in any message.
+        let missing = dir.0.join("missing.mp4");
+        let (code, _, err) = run(&[
+            os("mutate"),
+            os("add-elst"),
+            missing.as_os_str(),
+            again.as_os_str(),
+        ]);
+        assert_eq!(code, 3, "{err}");
+        assert!(!again.exists());
+        let folder = dir.0.to_string_lossy().into_owned();
+        assert!(!err.contains(&folder), "{err}");
+    }
+
+    #[test]
     fn check_writes_reports_and_exits_by_verdict() {
         let dir = Dir::new();
         let good = dir.file("good.mp4", &Spec::good().build());
