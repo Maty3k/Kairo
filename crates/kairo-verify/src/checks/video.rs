@@ -131,7 +131,7 @@ fn checked_fields(sps: &Sps) -> impl PartialEq + use<> {
 }
 
 /// The lowest level whose limits cover `width`×`height` at `fps` (Table A-1).
-fn level_needed(width: u32, height: u32, fps: (u64, u64)) -> Option<u8> {
+pub(crate) fn level_needed(width: u32, height: u32, fps: (u64, u64)) -> Option<u8> {
     let (w, h) = (
         u64::from(width.div_ceil(16)),
         u64::from(height.div_ceil(16)),
@@ -153,10 +153,14 @@ fn level_needed(width: u32, height: u32, fps: (u64, u64)) -> Option<u8> {
 /// C4: the VUI agrees with `colr`, and the parameter sets are what Kairo encodes.
 pub(crate) fn params(ctx: &Ctx<'_>) -> Outcome {
     let profile = ctx.plan.profile;
+    // The CI corpus's lossless I_PCM clips are CAVLC, and their expect file says so (README §7.2;
+    // `Plan::new` allows that under the test profile only). Kairo encodes CABAC.
+    let want_cabac = ctx.plan.expect.as_ref().and_then(|e| e.cabac) != Some(false);
+    let entropy = |cabac: bool| if cabac { "CABAC" } else { "CAVLC" };
     let mut outcome = Outcome {
         limit: json!({
             "profile": "High (100)", "chroma": "4:2:0", "bit_depth": 8, "progressive": true,
-            "entropy": "CABAC", "sar": "1:1", "vui_colour": "= colr",
+            "entropy": entropy(want_cabac), "sar": "1:1", "vui_colour": "= colr",
             "source": "research 09:558, CB:486, research 13:801, container.md §6 C4"
         }),
         ..Outcome::default()
@@ -300,7 +304,9 @@ pub(crate) fn params(ctx: &Ctx<'_>) -> Outcome {
     outcome.require(sps.frame_mbs_only, || {
         "interlaced coding (frame_mbs_only 0)".to_owned()
     });
-    outcome.require(pps.cabac, || "CAVLC; want CABAC".to_owned());
+    outcome.require(pps.cabac == want_cabac, || {
+        format!("{}; want {}", entropy(pps.cabac), entropy(want_cabac))
+    });
     // 5. One size everywhere, even.
     let tkhd = ctx.video.tkhd.map(|t| (t.width, t.height));
     let entry_size = (u32::from(*width), u32::from(*height));
@@ -365,8 +371,11 @@ pub(crate) fn params(ctx: &Ctx<'_>) -> Outcome {
         "inband_sps": ctx.clip.scan.as_ref().map(|s| s.inband_sps),
     });
     outcome.detail = format!(
-        "High {}x{} level {}, 4:2:0 8-bit, CABAC",
-        sps.width, sps.height, sps.level_idc
+        "High {}x{} level {}, 4:2:0 8-bit, {}",
+        sps.width,
+        sps.height,
+        sps.level_idc,
+        entropy(pps.cabac)
     );
     outcome
 }

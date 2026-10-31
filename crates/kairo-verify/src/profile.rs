@@ -407,6 +407,12 @@ impl Plan {
         if gate_m3 && profile != Profile::Engine {
             return Err(PlanError("--gate m3 goes with --profile engine".to_owned()));
         }
+        if profile != Profile::Test && expect.as_ref().is_some_and(|e| e.cabac == Some(false)) {
+            return Err(PlanError(
+                "cabac: false is for the test profile's lossless I_PCM clips (README §7.2); Kairo encodes CABAC"
+                    .to_owned(),
+            ));
+        }
         let roles = |e: &Expect| {
             Layout::Exact(
                 e.tracks

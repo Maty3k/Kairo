@@ -26,7 +26,9 @@
 //!
 //! [`mutate`] makes the bad clips that are one box-level change from a good one (README §7.3):
 //! moov after the media, an edit list, a wrong or missing `colr`, a second default track, and
-//! one uneven frame.
+//! one uneven frame. [`synth`] renders pattern v1 for an encoder, as raw NV12 or as [`ipcm`]'s
+//! lossless I_PCM H.264, with the defects that live in the pictures and the clip's expect file
+//! (README §7.1–7.3).
 
 #![forbid(unsafe_code)]
 
@@ -40,11 +42,13 @@ mod content_tests;
 pub mod decode;
 pub mod expect;
 pub mod h264;
+pub mod ipcm;
 pub mod mp4;
 pub mod mutate;
 pub mod profile;
 pub mod report;
 pub mod scan;
+pub mod synth;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
