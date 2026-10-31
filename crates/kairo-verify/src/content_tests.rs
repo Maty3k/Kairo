@@ -7,7 +7,7 @@
 use kairo_core::testsig::{Curve, Load, Matrix, Options, Patches, Pattern, Range, Size};
 
 use crate::checks::Status;
-use crate::decode::synthetic::{Damage, Synthetic};
+use crate::decode::synthetic::{Damage, Sound, Synthetic, SyntheticAudio};
 use crate::expect::Expect;
 use crate::profile::{Plan, Profile};
 use crate::testkit::Spec;
@@ -25,15 +25,62 @@ fn options() -> Options {
     }
 }
 
+/// The tones of gate 1's layout on the builder's three tracks: the Mix carries the game beep and
+/// the mic marker, the Game track the beep, the Mic track the marker (README §6.4).
+const TONES: [&str; 3] = [
+    r#"{"game":"present","voice":"absent","mic":"present","cue":"absent"}"#,
+    r#"{"game":"present","voice":"absent","mic":"absent","cue":"absent"}"#,
+    r#"{"game":"absent","voice":"absent","mic":"present","cue":"absent"}"#,
+];
+
 fn plan(profile: Profile, run_tag: u32) -> Plan {
+    let [mix, game, mic] = TONES;
     let text = format!(
         r#"{{"kairo_expect":1,"pattern":1,"size":[320,180],"fps":60,"source_hz":180,"seconds":2,
             "run_tag":{run_tag},"tracks":[
-            {{"title":"Mix","channels":2,"default":true}},
-            {{"title":"Game","channels":2,"default":false}},
-            {{"title":"Mic","channels":1,"default":false}}]}}"#
+            {{"title":"Mix","channels":2,"default":true,"tones":{mix}}},
+            {{"title":"Game","channels":2,"default":false,"tones":{game}}},
+            {{"title":"Mic","channels":1,"default":false,"tones":{mic}}}]}}"#
     );
     Plan::new(profile, false, Some(Expect::parse(&text).unwrap())).unwrap()
+}
+
+/// Where the builder's 60 fps clip shows testbed frame `n` under [`content`]'s mapping, in
+/// seconds: frame k ≥ 1 at (328 + 256k) / 15360 shows 1000 + 3k.
+fn shown_at(n: f64) -> f64 {
+    (328.0 + 256.0 * (n - 1_000.0) / 3.0) / 15_360.0
+}
+
+/// Audio for `spec`'s tracks, as long as their packets: with `beeps`, the game beep at each
+/// flash (testbed frame 180·m) in the Mix and Game tracks and the mic marker 250 ms later in the
+/// Mix and Mic tracks, each `late` seconds late; silence otherwise.
+fn audio(spec: &Spec, beeps: bool, late: f64) -> Vec<SyntheticAudio> {
+    let flashes: Vec<f64> = (6..=7).map(|m| shown_at(180.0 * f64::from(m))).collect();
+    spec.audio
+        .iter()
+        .map(|track| {
+            let mut sounds = Vec::new();
+            let (game, mic) = match track.title.as_str() {
+                "Mix" => (true, true),
+                "Game" => (true, false),
+                "Mic" => (false, true),
+                _ => (false, false),
+            };
+            for &t in flashes.iter().filter(|_| beeps) {
+                if game {
+                    sounds.push((Sound::Beep(1_000.0), t + late, 0.0));
+                }
+                if mic {
+                    sounds.push((Sound::Beep(3_000.0), t + 0.25 + late, 0.0));
+                }
+            }
+            SyntheticAudio {
+                frames: track.deltas.len() * 1_024,
+                sounds,
+                noise_db: None,
+            }
+        })
+        .collect()
 }
 
 /// Output frame k showing 180 fps content: testbed frame 3k, from a clip-start offset.
@@ -42,8 +89,10 @@ fn content() -> Vec<u64> {
 }
 
 fn run(content: Vec<u64>, damage: Damage, options: Options, plan: &Plan) -> Report {
-    let bytes = Spec::good().build();
-    let mut decoder = Synthetic::new(Size::new(320, 180).unwrap(), options, content, damage);
+    let spec = Spec::good();
+    let bytes = spec.build();
+    let mut decoder = Synthetic::new(Size::new(320, 180).unwrap(), options, content, damage)
+        .with_audio(audio(&spec, true, 0.0));
     check_with(&mut bytes.as_slice(), "clip.mp4", plan, Some(&mut decoder))
 }
 
@@ -99,8 +148,22 @@ fn a_good_clip_passes_every_content_check_this_build_runs() {
         report.summary.content,
         "120/120 barcodes, 0 skipped, 0 repeats, judder excess 0.0 pp, bars min 59.5 dB"
     );
-    // Audio comes later: `test` can't pass yet.
-    assert_eq!(status(&report, "av.offset"), Status::Error);
+    // The audio too: every check `test` runs passes, so the clip does.
+    for id in [
+        "av.offset",
+        "av.inter_track",
+        "audio.tone_snr",
+        "audio.routing",
+        "audio.cue",
+    ] {
+        assert_eq!(
+            status(&report, id),
+            Status::Pass,
+            "{id}: {}",
+            report.to_text()
+        );
+    }
+    assert_eq!(report.verdict, crate::Verdict::Pass, "{}", report.to_text());
     // Noise and scaling don't stop the barcodes, cadence or flash. The bars are stricter:
     // ±6 codes of noise alone is about 37 dB, under the 40 dB a recording must keep.
     let damage = Damage {
@@ -360,7 +423,8 @@ fn run_spec(
     plan: &Plan,
 ) -> Report {
     let bytes = spec.build();
-    let mut decoder = Synthetic::new(Size::new(320, 180).unwrap(), options, content, damage);
+    let mut decoder = Synthetic::new(Size::new(320, 180).unwrap(), options, content, damage)
+        .with_audio(audio(spec, false, 0.0));
     check_with(&mut bytes.as_slice(), "clip.mp4", plan, Some(&mut decoder))
 }
 
@@ -437,13 +501,96 @@ fn stalled_and_backward_clips_fail_drops_dups() {
 }
 
 #[test]
+fn each_audio_defect_fails_its_own_check() {
+    // README §7.3's audio defects on the builder's Mix, Game and Mic: each fails its own check
+    // and nothing else.
+    type Change = fn(&mut [SyntheticAudio]);
+    let defects: [(&str, Change, &[&str]); 6] = [
+        (
+            "audio 50 ms late",
+            |tracks| {
+                for t in tracks {
+                    for s in &mut t.sounds {
+                        s.1 += 0.050;
+                    }
+                }
+            },
+            &["av.offset"],
+        ),
+        (
+            "the Game and Mic tracks swapped",
+            |tracks| {
+                let (game, mic) = (tracks[1].sounds.clone(), tracks[2].sounds.clone());
+                tracks[1].sounds = mic;
+                tracks[2].sounds = game;
+            },
+            &["audio.routing"],
+        ),
+        (
+            "the cue in the Mix",
+            |tracks| {
+                let at = shown_at(1_080.0) + 0.75;
+                tracks[0].sounds.push((Sound::Cue, at, 0.0));
+            },
+            &["audio.cue"],
+        ),
+        (
+            "the voice tone leaking into Game at −40 dBFS",
+            |tracks| {
+                let at = shown_at(1_080.0) + 0.5;
+                tracks[1].sounds.push((Sound::Beep(2_000.0), at, -10.0));
+            },
+            &["audio.routing"],
+        ),
+        (
+            "noise at −55 dBFS RMS in Game",
+            |tracks| {
+                tracks[1].noise_db = Some(-55.0);
+            },
+            &["audio.tone_snr"],
+        ),
+        (
+            "Game 1 ms behind the Mix",
+            |tracks| {
+                for s in &mut tracks[1].sounds {
+                    s.1 += 0.001;
+                }
+            },
+            &["av.inter_track"],
+        ),
+    ];
+    let spec = Spec::good();
+    let bytes = spec.build();
+    for (name, change, fails) in defects {
+        let mut tracks = audio(&spec, true, 0.0);
+        change(&mut tracks);
+        let mut decoder = Synthetic::new(
+            Size::new(320, 180).unwrap(),
+            options(),
+            content(),
+            Damage::default(),
+        )
+        .with_audio(tracks);
+        let report = check_with(
+            &mut bytes.as_slice(),
+            "clip.mp4",
+            &plan(Profile::Test, 5),
+            Some(&mut decoder),
+        );
+        assert_eq!(failing(&report), fails, "{name}: {}", report.to_text());
+    }
+}
+
+#[test]
 fn a_clip_that_shows_the_pattern_is_held_to_every_required_check() {
     // Engine with no pattern named, but the pattern shows: the checks this build lacks are
     // errors, not skips (review F3).
     let report = run(content(), Damage::default(), options(), &engine_plan());
     assert_eq!(status(&report, "content.barcode"), Status::Pass);
     assert_eq!(status(&report, "content.bars"), Status::Pass);
-    assert_eq!(status(&report, "av.offset"), Status::Error);
+    assert_eq!(status(&report, "av.offset"), Status::Pass);
+    // source.stability reads the testbed log, which comes with research 16's PR 8.
+    assert_eq!(status(&report, "source.stability"), Status::Error);
     assert_eq!(
         report.verdict,
         crate::Verdict::Error,
@@ -921,5 +1068,176 @@ fn a_1080p_videotoolbox_clip_passes_the_line_rule() {
             "{id}: {}",
             report.to_text()
         );
+    }
+}
+
+/// Writes `samples` (interleaved at `channels`) as a 48 kHz float WAV.
+#[cfg(feature = "dev-tools")]
+fn write_wav(path: &std::path::Path, channels: u16, samples: &[f32]) {
+    let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let mut out = b"RIFF".to_vec();
+    out.extend((36 + data.len() as u32).to_le_bytes());
+    out.extend(b"WAVEfmt ");
+    out.extend(16_u32.to_le_bytes());
+    out.extend(3_u16.to_le_bytes());
+    out.extend(channels.to_le_bytes());
+    out.extend(48_000_u32.to_le_bytes());
+    out.extend((48_000 * 4 * u32::from(channels)).to_le_bytes());
+    out.extend((4 * channels).to_le_bytes());
+    out.extend(32_u16.to_le_bytes());
+    out.extend(b"data");
+    out.extend((data.len() as u32).to_le_bytes());
+    out.extend(data);
+    std::fs::write(path, out).unwrap();
+}
+
+/// Opt-in, as above: research 16 §7.2's two-step recipe with real AAC. An I_PCM clip from
+/// `synth`, stream-copied, then muxed with four tracks of beeps encoded by FFmpeg's `aac`: the
+/// game beep at each whole second, the mic marker 250 ms after it and the voice beep 500 ms
+/// after it. Every audio check passes, with the A/V offset within a millisecond: the decoded
+/// priming and the held first frame cancel (cookbook P8).
+#[cfg(feature = "dev-tools")]
+#[test]
+#[ignore = "needs KAIRO_FFMPEG"]
+fn an_aac_clip_passes_the_audio_checks() {
+    use std::process::{Command, Stdio};
+
+    use crate::synth::{Codec, Synth};
+
+    let ffmpeg = ffmpeg();
+    let dir = Scratch::new("aac");
+    let synth = Synth {
+        format: "480x270@60".parse().unwrap(),
+        source_hz: 180,
+        seconds: 4,
+        defect: None,
+        hdr: None,
+        codec: Codec::Ipcm { gop: 60 },
+    };
+    let mut child = Command::new(&ffmpeg)
+        .current_dir(&dir.0)
+        .args(["-hide_banner", "-nostdin", "-v", "error", "-y"])
+        .args(["-f", "h264", "-r", "60", "-i", "-", "-c:v", "copy"])
+        .args(["-color_primaries", "bt709", "-color_trc", "bt709"])
+        .args(["-colorspace", "bt709", "-color_range", "tv"])
+        .args([
+            "-an",
+            "-movflags",
+            "+faststart",
+            "-use_editlist",
+            "0",
+            "v.mp4",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    synth.write(&mut child.stdin.take().unwrap()).unwrap();
+    assert!(child.wait().unwrap().success());
+    // (title, channels, game, mic, voice)
+    let layout = [
+        ("Mix", 2_u16, true, true, true),
+        ("Game", 2, true, false, false),
+        ("Mic", 1, false, true, false),
+        ("Voice chat", 2, false, false, true),
+    ];
+    for (title, channels, game, mic, voice) in layout {
+        let mut sounds = Vec::new();
+        for m in 0..4 {
+            let t = f64::from(m);
+            if game {
+                sounds.push((Sound::Beep(1_000.0), t, 0.0));
+            }
+            if mic {
+                sounds.push((Sound::Beep(3_000.0), t + 0.25, 0.0));
+            }
+            if voice {
+                sounds.push((Sound::Beep(2_000.0), t + 0.5, 0.0));
+            }
+        }
+        let mono = SyntheticAudio {
+            frames: 4 * 48_000,
+            sounds,
+            noise_db: None,
+        }
+        .render();
+        let samples: Vec<f32> = mono
+            .iter()
+            .flat_map(|&v| std::iter::repeat_n(v, usize::from(channels)))
+            .collect();
+        write_wav(&dir.0.join(format!("{title}.wav")), channels, &samples);
+    }
+    let mut mux = Command::new(&ffmpeg);
+    mux.current_dir(&dir.0).args([
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        "v.mp4",
+    ]);
+    for (title, ..) in layout {
+        mux.arg("-i").arg(format!("{title}.wav"));
+    }
+    mux.args(["-map", "0:v"]);
+    for (i, (title, ..)) in layout.iter().enumerate() {
+        mux.args(["-map", &format!("{}:a", i + 1)]);
+        mux.arg(format!("-metadata:s:a:{i}"))
+            .arg(format!("title={title}"));
+        mux.arg(format!("-metadata:s:a:{i}"))
+            .arg(format!("handler_name={title}"));
+        mux.arg(format!("-disposition:a:{i}"))
+            .arg(if i == 0 { "default" } else { "0" });
+    }
+    mux.args([
+        "-c:v", "copy", "-c:a", "aac", "-b:a:0", "160k", "-b:a:1", "160k",
+    ])
+    .args(["-b:a:2", "128k", "-b:a:3", "160k"])
+    .args(["-movflags", "+faststart", "-use_editlist", "0", "clip.mp4"]);
+    assert!(mux.status().unwrap().success());
+    let tones = |game: &str, voice: &str, mic: &str| {
+        format!(r#"{{"game":"{game}","voice":"{voice}","mic":"{mic}","cue":"absent"}}"#)
+    };
+    let text = format!(
+        r#"{{"kairo_expect":1,"pattern":1,"size":[480,270],"fps":60,"source_hz":180,"seconds":4,
+            "run_tag":0,"cabac":false,"tracks":[
+            {{"title":"Mix","channels":2,"default":true,"tones":{}}},
+            {{"title":"Game","channels":2,"default":false,"tones":{}}},
+            {{"title":"Mic","channels":1,"default":false,"tones":{}}},
+            {{"title":"Voice chat","channels":2,"default":false,"tones":{}}}]}}"#,
+        tones("present", "present", "present"),
+        tones("present", "absent", "absent"),
+        tones("absent", "absent", "present"),
+        tones("absent", "present", "absent"),
+    );
+    let plan = Plan::new(Profile::Test, false, Some(Expect::parse(&text).unwrap())).unwrap();
+    let clip = dir.0.join("clip.mp4");
+    let mut decoder = crate::decode::cli::Cli::new(&ffmpeg, &clip);
+    let mut file = std::fs::File::open(&clip).unwrap();
+    let report = check_with(&mut file, "clip.mp4", &plan, Some(&mut decoder));
+    for id in [
+        "decode.clean",
+        "av.offset",
+        "av.inter_track",
+        "audio.tone_snr",
+        "audio.routing",
+        "audio.cue",
+    ] {
+        assert_eq!(
+            status(&report, id),
+            Status::Pass,
+            "{id}: {}",
+            report.to_text()
+        );
+    }
+    let offsets = report
+        .checks
+        .iter()
+        .find(|f| f.id == "av.offset")
+        .and_then(|f| f.value.get("tracks")?.as_array().cloned())
+        .unwrap();
+    for track in offsets.iter().filter(|t| t["measured"] == true) {
+        let median = track["median_ms"].as_f64().unwrap();
+        assert!(median.abs() < 1.0, "{track}");
     }
 }

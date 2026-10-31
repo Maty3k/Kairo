@@ -1200,11 +1200,12 @@ mod cli {
             os("a.mp4"),
             os("--profile"),
             os("engine"),
-            os("--av-tight"),
+            os("--testbed-log"),
+            os("t.log"),
         ]);
         assert_eq!(code, 2);
         assert!(
-            err.contains("--av-tight comes with the audio and A/V checks (research 16's PR 5)"),
+            err.contains("--testbed-log comes with source.stability and the testbed and tone logs (research 16's PR 8)"),
             "{err}"
         );
     }

@@ -9,13 +9,14 @@
 //! Given a [`decode::Decoder`] ([`check_with`]), it also reads pattern v1 in the decoded
 //! pictures: each frame's barcode and flash, the testbed frame numbers, and from them
 //! `decode.clean` (video), `content.barcode`, `cadence.drops_dups`, `cadence.judder`,
-//! `content.flash`, the bars (`content.bars`, `content.colour_matrix`, `content.bars_lines`) and
-//! the grey patches (`content.levels`, `hdr.curve_levels`) (README §6.3). The audio checks come
-//! with research 16's PR 5, and `source.stability`, which reads the testbed log, with its PR 8.
-//! Until then `test` and `engine` clips that show the pattern (or must), pattern-bearing exports
-//! and `--gate m3`, whose list holds A/V, end in `error`, and so does `capture`, on
-//! `source.stability`; `smoke` is judged on what runs, and so are clips without the pattern, such
-//! as a real game clip. A required check that can't be computed (no barcode line, a decoder that didn't start)
+//! `content.flash`, the bars (`content.bars`, `content.colour_matrix`, `content.bars_lines`), the
+//! grey patches (`content.levels`, `hdr.curve_levels`), and in each audio track's (L+R)/2 the
+//! beeps, against the pictures and each other: `av.offset`, `av.offset_tight`,
+//! `av.inter_track`, `audio.tone_snr`, `audio.routing` and `audio.cue` (README §6.3–6.4).
+//! `source.stability`, which reads the testbed log, comes with research 16's PR 8: until then
+//! `capture` and `engine` clips that show the pattern end in `error`; `test`, `smoke` and the
+//! exports are judged on what runs, and so are clips without the pattern, such as a real game
+//! clip. A required check that can't be computed (no barcode line, a decoder that didn't start)
 //! is an `error`, never a pass; a clip whose testbed frame never advances fails
 //! `cadence.drops_dups`.
 //!
@@ -53,6 +54,7 @@ pub mod synth;
 mod testkit;
 #[cfg(test)]
 mod tests;
+pub mod wav;
 
 use std::time::Instant;
 
@@ -194,7 +196,7 @@ pub fn check_with(
         Some(decoder) if clip.problems.is_empty() => {
             report.decoder.kind = decoder.kind();
             let decode_started = Instant::now();
-            let decoded = checks::decode(decoder, plan);
+            let decoded = checks::decode(decoder, plan, &checks::audio_channels(&clip));
             report.timings_ms.decode = decode_started.elapsed().as_millis() as u64;
             Some(decoded)
         }

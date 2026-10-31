@@ -6,6 +6,7 @@
 //! One pass over the decode keeps a few numbers per frame, never the pixels, so memory stays
 //! flat however long the clip is (README §6.7).
 
+pub mod audio;
 pub mod bars;
 pub mod cadence;
 pub mod flash;

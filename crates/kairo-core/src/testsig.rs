@@ -1110,30 +1110,39 @@ pub fn tone_burst(hz: f64, ms: u32, sample_rate: u32) -> Result<Vec<f32>, Patter
     if sample_rate == 0 {
         return Err(PatternError::SampleRate(sample_rate));
     }
-    let amplitude = 10_f64.powf(BEEP_PEAK_DBFS / 20.0);
     let rate = f64::from(sample_rate);
     let samples = u64::from(sample_rate) * u64::from(ms) / 1_000;
-    let length = f64::from(ms) / 1_000.0;
-    let ramp = (BEEP_RAMP_MS / 1_000.0).min(length / 2.0);
     Ok((0..samples)
-        .map(|i| {
-            let t = i as f64 / rate;
-            let envelope = if t < ramp {
-                0.5 - 0.5 * (std::f64::consts::PI * t / ramp).cos()
-            } else if t > length - ramp {
-                0.5 - 0.5 * (std::f64::consts::PI * (length - t) / ramp).cos()
-            } else {
-                1.0
-            };
-            (amplitude * envelope * (std::f64::consts::TAU * hz * t).sin()) as f32
-        })
+        .map(|i| tone_burst_at(hz, ms, i as f64 / rate) as f32)
         .collect())
+}
+
+/// [`tone_burst`]'s value `t` seconds after its onset, 0 outside it: for a burst that starts
+/// between two samples.
+pub fn tone_burst_at(hz: f64, ms: u32, t: f64) -> f64 {
+    let length = f64::from(ms) / 1_000.0;
+    if !(0.0..length).contains(&t) {
+        return 0.0;
+    }
+    let amplitude = 10_f64.powf(BEEP_PEAK_DBFS / 20.0);
+    let ramp = (BEEP_RAMP_MS / 1_000.0).min(length / 2.0);
+    let envelope = if t < ramp {
+        0.5 - 0.5 * (std::f64::consts::PI * t / ramp).cos()
+    } else if t > length - ramp {
+        0.5 - 0.5 * (std::f64::consts::PI * (length - t) / ramp).cos()
+    } else {
+        1.0
+    };
+    amplitude * envelope * (std::f64::consts::TAU * hz * t).sin()
 }
 
 /// One beep of `tone`: [`BEEP_MS`] long.
 pub fn beep(tone: Tone, sample_rate: u32) -> Result<Vec<f32>, PatternError> {
     tone_burst(f64::from(tone.hz()), BEEP_MS, sample_rate)
 }
+
+/// The placeholder cue's length, in ms.
+pub const CUE_MS: u32 = 220;
 
 /// A stand-in for Kairo's save cue until M4 defines it: 600 Hz for 100 ms, then 1,500 Hz for
 /// 120 ms, each with its own ramps. Its notes keep at least 200 Hz from every beep's frequency,
@@ -1142,6 +1151,15 @@ pub fn cue_placeholder(sample_rate: u32) -> Result<Vec<f32>, PatternError> {
     let mut samples = tone_burst(600.0, 100, sample_rate)?;
     samples.extend(tone_burst(1_500.0, 120, sample_rate)?);
     Ok(samples)
+}
+
+/// [`cue_placeholder`]'s value `t` seconds after its start, 0 outside it.
+pub fn cue_placeholder_at(t: f64) -> f64 {
+    if t < 0.1 {
+        tone_burst_at(600.0, 100, t)
+    } else {
+        tone_burst_at(1_500.0, 120, t - 0.1)
+    }
 }
 
 #[cfg(test)]
@@ -1799,6 +1817,35 @@ mod tests {
             let peak = envelope.iter().copied().fold(0.0, f64::max);
             assert!(peak > 0.99, "{ms} ms: peak {peak}");
         }
+    }
+
+    #[test]
+    fn bursts_between_samples_follow_the_sampled_ones() {
+        // The per-time functions give the sampled bursts, and are 0 outside them.
+        let beep = beep(Tone::Voice, 48_000).unwrap();
+        for (i, &x) in beep.iter().enumerate() {
+            assert_eq!(
+                tone_burst_at(2_000.0, BEEP_MS, i as f64 / 48_000.0) as f32,
+                x
+            );
+        }
+        let cue = cue_placeholder(48_000).unwrap();
+        assert_eq!(cue.len(), 48 * CUE_MS as usize);
+        // Up to the samples' f32 rounding: the second note's time is t − 0.1 here and
+        // (i − 4800) / 48000 there.
+        for (i, &x) in cue.iter().enumerate() {
+            let at = cue_placeholder_at(i as f64 / 48_000.0);
+            assert!((at - f64::from(x)).abs() < 1e-8, "{i}");
+        }
+        for t in [-1e-9, 0.1, 0.5] {
+            assert_eq!(tone_burst_at(1_000.0, BEEP_MS, t), 0.0);
+        }
+        assert_eq!(cue_placeholder_at(0.22), 0.0);
+        assert_eq!(cue_placeholder_at(-0.001), 0.0);
+        // Half a sample late: the same sine, shifted.
+        let t = 0.05 + 0.5 / 48_000.0;
+        let late = tone_burst_at(1_000.0, BEEP_MS, t - 0.5 / 48_000.0);
+        assert!((late - tone_burst_at(1_000.0, BEEP_MS, 0.05)).abs() < 1e-15);
     }
 
     #[test]
