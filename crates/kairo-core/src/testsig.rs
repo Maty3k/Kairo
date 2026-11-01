@@ -97,8 +97,10 @@ pub const BEEP_PEAK_DBFS: f64 = -30.0;
 pub const BEEP_MS: u32 = 100;
 /// Length of each raised-cosine ramp at a tone's ends, in ms.
 pub const BEEP_RAMP_MS: f64 = 2.0;
-/// Where in each second the placeholder cue starts in synthetic clips, in ms.
-pub const CUE_OFFSET_MS: u32 = 750;
+/// Where in each second the placeholder cue starts in synthetic clips, in ms: 100 ms after the
+/// voice beep ends, and ending 80 ms before the next second's game beep, already playing when
+/// the search for that beep opens 250 ms before it.
+pub const CUE_OFFSET_MS: u32 = 700;
 
 /// Why a frame or a tone could not be made.
 #[derive(Debug, Clone, PartialEq)]

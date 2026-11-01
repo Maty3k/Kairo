@@ -686,30 +686,60 @@ fn mutate_file(
     }
 }
 
-/// Writes a new file at `path` through `write`: under a temporary name first, then linked to
-/// `path`, which fails if something took the name meanwhile, so an interrupted run never leaves
-/// a cut file under it. Messages name the file (`name`) only.
-fn write_new(
-    path: &Path,
-    name: &str,
-    write: impl FnOnce(&mut File) -> std::io::Result<()>,
-) -> Result<(), String> {
-    let mut partial = path.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    let mut file = File::create_new(&partial).map_err(|e| format!("{name}.partial: {e}"))?;
-    let result = write(&mut file)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("{name}: {e}"));
-    drop(file);
-    let result = result
-        .and_then(|()| std::fs::hard_link(&partial, path).map_err(|e| format!("{name}: {e}")));
-    let _ = std::fs::remove_file(&partial);
-    result
+/// A new file reserved before anything is written: `NAME.partial` is made at once, filled later
+/// and then linked to `NAME`, which fails if something took that name meanwhile, so an
+/// interrupted run never leaves a cut file under it. Dropping it removes the temporary name.
+/// Messages name the file only.
+struct Reserved {
+    path: PathBuf,
+    partial: PathBuf,
+    name: String,
+    file: Option<File>,
 }
 
-/// `synth`: the frames to `out`; once every frame is out, the WAVs into `wav_dir` and then the
-/// expect file, each written under a temporary name and linked to its own.
+impl Reserved {
+    fn new(path: &Path, name: &str) -> Result<Self, String> {
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let file = File::create_new(&partial).map_err(|e| format!("{name}.partial: {e}"))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            partial,
+            name: name.to_owned(),
+            file: Some(file),
+        })
+    }
+
+    /// Fills it through `write` and links it to its own name.
+    fn finish(
+        &mut self,
+        write: impl FnOnce(&mut File) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        let name = self.name.clone();
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| format!("{name}: written already"))?;
+        write(&mut file)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{name}: {e}"))?;
+        drop(file);
+        std::fs::hard_link(&self.partial, &self.path).map_err(|e| format!("{name}: {e}"))
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        // The handle first: Windows can't remove an open file.
+        self.file = None;
+        let _ = std::fs::remove_file(&self.partial);
+    }
+}
+
+/// `synth`: every file it will write reserved first, so a name that is taken or a folder that
+/// can't be written stops it before any frame goes out; then the frames to `out`; then the WAVs
+/// into `wav_dir` and the expect file. If one of those fails, the files this run made go again.
 fn synth_file(
     synth: &Synth,
     expect: &Path,
@@ -733,7 +763,6 @@ fn synth_file(
         say(err, "the expect file must name a file, with a UTF-8 name");
         return 2;
     };
-    // Every file it will write must be new, and every folder there, before any frame goes out.
     let wavs: Vec<(AudioTrack, PathBuf)> = wav_dir
         .map(|dir| {
             AudioTrack::ALL
@@ -745,6 +774,27 @@ fn synth_file(
     if wav_dir.is_some_and(|dir| !dir.is_dir()) {
         say(err, "the --wav-dir folder doesn't exist");
         return 4;
+    }
+    let folder = expect
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !folder.is_dir() {
+        say(err, &format!("{name}: its folder doesn't exist"));
+        return 4;
+    }
+    if let Some(dir) = wav_dir {
+        let same_folder = matches!(
+            (std::fs::canonicalize(folder), std::fs::canonicalize(dir)),
+            (Ok(a), Ok(b)) if a == b
+        );
+        if same_folder && AudioTrack::ALL.iter().any(|t| t.file() == name) {
+            say(
+                err,
+                &format!("{name}: the expect file can't take a WAV's name"),
+            );
+            return 2;
+        }
     }
     let names = std::iter::once((name, expect)).chain(
         wavs.iter()
@@ -759,35 +809,45 @@ fn synth_file(
             return 4;
         }
     }
-    let folder = expect
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !folder.is_dir() {
-        say(err, &format!("{name}: its folder doesn't exist"));
-        return 4;
+    // Every name reserved before the frames: a leftover partial file or a folder that can't be
+    // written shows now, not after the encode.
+    let mut reserved = Vec::with_capacity(wavs.len() + 1);
+    for (track, path) in &wavs {
+        match Reserved::new(path, track.file()) {
+            Ok(file) => reserved.push((Some(*track), file)),
+            Err(message) => {
+                say(err, &message);
+                return 4;
+            }
+        }
+    }
+    match Reserved::new(expect, name) {
+        Ok(file) => reserved.push((None, file)),
+        Err(message) => {
+            say(err, &message);
+            return 4;
+        }
     }
     if let Err(error) = synth.write(out) {
         say(err, &error.to_string());
         return error.exit_code();
     }
-    // Then the WAVs and the expect file; if one fails, the files this run made go again.
-    let mut made: Vec<&Path> = Vec::new();
+    let mut made: Vec<PathBuf> = Vec::new();
     let mut result = Ok(());
-    for (track, path) in &wavs {
-        result = write_new(path, track.file(), |file| synth.write_wav(*track, file));
+    for (track, file) in &mut reserved {
+        result = match track {
+            Some(track) => file.finish(|f| synth.write_wav(*track, f)),
+            None => file.finish(|f| {
+                let text = serde_json::to_string_pretty(&synth.expect(wav_dir.is_some()))
+                    .map_err(std::io::Error::other)?;
+                f.write_all(format!("{text}\n").as_bytes())
+            }),
+        };
         if result.is_err() {
             break;
         }
-        made.push(path);
+        made.push(file.path.clone());
     }
-    let result = result.and_then(|()| {
-        write_new(expect, name, |file| {
-            let text = serde_json::to_string_pretty(&synth.expect(wav_dir.is_some()))
-                .map_err(std::io::Error::other)?;
-            file.write_all(format!("{text}\n").as_bytes())
-        })
-    });
     match result {
         Ok(()) => {
             let wavs = if wavs.is_empty() {

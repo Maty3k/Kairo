@@ -956,6 +956,10 @@ fn synth_audio_defects_fail_their_own_checks() {
             .map(|t| t["median_ms"].as_f64().unwrap())
             .collect();
         assert!(!measured.is_empty(), "{name}");
+        // Every track still timed beside a cue or noise: a defect may not blind the detector.
+        if !matches!(defect, Some(Defect::SwapGameVoice)) {
+            assert_eq!(measured.len(), 4, "{name}: {offsets:?}");
+        }
         for median in measured {
             assert!((median - late).abs() < 1.0, "{name}: {median} ms");
         }
@@ -1576,8 +1580,14 @@ fn aac_clips_from_synth_behave() {
         let tracks = offsets(&report);
         if name == "good" {
             assert_eq!(report.verdict, crate::Verdict::Pass, "{}", report.to_text());
+        }
+        // Every track still timed beside a cue or noise: a defect may not blind the detector.
+        if name != "swap-game-voice" {
             assert_eq!(tracks.len(), 4);
-            assert!(tracks.iter().all(|t| t["measured"] == true), "{tracks:?}");
+            assert!(
+                tracks.iter().all(|t| t["measured"] == true),
+                "{name}: {tracks:?}"
+            );
         }
         // What av.offset reads where every track moves together.
         let want = match (defect, late) {
@@ -1625,11 +1635,9 @@ fn three_khz_markers_keep_their_cycle_through_aac() {
     }
     .render();
     for (channels, kbps) in [(2_u16, "96k"), (2, "160k"), (1, "128k")] {
-        let samples: Vec<f32> = mono
-            .iter()
-            .flat_map(|&v| std::iter::repeat_n(v, usize::from(channels)))
-            .collect();
-        write_wav(&dir.0.join("m.wav"), channels, &samples);
+        let mut wav = Vec::new();
+        crate::wav::write_float(&mut wav, 48_000, channels, &mono).unwrap();
+        std::fs::write(dir.0.join("m.wav"), wav).unwrap();
         let encoded = Command::new(&ffmpeg)
             .current_dir(&dir.0)
             .args([

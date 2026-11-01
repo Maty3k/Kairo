@@ -1376,36 +1376,55 @@ mod cli {
         assert_eq!(std::fs::read(&expect).unwrap(), before);
     }
 
+    /// Runs `synth` for a 2 s 64×36 clip with this defect, its WAVs into `wavs` and its expect
+    /// file at `expect`, writing the frames to `out`: (code, stderr).
+    fn synth_wavs(
+        defect: &str,
+        wavs: &std::path::Path,
+        expect: &std::path::Path,
+        out: &mut dyn std::io::Write,
+    ) -> (u8, String) {
+        let args: Vec<OsString> = [
+            "synth",
+            "--preset",
+            "64x36@60",
+            "--seconds",
+            "2",
+            "--defect",
+            defect,
+            "--wav-dir",
+        ]
+        .iter()
+        .map(OsString::from)
+        .chain([wavs.as_os_str().to_os_string(), OsString::from("--expect")])
+        .chain([expect.as_os_str().to_os_string()])
+        .collect();
+        let mut err = Vec::new();
+        let code = crate::cli::run_with(&args, out, &mut err, false);
+        (code, String::from_utf8(err).unwrap())
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn synth_writes_the_wavs_after_the_frames_and_never_replaces_one() {
         let dir = Dir::new();
         let folder = dir.0.to_string_lossy().into_owned();
         let expect = dir.0.join("e.json");
-        let synth = |defect: &str| {
-            let args: Vec<OsString> = [
-                "synth",
-                "--preset",
-                "64x36@60",
-                "--seconds",
-                "1",
-                "--defect",
-                defect,
-                "--wav-dir",
-            ]
-            .iter()
-            .map(OsString::from)
-            .chain([dir.0.clone().into_os_string(), OsString::from("--expect")])
-            .chain([expect.clone().into_os_string()])
-            .collect();
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = crate::cli::run_with(&args, &mut out, &mut err, false);
-            let err = String::from_utf8(err).unwrap();
-            assert!(!err.contains(&folder), "{err}");
-            (code, out, err)
-        };
-        let (code, out, err) = synth("cue");
+        let frames = 120 * 64 * 36 * 3 / 2;
+        let mut out = Vec::new();
+        let (code, err) = synth_wavs("cue", &dir.0, &expect, &mut out);
         assert_eq!(code, 0, "{err}");
-        assert_eq!(out.len(), 60 * 64 * 36 * 3 / 2);
+        assert!(!err.contains(&folder), "{err}");
+        assert_eq!(out.len(), frames);
         assert!(
             err.ends_with("defect cue; the expect file is e.json; the WAVs are mix.wav, game.wav, mic.wav and voice.wav\n"),
             "{err}"
@@ -1418,45 +1437,70 @@ mod cli {
         ] {
             let wav = crate::wav::read(&std::fs::read(dir.0.join(file)).unwrap()).unwrap();
             assert_eq!((wav.rate, wav.channels), (48_000, channels), "{file}");
-            assert_eq!(wav.samples.len(), 48_000 * usize::from(channels), "{file}");
+            assert_eq!(wav.samples.len(), 96_000 * usize::from(channels), "{file}");
         }
         let written = Expect::parse(&std::fs::read_to_string(&expect).unwrap()).unwrap();
         assert_eq!(written.tracks.len(), 4);
-        let partials = std::fs::read_dir(&dir.0)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".partial")
-            })
-            .count();
-        assert_eq!(partials, 0);
+        assert_eq!(
+            names_in(&dir.0),
+            ["e.json", "game.wav", "mic.wav", "mix.wav", "voice.wav"]
+        );
         // A WAV that exists already stops the run before any frame, and nothing is written.
         std::fs::remove_file(&expect).unwrap();
         let mix = std::fs::read(dir.0.join("mix.wav")).unwrap();
-        let (code, out, err) = synth("leak");
+        let mut out = Vec::new();
+        let (code, err) = synth_wavs("leak", &dir.0, &expect, &mut out);
         assert_eq!((code, out.len()), (4, 0), "{err}");
         assert!(err.contains("mix.wav: already exists"), "{err}");
         assert!(!expect.exists());
         assert_eq!(std::fs::read(dir.0.join("mix.wav")).unwrap(), mix);
         // A WAV folder that doesn't exist, likewise, without naming it.
-        let args: Vec<OsString> = ["synth", "--preset", "64x36@60", "--seconds", "1"]
-            .iter()
-            .map(OsString::from)
-            .chain([
-                OsString::from("--wav-dir"),
-                dir.0.join("Carol").into_os_string(),
-                OsString::from("--expect"),
-                expect.clone().into_os_string(),
-            ])
-            .collect();
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = crate::cli::run_with(&args, &mut out, &mut err, false);
-        let err = String::from_utf8(err).unwrap();
+        let (code, err) = synth_wavs("leak", &dir.0.join("Carol"), &expect, &mut out);
         assert_eq!((code, out.len()), (4, 0), "{err}");
         assert!(!err.contains("Carol"), "{err}");
+    }
+
+    #[test]
+    fn synth_reserves_its_files_before_the_frames_and_cleans_up_after_them() {
+        // PR 5b's review: a leftover partial file, or an expect file named like a WAV, stops it
+        // before any frame; a name taken while the frames go out removes the WAVs it made.
+        let dir = Dir::new();
+        let expect = dir.0.join("e.json");
+        std::fs::write(dir.0.join("voice.wav.partial"), b"left over").unwrap();
+        let mut out = Vec::new();
+        let (code, err) = synth_wavs("noisy", &dir.0, &expect, &mut out);
+        assert_eq!((code, out.len()), (4, 0), "{err}");
+        assert!(err.contains("voice.wav.partial: "), "{err}");
+        assert_eq!(names_in(&dir.0), ["voice.wav.partial"]);
+        std::fs::remove_file(dir.0.join("voice.wav.partial")).unwrap();
+        let (code, err) = synth_wavs("noisy", &dir.0, &dir.0.join("mic.wav"), &mut out);
+        assert_eq!((code, out.len()), (2, 0), "{err}");
+        assert!(err.contains("can't take a WAV's name"), "{err}");
+        assert!(names_in(&dir.0).is_empty());
+        // Another program takes voice.wav while the frames go out.
+        struct Takes(std::path::PathBuf, usize);
+        impl std::io::Write for Takes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.1 == 0 {
+                    std::fs::write(&self.0, b"someone else's")?;
+                }
+                self.1 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut takes = Takes(dir.0.join("voice.wav"), 0);
+        let (code, err) = synth_wavs("noisy", &dir.0, &expect, &mut takes);
+        assert_eq!(code, 4, "{err}");
+        assert_eq!(takes.1, 120 * 64 * 36 * 3 / 2);
+        assert!(err.contains("voice.wav: "), "{err}");
+        assert_eq!(names_in(&dir.0), ["voice.wav"]);
+        assert_eq!(
+            std::fs::read(dir.0.join("voice.wav")).unwrap(),
+            b"someone else's"
+        );
     }
 
     #[test]

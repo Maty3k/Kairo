@@ -241,6 +241,10 @@ fn tone_name(tone: Tone) -> &'static str {
 /// The longest clip `synth` writes WAVs for: the checks decode no more audio than this.
 pub const MAX_AUDIO_SECONDS: u32 = crate::profile::AUDIO_MAX_SECONDS as u32;
 
+/// The shortest: flash 0 falls on the held first frame, which `av.offset` leaves out, so a 1 s
+/// clip has no beep to time.
+pub const MIN_AUDIO_SECONDS: u32 = 2;
+
 /// `--hdr`: the HDR source the patch row stands for. The patches show the SDR codes `curve`
 /// should give; every other element keeps its SDR codes, so only the patch check is tested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,11 +399,11 @@ impl Synth {
     }
 
     /// Checks that the WAVs can be written too: an audio defect needs nothing more, but a clip
-    /// longer than the checks read is refused.
+    /// too short to time a beep, or longer than the checks read, is refused.
     pub fn check_audio(&self) -> Result<(), SynthError> {
-        if self.seconds > MAX_AUDIO_SECONDS {
+        if !(MIN_AUDIO_SECONDS..=MAX_AUDIO_SECONDS).contains(&self.seconds) {
             return Err(SynthError::Settings(format!(
-                "--wav-dir takes clips of up to {MAX_AUDIO_SECONDS} s, as much audio as the checks read"
+                "--wav-dir takes clips of {MIN_AUDIO_SECONDS} to {MAX_AUDIO_SECONDS} s: a 1 s clip's only flash falls on its held first frame, and the checks read at most {MAX_AUDIO_SECONDS} s of audio"
             )));
         }
         Ok(())
@@ -1034,7 +1038,7 @@ mod tests {
         assert_eq!(render(&swap, AudioTrack::Game), voice);
         assert_eq!(render(&swap, AudioTrack::Voice), game);
         assert_eq!(render(&swap, AudioTrack::Mix), mix);
-        // cue: the placeholder in the Mix at 750 ms in each second, 220 ms long.
+        // cue: the placeholder in the Mix at 700 ms in each second, 220 ms long.
         let cue = Synth {
             defect: Some(Defect::Cue),
             ..s
@@ -1046,10 +1050,10 @@ mod tests {
             .collect();
         assert_eq!(
             sounding(&extra),
-            [750, 1_750]
+            [700, 1_700]
                 .iter()
                 .flat_map(|&ms| ms * 48 + 1..ms * 48 + 10_560)
-                .filter(|&n| n != 750 * 48 + 4_800 && n != 1_750 * 48 + 4_800)
+                .filter(|&n| n != 700 * 48 + 4_800 && n != 1_700 * 48 + 4_800)
                 .collect::<Vec<usize>>()
         );
         assert_eq!(render(&cue, AudioTrack::Game), game);
@@ -1087,7 +1091,7 @@ mod tests {
     #[test]
     fn the_wavs_are_float_at_48_khz() {
         let s = Synth {
-            seconds: 1,
+            seconds: 2,
             ..synth(None)
         };
         for track in AudioTrack::ALL {
@@ -1110,6 +1114,8 @@ mod tests {
         };
         assert!(long.check_audio().is_err());
         assert!(long.write_wav(AudioTrack::Mic, &mut Vec::new()).is_err());
+        let short = Synth { seconds: 1, ..s };
+        assert!(short.check_audio().is_err());
     }
 
     #[test]
