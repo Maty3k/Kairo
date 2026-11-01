@@ -22,8 +22,8 @@
 //!
 //! Structure needs no FFmpeg and no `ffprobe`, so it runs on the Mac, on Linux CI and, later,
 //! inside the engine for its post-save check (PLAN:179) and in "Test my setup" (PLAN:271). The
-//! decoders: synthetic (tests), the CLI pipe (`dev-tools`, a spawned FFmpeg), and the linked
-//! one with research 16's PR 6. Reports name the file only, never its folder (CLAUDE.md).
+//! decoders: synthetic (tests), the CLI pipe (`dev-tools`, a spawned FFmpeg), and on Windows the
+//! linked LGPL FFmpeg Kairo ships. Reports name the file only, never its folder (CLAUDE.md).
 //!
 //! [`mutate`] makes the bad clips that are one box-level change from a good one (README §7.3):
 //! moov after the media, an edit list, a wrong or missing `colr`, a second default track, and
@@ -51,6 +51,7 @@ pub mod mutate;
 pub mod profile;
 pub mod report;
 pub mod scan;
+pub mod sha256;
 pub mod synth;
 #[cfg(test)]
 mod testkit;
@@ -158,6 +159,18 @@ pub fn check_with(
     plan: &Plan,
     decoder: Option<&mut dyn Decoder>,
 ) -> Report {
+    check_with_ffmpeg(source, name, plan, decoder, decode::linked_ffmpeg())
+}
+
+/// [`check_with`], with the FFmpeg linked into this process given, so tests can stand in a
+/// non-LGPL one.
+pub(crate) fn check_with_ffmpeg(
+    source: &mut dyn Source,
+    name: &str,
+    plan: &Plan,
+    decoder: Option<&mut dyn Decoder>,
+    ffmpeg: Option<decode::LinkedFfmpeg>,
+) -> Report {
     let started = Instant::now();
     let mut report = Report {
         kairo_verify: report::VERSION,
@@ -171,11 +184,20 @@ pub fn check_with(
             name: name.to_owned(),
             bytes: 0,
         },
-        decoder: report::Decoder { kind: "none" },
+        decoder: report::Decoder {
+            kind: "none",
+            ffmpeg,
+        },
         summary: report::Summary::default(),
         checks: Vec::new(),
         timings_ms: report::Timings::default(),
     };
+    // A non-LGPL FFmpeg linked into this process stops the check before analysis (README §2
+    // item 18, §6.6: exit 3), whichever decoder was asked for.
+    if let Some(refusal) = report.decoder.ffmpeg.as_ref().and_then(checks::not_lgpl) {
+        report.error = Some(refusal);
+        return report;
+    }
     let clip = match Clip::read(source) {
         Ok(clip) => clip,
         Err(error) => {

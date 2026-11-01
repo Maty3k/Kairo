@@ -1065,11 +1065,15 @@ mod cli {
         let bad = dir.file("bad.mp4", &Spec::with(|s| s.faststart = false).build());
         let expect = dir.file("expect.json", expect_text(2, &ROLES).as_bytes());
         let json = dir.0.join("report.json");
+        // Structure only, on every system: Windows would otherwise decode with the linked FFmpeg,
+        // and the builder's clips hold no real pictures.
         let engine = [
             os("--profile"),
             os("engine"),
             os("--expect"),
             expect.as_os_str(),
+            os("--decoder"),
+            os("none"),
         ];
         let (code, out, err) = run(&[
             &[os("check"), good.as_os_str()][..],
@@ -1097,7 +1101,7 @@ mod cli {
         .concat());
         assert_eq!(code, 0, "{out}");
         assert!(out.starts_with("{\"kairo_verify\":1,"), "{out}");
-        // The test profile needs content checks this build can't run: exit 3.
+        // The test profile needs content checks, which can't run without a decoder: exit 3.
         let (code, out, _) = run(&[
             os("check"),
             good.as_os_str(),
@@ -1105,6 +1109,8 @@ mod cli {
             os("test"),
             os("--expect"),
             expect.as_os_str(),
+            os("--decoder"),
+            os("none"),
         ]);
         assert_eq!(code, 3, "{out}");
         assert!(out.contains("NOT RUN"), "{out}");
@@ -2226,4 +2232,77 @@ mod pinned {
         assert_eq!(gate.content_mode("av.offset"), Mode::Required);
         assert_eq!(gate.content_mode("decode.clean"), Mode::Warning);
     }
+}
+
+/// A decoder that only notes that it was asked to decode.
+struct Untouched(bool);
+
+impl crate::decode::Decoder for Untouched {
+    fn kind(&self) -> &'static str {
+        "untouched"
+    }
+
+    fn video(
+        &mut self,
+        _each: &mut dyn FnMut(usize, &crate::decode::Planes<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<crate::decode::DecodeStats, crate::decode::DecodeError> {
+        self.0 = true;
+        Err(crate::decode::DecodeError::Start("never".to_owned()))
+    }
+
+    fn audio(
+        &mut self,
+        _track: usize,
+        _channels: usize,
+        _each: &mut dyn FnMut(&[f32]) -> std::ops::ControlFlow<()>,
+    ) -> Result<crate::decode::DecodeStats, crate::decode::DecodeError> {
+        self.0 = true;
+        Err(crate::decode::DecodeError::Start("never".to_owned()))
+    }
+}
+
+#[test]
+fn a_non_lgpl_linked_ffmpeg_stops_the_check_before_analysis() {
+    let gpl = crate::decode::LinkedFfmpeg {
+        libs: crate::decode::Libs {
+            avutil: "60.8.100".to_owned(),
+            avcodec: "62.11.100".to_owned(),
+            avformat: "62.3.100".to_owned(),
+        },
+        config_sha256: "cd".repeat(32),
+        license: "GPL version 3 or later",
+        lgpl: false,
+    };
+    let bytes = Spec::good().build();
+    let plan = plan(Profile::Test, 2, &ROLES);
+    let mut decoder = Untouched(false);
+    let report = crate::check_with_ffmpeg(
+        &mut bytes.as_slice(),
+        "clip.mp4",
+        &plan,
+        Some(&mut decoder),
+        Some(gpl.clone()),
+    );
+    // README §2 item 18, §6.6: exit 3 before analysis, nothing decoded, the build named.
+    assert_eq!(report.verdict, Verdict::Error);
+    assert_eq!(report.verdict.exit_code(), 3);
+    assert_eq!(
+        report.error.as_deref(),
+        Some("the linked FFmpeg is GPL version 3 or later, not LGPL")
+    );
+    assert!(report.checks.is_empty());
+    assert!(!decoder.0);
+    let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+    assert_eq!(json["decoder"]["license"], "GPL version 3 or later");
+    assert_eq!(json["decoder"]["libs"]["avcodec"], "62.11.100");
+    // An LGPL one checks as usual.
+    let lgpl = crate::decode::LinkedFfmpeg {
+        license: "LGPL version 2.1 or later",
+        lgpl: true,
+        ..gpl
+    };
+    let report =
+        crate::check_with_ffmpeg(&mut bytes.as_slice(), "clip.mp4", &plan, None, Some(lgpl));
+    assert_eq!(report.error, None);
+    assert_eq!(status(&report, "build.lgpl"), Status::Pass);
 }

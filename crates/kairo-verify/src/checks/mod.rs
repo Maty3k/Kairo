@@ -417,22 +417,74 @@ pub(crate) fn run(
     findings
 }
 
+/// Why a linked FFmpeg can't be used, if it can't: one of its libraries isn't LGPL (README §2
+/// item 18).
+pub(crate) fn not_lgpl(ffmpeg: &crate::decode::LinkedFfmpeg) -> Option<String> {
+    (!ffmpeg.lgpl).then(|| format!("the linked FFmpeg is {}, not LGPL", ffmpeg.license))
+}
+
+/// `build.lgpl` (README §2 item 18, §6.3): the FFmpeg linked into this process, if any, must be
+/// LGPL, whichever decoder ran; a spawned one's licence binds nothing and is only reported.
+/// `kind` is the decoder that ran, if one did, and `spawned` its licence. A linked FFmpeg that
+/// isn't LGPL has already stopped the check before analysis, so here it can only be an `error`.
+pub(crate) fn lgpl_finding(
+    required: bool,
+    linked: Option<&crate::decode::LinkedFfmpeg>,
+    kind: Option<&'static str>,
+    spawned: Option<&'static str>,
+) -> Finding {
+    let id = "build.lgpl";
+    let base = || Finding {
+        limit: json!({"licence": "LGPL", "source": "CLAUDE.md, M1:12, README §2 item 18"}),
+        ..skipped(id, required, String::new())
+    };
+    match linked {
+        Some(ffmpeg) => Finding {
+            status: if ffmpeg.lgpl {
+                Status::Pass
+            } else if required {
+                Status::Error
+            } else {
+                Status::Skip
+            },
+            detail: not_lgpl(ffmpeg).unwrap_or_else(|| match (kind, spawned) {
+                (Some(kind), Some(licence)) if kind != "linked" => format!(
+                    "linked and LGPL ({}); the spawned {kind} decoder's FFmpeg: {licence}",
+                    ffmpeg.license
+                ),
+                _ => format!("linked and LGPL ({})", ffmpeg.license),
+            }),
+            value: json!({"linked": true, "decoder": kind, "licence": ffmpeg.license,
+                          "libs": ffmpeg.libs, "config_sha256": ffmpeg.config_sha256,
+                          "spawned_licence": spawned.filter(|_| kind != Some("linked"))}),
+            ..base()
+        },
+        None => Finding {
+            status: Status::Pass,
+            detail: match (kind, spawned) {
+                (Some(kind), Some(licence)) => {
+                    format!("spawned, not linked: the {kind} decoder ({licence})")
+                }
+                (Some(kind), None) => format!("nothing linked: the {kind} decoder"),
+                (None, _) => "nothing linked: no decoder ran".to_owned(),
+            },
+            value: json!({"linked": false, "decoder": kind, "licence": spawned}),
+            ..base()
+        },
+    }
+}
+
 /// The content checks when no decoder ran: a required one is an `error`, so a profile that
 /// needs them can't pass on structure alone (README §6.1).
 fn content_findings(plan: &Plan) -> Vec<Finding> {
+    let linked = crate::decode::linked_ffmpeg();
     profile::CONTENT_CHECKS
         .into_iter()
         .map(|id| {
             let mode = plan.content_mode(id);
             let required = mode == Mode::Required;
             if id == "build.lgpl" {
-                return Finding {
-                    status: Status::Pass,
-                    detail: "nothing linked: no decoder ran".to_owned(),
-                    value: json!({"linked": false}),
-                    limit: json!({"licence": "LGPL", "source": "CLAUDE.md, M1:12"}),
-                    ..skipped(id, required, String::new())
-                };
+                return lgpl_finding(required, linked.as_ref(), None, None);
             }
             match mode {
                 Mode::Off => skipped(id, false, format!("not in the {} profile", plan.profile)),
@@ -618,6 +670,84 @@ pub fn verdict(findings: &[Finding]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::{Libs, LinkedFfmpeg};
+
+    fn ffmpeg(license: &'static str) -> LinkedFfmpeg {
+        LinkedFfmpeg {
+            libs: Libs {
+                avutil: "60.8.100".to_owned(),
+                avcodec: "62.11.100".to_owned(),
+                avformat: "62.3.100".to_owned(),
+            },
+            config_sha256: "ab".repeat(32),
+            license,
+            lgpl: license.starts_with("LGPL"),
+        }
+    }
+
+    #[test]
+    fn build_lgpl_judges_a_linked_ffmpeg_whichever_decoder_ran() {
+        // Linked and LGPL: a pass that names the build, with any decoder or none.
+        let lgpl = ffmpeg("LGPL version 3 or later");
+        for (kind, spawned) in [
+            (Some("linked"), Some("LGPL version 3 or later")),
+            (Some("cli"), Some("GPL version 3 or later")),
+            (None, None),
+        ] {
+            let f = lgpl_finding(true, Some(&lgpl), kind, spawned);
+            assert_eq!(f.status, Status::Pass, "{kind:?}");
+            assert!(
+                f.detail
+                    .starts_with("linked and LGPL (LGPL version 3 or later)"),
+                "{}",
+                f.detail
+            );
+            assert_eq!(f.value["linked"], true);
+            assert_eq!(f.value["libs"]["avcodec"], "62.11.100");
+            assert_eq!(f.value["config_sha256"].as_str().map(str::len), Some(64));
+        }
+        // A spawned FFmpeg beside the linked one is still reported (README §2 item 18).
+        let both = lgpl_finding(
+            true,
+            Some(&lgpl),
+            Some("cli"),
+            Some("GPL version 3 or later"),
+        );
+        assert!(
+            both.detail
+                .ends_with("the spawned cli decoder's FFmpeg: GPL version 3 or later")
+        );
+        assert_eq!(both.value["spawned_licence"], "GPL version 3 or later");
+        // A GPL or non-free build can't judge clips: an error, whichever decoder ran.
+        let gpl = ffmpeg("GPL version 3 or later");
+        assert_eq!(
+            not_lgpl(&gpl).as_deref(),
+            Some("the linked FFmpeg is GPL version 3 or later, not LGPL")
+        );
+        assert_eq!(not_lgpl(&lgpl), None);
+        for kind in [Some("linked"), Some("cli"), None] {
+            let f = lgpl_finding(true, Some(&gpl), kind, None);
+            assert_eq!(f.status, Status::Error, "{kind:?}");
+            assert_eq!(f.value["linked"], true);
+        }
+        assert_eq!(
+            lgpl_finding(false, Some(&gpl), None, None).status,
+            Status::Skip
+        );
+        // Nothing linked (the Mac and Linux): a spawned FFmpeg's licence is only reported.
+        let spawned = lgpl_finding(true, None, Some("cli"), Some("GPL version 3 or later"));
+        assert_eq!(spawned.status, Status::Pass);
+        assert_eq!(
+            spawned.detail,
+            "spawned, not linked: the cli decoder (GPL version 3 or later)"
+        );
+        assert_eq!(spawned.value["linked"], false);
+        let none = lgpl_finding(true, None, None, None);
+        assert_eq!(none.status, Status::Pass);
+        assert_eq!(none.detail, "nothing linked: no decoder ran");
+        let synthetic = lgpl_finding(true, None, Some("synthetic"), None);
+        assert_eq!(synthetic.detail, "nothing linked: the synthetic decoder");
+    }
 
     #[test]
     fn findings_list_at_most_100_events_and_count_them_all() {

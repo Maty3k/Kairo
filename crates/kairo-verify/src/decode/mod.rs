@@ -8,14 +8,68 @@
 //! sample tables, and `decode.clean` compares the counts. The backends:
 //! [`synthetic::Synthetic`] renders pattern v1 straight from `kairo_core::testsig` (tests and
 //! `synth`); [`cli::Cli`] (feature `dev-tools`) spawns an FFmpeg it is given and reads raw
-//! frames from its pipe; the linked backend comes with research 16's PR 6.
+//! frames from its pipe; `linked::Linked` (Windows) decodes in-process with the LGPL FFmpeg
+//! Kairo ships.
 
 #[cfg(feature = "dev-tools")]
 pub mod cli;
+#[cfg(windows)]
+pub mod linked;
 pub mod synthetic;
 
 use std::fmt;
 use std::ops::ControlFlow;
+
+use serde::Serialize;
+
+/// The FFmpeg linked into this process, when there is one: on Windows, where `kairo-verify`
+/// imports avutil, avcodec and avformat whichever decoder runs (README §2 item 18, §6.3, §6.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkedFfmpeg {
+    /// Each library's version, `major.minor.micro`.
+    pub libs: Libs,
+    /// The SHA-256 of avutil's, avcodec's and avformat's build configurations, one per line,
+    /// which name the build.
+    pub config_sha256: String,
+    /// The first of avutil's, avcodec's and avformat's licences that isn't LGPL, else avcodec's.
+    pub license: &'static str,
+    /// Whether all three are LGPL.
+    #[serde(skip)]
+    pub lgpl: bool,
+}
+
+/// The linked libraries' versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Libs {
+    /// avutil's.
+    pub avutil: String,
+    /// avcodec's.
+    pub avcodec: String,
+    /// avformat's.
+    pub avformat: String,
+}
+
+/// The FFmpeg linked into this process: `Some` on Windows, `None` elsewhere, where nothing is.
+pub fn linked_ffmpeg() -> Option<LinkedFfmpeg> {
+    #[cfg(windows)]
+    {
+        Some(linked::build())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// An FFmpeg library version, `AV_VERSION_INT`'s packing, as `major.minor.micro`.
+pub fn version_text(version: u32) -> String {
+    format!(
+        "{}.{}.{}",
+        version >> 16,
+        (version >> 8) & 0xFF,
+        version & 0xFF
+    )
+}
 
 /// One picture's planes: 8-bit Y′CbCr 4:2:0, borrowed.
 #[derive(Debug, Clone, Copy)]
@@ -209,8 +263,10 @@ pub trait Decoder {
     /// Its kind for the report: `synthetic`, `cli` or `linked`.
     fn kind(&self) -> &'static str;
 
-    /// The licence of a decoder that is spawned rather than linked, for the report (README §2
-    /// item 18): `GPL` or `LGPL`, if it says.
+    /// Its FFmpeg's licence, which `build.lgpl` reports (README §2 item 18): a spawned FFmpeg's,
+    /// `GPL` or `LGPL` if it says, binds nothing; the linked decoder's is its libraries' first
+    /// that isn't LGPL. The FFmpeg linked into the process is judged from [`linked_ffmpeg`],
+    /// whichever decoder runs.
     fn licence(&mut self) -> Option<&'static str> {
         None
     }

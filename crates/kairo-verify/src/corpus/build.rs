@@ -491,6 +491,14 @@ impl Build<'_> {
 
     /// Builds the corpus, telling `say` each step, and returns its manifest.
     pub fn run(&self, say: &mut dyn FnMut(&str)) -> Result<Manifest, BuildError> {
+        // The B-frames probe reads clips through `check_with`, which a non-LGPL linked FFmpeg
+        // stops (README §2 item 18).
+        if let Some(refusal) = crate::decode::linked_ffmpeg()
+            .as_ref()
+            .and_then(crate::checks::not_lgpl)
+        {
+            return Err(BuildError::step(refusal));
+        }
         if self.out.symlink_metadata().is_ok() {
             return Err(BuildError {
                 code: 2,
@@ -821,9 +829,11 @@ impl Build<'_> {
         let expect = self.encoder.synth(Video::Good).expect(false);
         let plan = Plan::new(Profile::Test, false, Some(expect))
             .map_err(|e| BuildError::step(format!("{name}: {e}")))?;
-        Ok(holds_b_frames(&crate::check_with(
-            &mut file, &name, &plan, None,
-        )))
+        let report = crate::check_with(&mut file, &name, &plan, None);
+        if let Some(error) = &report.error {
+            return Err(BuildError::step(format!("{name}: {error}")));
+        }
+        Ok(holds_b_frames(&report))
     }
 
     /// The four WAVs of `audio`: the good clip's tracks with this audio defect, if any.

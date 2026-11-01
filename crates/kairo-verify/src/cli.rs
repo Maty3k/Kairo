@@ -37,7 +37,7 @@ use crate::{Clip, boxes};
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
                     [--cue FILE.wav] [--av-tight] [--voice-included]
-                    [--decoder none|cli] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
+                    [--decoder linked|cli|none] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
                            |set-default TRACK|perturb-stts S D  IN OUT
@@ -49,26 +49,26 @@ pub const USAGE: &str =
                                  --ffmpeg PATH [--hw-index N [--hw-device VVVV:DDDD]]
                                  [--finishing h264_metadata] --out DIR
                           (h264_amf needs --hw-index)
-       kairo-verify corpus check DIR --ffmpeg PATH
+       kairo-verify corpus check DIR [--ffmpeg PATH]
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
 defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable (video);
          av50 swap-game-voice cue leak noisy (audio, with --wav-dir)
-The cli decoder (--ffmpeg PATH) decodes for the content checks; the linked decoder comes with
-research 16's PR 6.";
+The content checks decode with the cli decoder when --ffmpeg PATH is given, else with the
+linked LGPL FFmpeg on Windows; elsewhere, without --ffmpeg, only the structure is checked.";
 
 /// The usage text.
 #[cfg(not(feature = "dev-tools"))]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
-                    [--decoder none] [--json FILE|-] [--summary FILE|-]
+                    [--decoder linked|none] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
-This build checks structure only: the content checks need a decoder, and the linked one comes
-with research 16's PR 6.";
+On Windows the linked LGPL FFmpeg decodes for the content checks; elsewhere this build, which
+has no cli decoder, checks structure only.";
 
 /// Where a report goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +85,7 @@ enum Command {
         profile: Profile,
         gate_m3: bool,
         expect: Option<PathBuf>,
-        ffmpeg: Option<PathBuf>,
+        decoder: DecoderChoice,
         json: Option<Output>,
         summary: Option<Output>,
         cue: Option<PathBuf>,
@@ -113,10 +113,50 @@ enum Command {
     },
     CorpusCheck {
         dir: PathBuf,
-        ffmpeg: PathBuf,
+        decoder: DecoderChoice,
     },
     Version,
     Help,
+}
+
+/// The decoder the content checks run (README §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecoderChoice {
+    /// None: the structure only.
+    None,
+    /// FFmpeg spawned from this path (`dev-tools`).
+    Cli(PathBuf),
+    /// The linked LGPL FFmpeg (Windows).
+    Linked,
+}
+
+/// Without `--decoder` or `--ffmpeg`: the linked decoder where Kairo ships FFmpeg, else none.
+const DEFAULT_DECODER: DecoderChoice = if cfg!(windows) {
+    DecoderChoice::Linked
+} else {
+    DecoderChoice::None
+};
+
+/// Resolves `--decoder` and `--ffmpeg`: an explicit `--decoder` wins; `--ffmpeg` alone means the
+/// cli decoder; otherwise [`DEFAULT_DECODER`].
+fn decoder_choice(chosen: Option<&str>, ffmpeg: Option<PathBuf>) -> Result<DecoderChoice, String> {
+    match (chosen, ffmpeg) {
+        (Some("none"), _) => Ok(DecoderChoice::None),
+        (Some("cli"), _) if !cfg!(feature = "dev-tools") => {
+            Err("this build has no cli decoder (feature dev-tools)".to_owned())
+        }
+        (Some("cli"), Some(program)) | (None, Some(program)) => Ok(DecoderChoice::Cli(program)),
+        (Some("cli"), None) => Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}")),
+        (Some("linked"), _) if !cfg!(windows) => Err(if cfg!(feature = "dev-tools") {
+            "the linked decoder is Windows-only, where Kairo ships FFmpeg; use --decoder cli --ffmpeg PATH"
+        } else {
+            "the linked decoder is Windows-only, where Kairo ships FFmpeg; elsewhere this build checks structure only"
+        }
+        .to_owned()),
+        (Some("linked"), _) => Ok(DecoderChoice::Linked),
+        (Some(_), _) => Err(format!("--decoder takes linked, cli or none\n{USAGE}")),
+        (None, None) => Ok(DEFAULT_DECODER),
+    }
 }
 
 fn output(value: &OsString) -> Output {
@@ -180,7 +220,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut expect = None;
     let mut ffmpeg = None;
     // An explicit --decoder wins over --ffmpeg, in either order.
-    let mut chosen: Option<bool> = None;
+    let mut chosen: Option<String> = None;
     let mut json = None;
     let mut summary = None;
     let mut cue = None;
@@ -209,17 +249,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
                 _ => return Err(format!("--gate takes m3\n{USAGE}")),
             },
             "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
-            "--decoder" => match value("--decoder")?.to_str() {
-                Some("none") => chosen = Some(false),
-                Some("cli") if cfg!(feature = "dev-tools") => chosen = Some(true),
-                Some("cli") => {
-                    return Err("this build has no cli decoder (feature dev-tools)".to_owned());
-                }
-                Some("linked") => {
-                    return Err("the linked decoder comes with research 16's PR 6; use --decoder cli --ffmpeg PATH".to_owned());
-                }
-                _ => return Err(format!("--decoder takes linked, cli or none\n{USAGE}")),
-            },
+            "--decoder" => {
+                chosen = Some(value("--decoder")?.to_str().unwrap_or_default().to_owned());
+            }
             "--ffmpeg" if cfg!(feature = "dev-tools") => {
                 ffmpeg = Some(PathBuf::from(value("--ffmpeg")?));
             }
@@ -247,10 +279,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         }
     }
     let clip = clip.ok_or_else(|| format!("check needs a clip\n{USAGE}"))?;
-    let cli_decoder = chosen.unwrap_or(ffmpeg.is_some());
-    if cli_decoder && ffmpeg.is_none() {
-        return Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}"));
-    }
+    let decoder = decoder_choice(chosen.as_deref(), ffmpeg)?;
     let profile = profile.ok_or_else(|| format!("check needs --profile\n{USAGE}"))?;
     // Flags that would do nothing under this profile are refused, not ignored.
     if av_tight && profile != Profile::Engine {
@@ -271,7 +300,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         profile,
         gate_m3,
         expect,
-        ffmpeg: ffmpeg.filter(|_| cli_decoder),
+        decoder,
         json,
         summary,
         cue,
@@ -579,12 +608,13 @@ fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
             }
             let dir =
                 dir.ok_or_else(|| format!("corpus check needs the corpus folder\n{USAGE}"))?;
-            let ffmpeg = ffmpeg.ok_or_else(|| {
-                format!(
-                    "corpus check needs --ffmpeg PATH until the linked decoder (research 16's PR 6)\n{USAGE}"
-                )
-            })?;
-            Ok(Command::CorpusCheck { dir, ffmpeg })
+            let decoder = decoder_choice(None, ffmpeg)?;
+            if decoder == DecoderChoice::None {
+                return Err(format!(
+                    "corpus check needs --ffmpeg PATH: the linked decoder is Windows-only\n{USAGE}"
+                ));
+            }
+            Ok(Command::CorpusCheck { dir, decoder })
         }
         _ => Err(usage()),
     }
@@ -625,21 +655,28 @@ fn corpus_build(settings: CorpusBuild<'_>, out: &mut dyn Write, err: &mut dyn Wr
 
 /// `corpus check`: every clip judged, then the summary on `out`.
 #[cfg(feature = "dev-tools")]
-fn corpus_check(dir: &Path, ffmpeg: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+fn corpus_check(
+    dir: &Path,
+    choice: &DecoderChoice,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
     // Without a decoder nothing can be judged, so a missing FFmpeg stops it at once.
-    let starts = std::process::Command::new(ffmpeg)
-        .arg("-version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !starts {
-        say(err, "corpus check: FFmpeg didn't start");
-        return 3;
+    if let DecoderChoice::Cli(program) = choice {
+        let starts = std::process::Command::new(program)
+            .arg("-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !starts {
+            say(err, "corpus check: FFmpeg didn't start");
+            return 3;
+        }
     }
     let decoder = |clip: &Path| -> Box<dyn crate::decode::Decoder> {
-        Box::new(crate::decode::cli::Cli::new(ffmpeg, clip))
+        make_decoder(choice, clip).unwrap_or_else(|| Box::new(NoDecoder))
     };
     let check = crate::corpus::check::Check {
         dir,
@@ -682,7 +719,7 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         profile,
         gate_m3,
         expect,
-        ffmpeg,
+        decoder,
         json,
         summary,
         cue,
@@ -731,7 +768,7 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             }
         }
     }
-    let mut decoder = make_decoder(ffmpeg, &clip);
+    let mut decoder = make_decoder(&decoder, &clip);
     let report = match File::open(&clip) {
         Ok(mut file) => crate::check_with(
             &mut file,
@@ -739,7 +776,7 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             &plan,
             decoder
                 .as_mut()
-                .map(|d| d as &mut dyn crate::decode::Decoder),
+                .map(|d| d.as_mut() as &mut dyn crate::decode::Decoder),
         ),
         Err(error) => {
             say(err, &format!("{name}: {error}"));
@@ -780,32 +817,37 @@ fn read_cue(path: &Path) -> Result<Vec<f32>, String> {
     Ok(mono)
 }
 
-/// The decoder `--ffmpeg` asks for.
-#[cfg(feature = "dev-tools")]
-fn make_decoder(ffmpeg: Option<PathBuf>, clip: &Path) -> Option<crate::decode::cli::Cli> {
-    ffmpeg.map(|program| crate::decode::cli::Cli::new(program, clip))
+/// The decoder `choice` names for `clip`, if any.
+// A build with neither decoder (no dev-tools, not Windows) never looks at the clip.
+#[cfg_attr(not(any(feature = "dev-tools", windows)), allow(unused_variables))]
+fn make_decoder(choice: &DecoderChoice, clip: &Path) -> Option<Box<dyn crate::decode::Decoder>> {
+    match choice {
+        DecoderChoice::None => None,
+        #[cfg(feature = "dev-tools")]
+        DecoderChoice::Cli(program) => Some(Box::new(crate::decode::cli::Cli::new(program, clip))),
+        #[cfg(windows)]
+        DecoderChoice::Linked => Some(Box::new(crate::decode::linked::Linked::new(clip))),
+        // Refused when parsed: a build without it never gets here.
+        #[allow(unreachable_patterns)]
+        _ => Some(Box::new(NoDecoder)),
+    }
 }
 
-#[cfg(not(feature = "dev-tools"))]
-fn make_decoder(_: Option<PathBuf>, _: &Path) -> Option<NoDecoder> {
-    None
-}
+/// A decoder that can't start: what a choice this build lacks gives, never reached in practice.
+struct NoDecoder;
 
-/// The decoder a build without `dev-tools` never has.
-#[cfg(not(feature = "dev-tools"))]
-enum NoDecoder {}
-
-#[cfg(not(feature = "dev-tools"))]
 impl crate::decode::Decoder for NoDecoder {
     fn kind(&self) -> &'static str {
-        match *self {}
+        "none"
     }
 
     fn video(
         &mut self,
         _: &mut dyn FnMut(usize, &crate::decode::Planes<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<crate::decode::DecodeStats, crate::decode::DecodeError> {
-        match *self {}
+        Err(crate::decode::DecodeError::Start(
+            "this build has no such decoder".to_owned(),
+        ))
     }
 }
 
@@ -1143,7 +1185,7 @@ pub fn run_with(
             err,
         ),
         #[cfg(feature = "dev-tools")]
-        Ok(Command::CorpusCheck { dir, ffmpeg }) => corpus_check(&dir, &ffmpeg, out, err),
+        Ok(Command::CorpusCheck { dir, decoder }) => corpus_check(&dir, &decoder, out, err),
         Ok(command) => check(command, out, err),
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -1177,7 +1219,7 @@ mod tests {
                 profile: Profile::Engine,
                 gate_m3: true,
                 expect: None,
-                ffmpeg: None,
+                decoder: DEFAULT_DECODER,
                 json: Some(Output::Stdout),
                 summary: Some(Output::File(PathBuf::from("s.txt"))),
                 cue: None,
@@ -1272,38 +1314,81 @@ mod tests {
                 wav_dir: None,
             })
         );
+        // Corpus work and the cli decoder spawn FFmpeg: only a dev-tools build has them.
+        if !cfg!(feature = "dev-tools") {
+            for line in [
+                "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c",
+                "corpus check c --ffmpeg f",
+                "check a.mp4 --profile engine --ffmpeg f",
+                "check a.mp4 --profile engine --decoder cli",
+            ] {
+                assert!(parse_args(&args(line)).is_err(), "{line}");
+            }
+        } else {
+            assert_eq!(
+                parse_args(&args(
+                    "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c"
+                )),
+                Ok(Command::CorpusBuild {
+                    encoder: Encoder::Amf,
+                    ffmpeg: PathBuf::from("f"),
+                    hw_index: Some(1),
+                    hw_device: None,
+                    finishing: false,
+                    out: PathBuf::from("c"),
+                })
+            );
+            assert_eq!(
+                parse_args(&args(
+                    "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
+                )),
+                Ok(Command::CorpusBuild {
+                    encoder: Encoder::Amf,
+                    ffmpeg: PathBuf::from("f"),
+                    hw_index: Some(0),
+                    hw_device: Some("1002:7550".to_owned()),
+                    finishing: true,
+                    out: PathBuf::from("c"),
+                })
+            );
+            assert_eq!(
+                parse_args(&args("corpus check c --ffmpeg f")),
+                Ok(Command::CorpusCheck {
+                    dir: PathBuf::from("c"),
+                    decoder: DecoderChoice::Cli(PathBuf::from("f")),
+                })
+            );
+            // --ffmpeg alone means the cli decoder; --decoder wins over it.
+            for (line, want) in [
+                (
+                    "check a.mp4 --profile engine --ffmpeg f",
+                    DecoderChoice::Cli(PathBuf::from("f")),
+                ),
+                (
+                    "check a.mp4 --profile engine --decoder none --ffmpeg f",
+                    DecoderChoice::None,
+                ),
+                (
+                    "check a.mp4 --profile engine --ffmpeg f --decoder none",
+                    DecoderChoice::None,
+                ),
+            ] {
+                assert!(
+                    matches!(parse_args(&args(line)), Ok(Command::Check { ref decoder, .. }) if *decoder == want),
+                    "{line}"
+                );
+            }
+        }
+        let linked = parse_args(&args("check a.mp4 --profile engine --decoder linked"));
         assert_eq!(
-            parse_args(&args(
-                "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c"
-            )),
-            Ok(Command::CorpusBuild {
-                encoder: Encoder::Amf,
-                ffmpeg: PathBuf::from("f"),
-                hw_index: Some(1),
-                hw_device: None,
-                finishing: false,
-                out: PathBuf::from("c"),
-            })
+            linked.is_ok(),
+            cfg!(windows),
+            "the linked decoder is Windows-only"
         );
         assert_eq!(
-            parse_args(&args(
-                "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
-            )),
-            Ok(Command::CorpusBuild {
-                encoder: Encoder::Amf,
-                ffmpeg: PathBuf::from("f"),
-                hw_index: Some(0),
-                hw_device: Some("1002:7550".to_owned()),
-                finishing: true,
-                out: PathBuf::from("c"),
-            })
-        );
-        assert_eq!(
-            parse_args(&args("corpus check c --ffmpeg f")),
-            Ok(Command::CorpusCheck {
-                dir: PathBuf::from("c"),
-                ffmpeg: PathBuf::from("f"),
-            })
+            parse_args(&args("corpus check c")).is_ok(),
+            cfg!(all(windows, feature = "dev-tools")),
+            "corpus check needs --ffmpeg off Windows, and dev-tools everywhere"
         );
         assert!(matches!(
             parse_args(&args(
@@ -1354,7 +1439,7 @@ mod tests {
             "check a.mp4 --profile clip",
             "check a.mp4 --profile engine --gate m4",
             "check a.mp4 --profile engine --decoder cli",
-            "check a.mp4 --profile engine --decoder linked --ffmpeg f",
+            "check a.mp4 --profile engine --decoder frobnicate",
             "check a.mp4 --profile engine --json - --summary -",
             "check a.mp4 b.mp4 --profile engine",
             "check a.mp4 --profile engine --frobnicate",
@@ -1408,7 +1493,6 @@ mod tests {
             "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --hw-device 1002 --out c",
             "corpus build --encoder ipcm --ffmpeg f --finishing x --out c",
             "corpus check c --ffmpeg f --finishing h264_metadata",
-            "corpus check c",
             "corpus check --ffmpeg f",
             "corpus check c --ffmpeg f --encoder ipcm",
             "corpus check c --ffmpeg f --ffprobe p",

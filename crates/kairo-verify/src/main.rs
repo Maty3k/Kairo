@@ -9,6 +9,10 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // The linked FFmpeg says nothing: its messages could name a path (CLAUDE.md), and the
+    // reports carry its error codes instead (README §3.1). The library leaves the log alone.
+    #[cfg(windows)]
+    ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Quiet);
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let stdout = std::io::stdout();
     let terminal = stdout.is_terminal();

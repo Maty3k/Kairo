@@ -21,3 +21,10 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+# The linked decoder (research 16 README section 3.3): Windows only, the safe API only, and only
+# avcodec and avformat (with avutil), so feature unification can't add avdevice, avfilter,
+# swresample or swscale.
+[target.'cfg(windows)'.dependencies]
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = ["codec", "format"] }
+ffmpeg-sys-next = { version = "=9.0.1", default-features = false, features = ["avcodec", "avformat"] }
