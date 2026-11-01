@@ -22,8 +22,8 @@
 //!
 //! Structure needs no FFmpeg and no `ffprobe`, so it runs on the Mac, on Linux CI and, later,
 //! inside the engine for its post-save check (PLAN:179) and in "Test my setup" (PLAN:271). The
-//! decoders: synthetic (tests), the CLI pipe (`dev-tools`, a spawned FFmpeg), and the linked
-//! one with research 16's PR 6. Reports name the file only, never its folder (CLAUDE.md).
+//! decoders: synthetic (tests), the CLI pipe (`dev-tools`, a spawned FFmpeg), and on Windows the
+//! linked LGPL FFmpeg Kairo ships. Reports name the file only, never its folder (CLAUDE.md).
 //!
 //! [`mutate`] makes the bad clips that are one box-level change from a good one (README §7.3):
 //! moov after the media, an edit list, a wrong or missing `colr`, a second default track, and

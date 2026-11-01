@@ -5,6 +5,7 @@ One ADR per architectural choice ([PLAN §2.11](../PLAN.md#211-repository-layout
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-architecture-and-stack.md) | Architecture and stack | Accepted, 2026-10-21 |
+| [0002](0002-ffmpeg-crate-licences-and-process-listing.md) | The FFmpeg crates' licence, and no process-listing crates | Accepted, 2026-11-01 |
 
 ## Template
 

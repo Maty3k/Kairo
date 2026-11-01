@@ -29,9 +29,13 @@ allow = [
 # This list is the policy, not an inventory: licences nobody uses yet are fine.
 unused-allowed-license = "allow"
 confidence-threshold = 0.93
-exceptions = []
-# Expected later, each by ADR: WTFPL (ffmpeg-next, ffmpeg-sys-next) and MPL-2.0 (option-ext via
-# dirs) as per-crate exceptions; the FFmpeg DLLs are LGPL-3.0 and are not crates.
+# Per crate, each by ADR. WTFPL: the FFmpeg crates (ADR-0002); the FFmpeg DLLs are LGPL and are
+# not crates, so kairo-verify's linked decoder checks their licence at run time. Expected later:
+# MPL-2.0 (option-ext via dirs).
+exceptions = [
+    { crate = "ffmpeg-next", allow = ["WTFPL"] },
+    { crate = "ffmpeg-sys-next", allow = ["WTFPL"] },
+]
 
 [licenses.private]
 # Kairo's own crates are GPL-3.0-or-later and unpublished (publish = false).
@@ -50,6 +54,7 @@ deny = [
     { crate = "sentry-rust-minidump", reason = "deprecated; use crash-handler + minidumper (docs/PLAN.md §2.9)" },
     { crate = "tauri-plugin-updater", reason = "updates live in the engine's control process (docs/PLAN.md §2.1)" },
     { crate = "ez-ffmpeg", reason = "pulls a second FFmpeg sys crate (cookbook §1)" },
+    { crate = "sysinfo", reason = "lists processes and may open them beyond PROCESS_QUERY_LIMITED_INFORMATION (house rule 3, ADR-0002)" },
 ]
 
 [sources]

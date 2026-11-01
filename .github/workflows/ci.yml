@@ -82,9 +82,9 @@ jobs:
         run: shellcheck tools/mac/pc tools/mac/keychain-askpass tools/mac/*.sh
 
   windows:
-    name: Windows (build, clippy, tests)
+    name: Windows (build, clippy, tests, lossless corpus)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +94,53 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
+      # kairo-verify links the LGPL FFmpeg the PC's bootstrap pins (research 16 §3.4): the same zip,
+      # checked against the same SHA-256, and cached by it.
+      - name: The FFmpeg pin (tools/pc/bootstrap.ps1)
+        id: ffmpeg
+        shell: pwsh
+        run: |
+          $text = Get-Content -Raw -LiteralPath tools/pc/bootstrap.ps1
+          $url = [regex]::Match($text, "(?m)^\`$FfmpegUrl\s*=\s*'(https://[^']+)'").Groups[1].Value
+          $sha = [regex]::Match($text, "(?m)^\`$FfmpegSha256\s*=\s*'([0-9a-f]{64})'").Groups[1].Value
+          if (-not $url -or -not $sha) { Write-Host '::error::No FFmpeg pin in tools/pc/bootstrap.ps1'; exit 1 }
+          "url=$url" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Cache the pinned FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\ffmpeg
+          key: ffmpeg-${{ steps.ffmpeg.outputs.sha }}
+
+      - name: Download and check the pinned FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          FFMPEG_URL: ${{ steps.ffmpeg.outputs.url }}
+          FFMPEG_SHA: ${{ steps.ffmpeg.outputs.sha }}
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:FFMPEG_SHA) { Write-Host "::error::The FFmpeg zip's SHA-256 is $hash, not the pin's"; exit 1 }
+          $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-extract'
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract
+          $inner = @(Get-ChildItem -LiteralPath $extract -Directory)
+          if ($inner.Count -ne 1 -or -not (Test-Path -LiteralPath (Join-Path $inner[0].FullName 'bin\ffmpeg.exe'))) {
+            Write-Host '::error::The FFmpeg zip does not have the expected layout'; exit 1
+          }
+          Move-Item -LiteralPath $inner[0].FullName -Destination (Join-Path $env:RUNNER_TEMP 'ffmpeg')
+
+      - name: Point the build and the tests at it
+        shell: pwsh
+        run: |
+          $ff = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          "FFMPEG_DIR=$ff" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          (Join-Path $ff 'bin') >> $env:GITHUB_PATH
+
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
@@ -102,6 +149,20 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # Research 16 §9's W tier: every defect but B-frames, built with the pinned ffmpeg.exe (its real
+      # muxer and AAC) and judged by the linked decoder. Generated here; never uploaded.
+      - name: CI's lossless corpus, judged by the linked decoder
+        shell: pwsh
+        run: |
+          cargo build -p kairo-verify --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $kv = 'target\release\kairo-verify.exe'
+          $corpus = Join-Path $env:RUNNER_TEMP 'corpus'
+          & $kv corpus build --encoder ipcm --ffmpeg (Join-Path $env:FFMPEG_DIR 'bin\ffmpeg.exe') --out $corpus
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $kv corpus check $corpus
+          exit $LASTEXITCODE
 
   cargo-deny:
     name: cargo-deny (${{ matrix.checks }})

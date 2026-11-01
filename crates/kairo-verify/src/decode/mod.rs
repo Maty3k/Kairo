@@ -8,10 +8,13 @@
 //! sample tables, and `decode.clean` compares the counts. The backends:
 //! [`synthetic::Synthetic`] renders pattern v1 straight from `kairo_core::testsig` (tests and
 //! `synth`); [`cli::Cli`] (feature `dev-tools`) spawns an FFmpeg it is given and reads raw
-//! frames from its pipe; the linked backend comes with research 16's PR 6.
+//! frames from its pipe; `linked::Linked` (Windows) decodes in-process with the LGPL FFmpeg
+//! Kairo ships.
 
 #[cfg(feature = "dev-tools")]
 pub mod cli;
+#[cfg(windows)]
+pub mod linked;
 pub mod synthetic;
 
 use std::fmt;
@@ -209,8 +212,9 @@ pub trait Decoder {
     /// Its kind for the report: `synthetic`, `cli` or `linked`.
     fn kind(&self) -> &'static str;
 
-    /// The licence of a decoder that is spawned rather than linked, for the report (README §2
-    /// item 18): `GPL` or `LGPL`, if it says.
+    /// Its FFmpeg's licence, for `build.lgpl` (README §2 item 18): a linked one's must be LGPL,
+    /// and the linked decoder gives the first of its libraries' that isn't; a spawned one's is
+    /// only reported, `GPL` or `LGPL` if it says.
     fn licence(&mut self) -> Option<&'static str> {
         None
     }
