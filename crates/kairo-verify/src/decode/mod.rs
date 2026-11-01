@@ -28,7 +28,8 @@ use serde::Serialize;
 pub struct LinkedFfmpeg {
     /// Each library's version, `major.minor.micro`.
     pub libs: Libs,
-    /// The SHA-256 of avutil's build configuration, which names the build.
+    /// The SHA-256 of avutil's, avcodec's and avformat's build configurations, one per line,
+    /// which name the build.
     pub config_sha256: String,
     /// The first of avutil's, avcodec's and avformat's licences that isn't LGPL, else avcodec's.
     pub license: &'static str,
@@ -262,9 +263,10 @@ pub trait Decoder {
     /// Its kind for the report: `synthetic`, `cli` or `linked`.
     fn kind(&self) -> &'static str;
 
-    /// Its FFmpeg's licence, for `build.lgpl` (README §2 item 18): a linked one's must be LGPL,
-    /// and the linked decoder gives the first of its libraries' that isn't; a spawned one's is
-    /// only reported, `GPL` or `LGPL` if it says.
+    /// Its FFmpeg's licence, which `build.lgpl` reports (README §2 item 18): a spawned FFmpeg's,
+    /// `GPL` or `LGPL` if it says, binds nothing; the linked decoder's is its libraries' first
+    /// that isn't LGPL. The FFmpeg linked into the process is judged from [`linked_ffmpeg`],
+    /// whichever decoder runs.
     fn licence(&mut self) -> Option<&'static str> {
         None
     }

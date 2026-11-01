@@ -159,6 +159,18 @@ pub fn check_with(
     plan: &Plan,
     decoder: Option<&mut dyn Decoder>,
 ) -> Report {
+    check_with_ffmpeg(source, name, plan, decoder, decode::linked_ffmpeg())
+}
+
+/// [`check_with`], with the FFmpeg linked into this process given, so tests can stand in a
+/// non-LGPL one.
+pub(crate) fn check_with_ffmpeg(
+    source: &mut dyn Source,
+    name: &str,
+    plan: &Plan,
+    decoder: Option<&mut dyn Decoder>,
+    ffmpeg: Option<decode::LinkedFfmpeg>,
+) -> Report {
     let started = Instant::now();
     let mut report = Report {
         kairo_verify: report::VERSION,
@@ -174,7 +186,7 @@ pub fn check_with(
         },
         decoder: report::Decoder {
             kind: "none",
-            ffmpeg: decode::linked_ffmpeg(),
+            ffmpeg,
         },
         summary: report::Summary::default(),
         checks: Vec::new(),

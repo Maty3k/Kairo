@@ -49,6 +49,12 @@ jobs:
       - name: Test kairo-core, the mock engine and kairo-verify
         run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify --locked
 
+      # The shipped kairo-verify has no dev-tools: it never spawns FFmpeg (research 16 §2 item 3).
+      - name: kairo-verify without dev-tools
+        run: |
+          cargo clippy -p kairo-verify --no-default-features --all-targets --locked -- -D warnings
+          cargo test -p kairo-verify --no-default-features --lib --locked
+
       - name: House rules (forbidden APIs, sockets outside kairo-net)
         run: |
           set -euo pipefail
@@ -149,6 +155,10 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The shipped kairo-verify: the linked decoder and no dev-tools (research 16 §2 item 3).
+      - name: Test kairo-verify without dev-tools, as it ships
+        run: cargo test -p kairo-verify --no-default-features --lib --locked
 
       # Research 16 §9's W tier: every defect but B-frames, built with the pinned ffmpeg.exe (its real
       # muxer and AAC) and judged by the linked decoder. Generated here; never uploaded.

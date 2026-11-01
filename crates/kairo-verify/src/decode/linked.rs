@@ -50,7 +50,15 @@ pub fn build() -> super::LinkedFfmpeg {
             avcodec: super::version_text(ffmpeg::codec::version()),
             avformat: super::version_text(ffmpeg::format::version()),
         },
-        config_sha256: crate::sha256::hex(ffmpeg::util::configuration().as_bytes()),
+        config_sha256: crate::sha256::hex(
+            [
+                ffmpeg::util::configuration(),
+                ffmpeg::codec::configuration(),
+                ffmpeg::format::configuration(),
+            ]
+            .join("\n")
+            .as_bytes(),
+        ),
         license: refused.unwrap_or(licences()[1]),
         lgpl: refused.is_none(),
     }

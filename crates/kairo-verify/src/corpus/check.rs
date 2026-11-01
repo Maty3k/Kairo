@@ -128,6 +128,14 @@ impl Check<'_> {
     pub fn run(&self, say: &mut dyn FnMut(&str)) -> Result<CorpusReport, CheckError> {
         // An earlier judgement goes first, so a run that stops leaves none behind.
         remove(self.dir, REPORT)?;
+        // A non-LGPL FFmpeg linked into this process judges nothing, whichever decoder runs
+        // (README §2 item 18): the corpus can't be judged.
+        if let Some(refusal) = crate::decode::linked_ffmpeg()
+            .as_ref()
+            .and_then(crate::checks::not_lgpl)
+        {
+            return Err(CheckError::evaluate(refusal));
+        }
         let manifest = self.manifest()?;
         let (encoder, entries) =
             expected(&manifest).map_err(|e| CheckError::evaluate(format!("{MANIFEST}: {e}")))?;
@@ -326,6 +334,10 @@ impl Check<'_> {
         let name = entry.report_file();
         fs::write(self.dir.join(&name), report.to_json() + "\n")
             .map_err(|e| CheckError::write(&name, e))?;
+        // A clip whose size and hash checked out can't be judged only for a reason outside it.
+        if let Some(error) = &report.error {
+            return Err(CheckError::evaluate(format!("{}: {error}", entry.file)));
+        }
         say(&format!(
             "  {} {} in {:.1} s",
             entry.file,

@@ -447,10 +447,16 @@ pub(crate) fn lgpl_finding(
             } else {
                 Status::Skip
             },
-            detail: not_lgpl(ffmpeg)
-                .unwrap_or_else(|| format!("linked and LGPL ({})", ffmpeg.license)),
+            detail: not_lgpl(ffmpeg).unwrap_or_else(|| match (kind, spawned) {
+                (Some(kind), Some(licence)) if kind != "linked" => format!(
+                    "linked and LGPL ({}); the spawned {kind} decoder's FFmpeg: {licence}",
+                    ffmpeg.license
+                ),
+                _ => format!("linked and LGPL ({})", ffmpeg.license),
+            }),
             value: json!({"linked": true, "decoder": kind, "licence": ffmpeg.license,
-                          "libs": ffmpeg.libs, "config_sha256": ffmpeg.config_sha256}),
+                          "libs": ffmpeg.libs, "config_sha256": ffmpeg.config_sha256,
+                          "spawned_licence": spawned.filter(|_| kind != Some("linked"))}),
             ..base()
         },
         None => Finding {
@@ -690,11 +696,28 @@ mod tests {
         ] {
             let f = lgpl_finding(true, Some(&lgpl), kind, spawned);
             assert_eq!(f.status, Status::Pass, "{kind:?}");
-            assert_eq!(f.detail, "linked and LGPL (LGPL version 3 or later)");
+            assert!(
+                f.detail
+                    .starts_with("linked and LGPL (LGPL version 3 or later)"),
+                "{}",
+                f.detail
+            );
             assert_eq!(f.value["linked"], true);
             assert_eq!(f.value["libs"]["avcodec"], "62.11.100");
             assert_eq!(f.value["config_sha256"].as_str().map(str::len), Some(64));
         }
+        // A spawned FFmpeg beside the linked one is still reported (README §2 item 18).
+        let both = lgpl_finding(
+            true,
+            Some(&lgpl),
+            Some("cli"),
+            Some("GPL version 3 or later"),
+        );
+        assert!(
+            both.detail
+                .ends_with("the spawned cli decoder's FFmpeg: GPL version 3 or later")
+        );
+        assert_eq!(both.value["spawned_licence"], "GPL version 3 or later");
         // A GPL or non-free build can't judge clips: an error, whichever decoder ran.
         let gpl = ffmpeg("GPL version 3 or later");
         assert_eq!(
