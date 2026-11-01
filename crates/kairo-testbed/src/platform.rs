@@ -11,7 +11,6 @@ use kairo_core::timeline;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -28,7 +27,7 @@ use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetForegroundWindow, HTCLIENT, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
+    GetForegroundWindow, GetWindowRect, HTCLIENT, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
     SPI_GETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
@@ -151,19 +150,6 @@ impl Drop for Timer {
         // SAFETY: closes the handle CreateWaitableTimerExW gave us, once.
         let _ = unsafe { CloseHandle(self.0) };
     }
-}
-
-/// DWM's latest vblank: its count and its QPC time in 100 ns, for a swap chain whose frame
-/// statistics say nothing.
-pub fn dwm_vblank() -> Option<(u64, i64)> {
-    let mut info = DWM_TIMING_INFO {
-        cbSize: size_of::<DWM_TIMING_INFO>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: `info` is ours and sized; a null window asks for the desktop's timing.
-    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.ok()?;
-    let counter = i64::try_from(info.qpcVBlank).ok()?;
-    Some((info.cRefresh, qpc_to_hns(counter)))
 }
 
 /// Milliseconds since the session's last keyboard or mouse input.
@@ -322,6 +308,14 @@ impl Window {
         let _ = unsafe { SetForegroundWindow(self.hwnd) };
         // SAFETY: reads which window is in front.
         (unsafe { GetForegroundWindow() }) == self.hwnd
+    }
+
+    /// The whole window, frame included, in desktop pixels: left, top, right, bottom.
+    pub fn outer_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let mut rect = RECT::default();
+        // SAFETY: our own window; `rect` is ours.
+        unsafe { GetWindowRect(self.hwnd, &mut rect) }.ok()?;
+        Some((rect.left, rect.top, rect.right, rect.bottom))
     }
 
     /// The client area in desktop pixels: left, top, width, height.

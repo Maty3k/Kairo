@@ -6,11 +6,13 @@
 //!
 //! An HDR toggle during a run ends it with `e hdr_changed` and `e end reason=hdr_changed`:
 //! recreating the swap chain mid-run (README §4.8) waits for M5's G2 tests, the first that
-//! toggle HDR. Messages on stderr name no device path or file path (CLAUDE.md), and neither does
+//! toggle HDR. Losing exclusive fullscreen logs `e fullscreen_lost`, and the run goes on in the
+//! window. Messages on stderr name no device path or file path (CLAUDE.md), and neither does
 //! the log.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -24,20 +26,37 @@ use kairo_display::DisplayTarget;
 
 use crate::cli::{self, Config, Hdr, exit};
 use crate::draw::{self, Format, Plan};
-use crate::gpu::{self, Chain, Gpu, PresentError};
+use crate::gpu::{Chain, Gpu, HdrWatch, PresentError, Statistics, VblankClock};
 use crate::pace::{self, Period, Resolved, Shown, Step, TimerPacer, VsyncPacer};
 use crate::platform::{self, Frame, KeepDisplayOn, Timer, Window};
 use crate::ready::Ready;
 
 /// How long `--activate` keeps asking for the foreground (README §4.1).
 const ACTIVATE_FOR: Duration = Duration::from_secs(10);
-/// How long the vsync loop warms up before it makes do without vblank timing.
+/// How long the vsync loop waits for DXGI's frame statistics before it takes its vblanks from
+/// the monitor's own clock.
 const WARMUP_LIMIT_HNS: i64 = 3 * HNS_PER_SECOND;
-/// How often the display's state is checked.
+/// How long the monitor's clock gets for its first vblank before the loop makes do without
+/// vblank timing.
+const CLOCK_LIMIT_HNS: i64 = HNS_PER_SECOND / 2;
+/// How long a vsync run may take to present its first frame: the warm-up, the clock, the whole
+/// second after them and a margin.
+const FIRST_FRAME_LIMIT_HNS: i64 = 6 * HNS_PER_SECOND;
+/// How long the statistics get to report the last frames at the end.
+const SETTLE_HNS: i64 = HNS_PER_SECOND / 10;
+/// How often the monitor's HDR state is checked.
 const CHECK_EVERY_HNS: i64 = HNS_PER_SECOND / 2;
 
 /// Why a run stopped: an exit code and a message without paths.
 struct Stop(u8, String);
+
+/// The pacer's clock jumped by more than an hour of frames.
+fn lost_clock() -> Stop {
+    Stop(
+        exit::DEVICE,
+        "the clock jumped by more than an hour of frames".to_owned(),
+    )
+}
 
 /// Runs the testbed; returns the exit code.
 pub fn run(config: &Config) -> u8 {
@@ -66,6 +85,7 @@ pub fn run(config: &Config) -> u8 {
 /// time.
 struct Log {
     file: Option<File>,
+    path: Option<PathBuf>,
     header: Option<TestbedHeader>,
     started: bool,
     waiting: Vec<String>,
@@ -86,6 +106,7 @@ impl Log {
         };
         Ok(Log {
             file,
+            path: config.log.clone(),
             header: None,
             started: false,
             waiting: Vec::new(),
@@ -141,8 +162,16 @@ impl Log {
     }
 
     /// The `end` event; if frame 0 never came, the header still opens the log (with the time
-    /// now), so the setup events parse.
+    /// now), so the setup events parse. A run that failed before its window existed has no
+    /// header to write, so its empty log is removed.
     fn finish(&mut self) {
+        if self.header.is_none() {
+            if let (Some(file), Some(path)) = (self.file.take(), &self.path) {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
         let reason = self.end_reason;
         self.event("end", &[("reason", reason)]);
         if !self.started {
@@ -166,9 +195,9 @@ struct Ctx<'a> {
     period: Period,
     refresh_mhz: u64,
     hdr: Option<(f64, f64)>,
+    hdr_watch: Option<HdrWatch>,
     stdin_eof: Arc<AtomicBool>,
     next_check_hns: i64,
-    fullscreen_lost: bool,
 }
 
 /// Sets the run up and runs it.
@@ -207,7 +236,11 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     };
     let fps = config.fps.unwrap_or_else(|| cli::default_fps(refresh_mhz));
     let k = refresh.fits_vsync(fps);
-    if let Some(why) = cli::refuse_rate(config.pace, fps, k) {
+    let vsync_rates: Vec<u32> = (1..=4_u64)
+        .filter_map(|k| u32::try_from((refresh_mhz + 500 * k) / (1_000 * k)).ok())
+        .filter(|&rate| refresh.fits_vsync(rate).is_some())
+        .collect();
+    if let Some(why) = cli::refuse_rate(config.pace, config.mode, fps, k, &vsync_rates) {
         return Err(Stop(exit::MONITOR, why));
     }
     let gpu =
@@ -248,6 +281,19 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     };
     let window =
         Window::create(frame, left, top, width, height).map_err(|e| Stop(exit::DEVICE, e))?;
+    if config.mode == Mode::Windowed {
+        // The framed window, still hidden, must sit inside the monitor, so the pattern never
+        // spills onto a neighbour, which may be the OLED (README §4.11).
+        let inside = window.outer_rect().is_some_and(|(l, t, r, b)| {
+            l >= rect.left && t >= rect.top && r <= rect.right && b <= rect.bottom
+        });
+        if !inside {
+            return Err(Stop(
+                exit::USAGE,
+                "--size doesn't fit the monitor, frame included".to_owned(),
+            ));
+        }
+    }
     let (_, _, cw, ch) = window.client_rect();
     let size = Size::new(cw.max(0) as u32, ch.max(0) as u32)
         .map_err(|e| Stop(exit::DEVICE, format!("the client area: {e}")))?;
@@ -289,14 +335,11 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     } else {
         window.show(false);
     }
+    // D3D11 has no frame-latency waitable object in exclusive fullscreen: there the blocking
+    // Present paces the loop.
+    let waitable = config.pace == Pace::Vsync && config.mode != Mode::Exclusive;
     let mut chain = gpu
-        .swap_chain(
-            window.hwnd(),
-            size.width(),
-            size.height(),
-            format,
-            config.pace == Pace::Vsync,
-        )
+        .swap_chain(window.hwnd(), size.width(), size.height(), format, waitable)
         .map_err(|e| Stop(exit::DEVICE, e))?;
     if config.mode == Mode::Exclusive {
         let entered = chain.enter_fullscreen();
@@ -317,6 +360,10 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
             None => Patches::Sdr,
         },
     };
+    let hdr_watch = match config.hdr {
+        Hdr::Auto => HdrWatch::new(target.adapter_luid, target.hmonitor),
+        Hdr::Off => None,
+    };
     let mut ctx = Ctx {
         config,
         log,
@@ -330,9 +377,9 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
         period,
         refresh_mhz,
         hdr,
+        hdr_watch,
         stdin_eof,
         next_check_hns: 0,
-        fullscreen_lost: false,
     };
     match (config.pace, k) {
         (Pace::Vsync, Some(k)) => vsync_loop(&mut ctx, k),
@@ -403,30 +450,33 @@ impl Ctx<'_> {
         }
     }
 
-    /// Every half second: has exclusive fullscreen been lost, or HDR toggled? The latter ends
-    /// the run.
-    fn check_display(&mut self, now: i64) -> Option<&'static str> {
+    /// Every half second: has the monitor's HDR state changed? That ends the run
+    /// (`e hdr_changed`).
+    fn hdr_changed(&mut self, now: i64) -> bool {
         if now < self.next_check_hns {
-            return None;
+            return false;
         }
         self.next_check_hns = now + CHECK_EVERY_HNS;
-        if self.config.mode == Mode::Exclusive
-            && !self.fullscreen_lost
-            && !self.chain.is_fullscreen()
-        {
-            self.fullscreen_lost = true;
+        let Some(pq) = self.hdr_watch.as_mut().and_then(HdrWatch::changed) else {
+            return false;
+        };
+        if pq == self.hdr.is_some() {
+            return false;
+        }
+        self.log
+            .event("hdr_changed", &[("hdr", if pq { "1" } else { "0" })]);
+        true
+    }
+
+    /// Exclusive mode: if DXGI has taken the swap chain out of fullscreen, `e fullscreen_lost`
+    /// and the `ResizeBuffers` its next `Present` needs; the run goes on in the window. `true`
+    /// if that happened.
+    fn fullscreen_lost(&mut self) -> Result<bool, Stop> {
+        let lost = self.chain.leave_if_lost();
+        if lost != Ok(false) {
             self.log.event("fullscreen_lost", &[]);
         }
-        if self.config.hdr == Hdr::Auto && !self.gpu.is_current() {
-            let pq = gpu::output_hdr_now(self.target.adapter_luid, self.target.hmonitor)
-                .is_some_and(|o| o.pq);
-            if pq != self.hdr.is_some() {
-                self.log
-                    .event("hdr_changed", &[("hdr", if pq { "1" } else { "0" })]);
-                return Some("hdr_changed");
-            }
-        }
-        None
+        lost.map_err(|e| Stop(exit::DEVICE, format!("leaving fullscreen: {e}")))
     }
 
     /// Frame `frame`'s plan.
@@ -437,15 +487,53 @@ impl Ctx<'_> {
             .map_err(|e| Stop(exit::DEVICE, format!("frame {frame}: {e}")))
     }
 
-    /// Presents; a lost device ends the run (`e device_lost`, exit 4).
-    fn present(&mut self, interval: u32) -> Result<(), Stop> {
+    /// Presents; `false` if exclusive fullscreen was lost just before, and the frame with it. A
+    /// lost device ends the run (`e device_lost`, exit 4).
+    fn present(&mut self, interval: u32) -> Result<bool, Stop> {
         match self.chain.present(interval) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(PresentError::DeviceLost(why)) => {
                 self.log.event("device_lost", &[]);
                 Err(Stop(exit::DEVICE, format!("the device was lost: {why}")))
             }
-            Err(PresentError::Other(why)) => Err(Stop(exit::DEVICE, why)),
+            Err(PresentError::Other(why)) => {
+                if self.fullscreen_lost()? {
+                    Ok(false)
+                } else {
+                    Err(Stop(exit::DEVICE, why))
+                }
+            }
+        }
+    }
+
+    /// Reads the statistics and writes the frames they settle; `true` if there was a reading.
+    fn statistics(&mut self, shown: &mut Shown, miss: Miss) -> bool {
+        match self.chain.stats() {
+            Statistics::Read(stats) => {
+                for r in shown.on_stats(stats) {
+                    self.log.frame(r, miss);
+                }
+                true
+            }
+            Statistics::Disjoint => {
+                shown.disjoint();
+                false
+            }
+            Statistics::Nothing => false,
+        }
+    }
+
+    /// What the statistics can still say about the frames presented last: they are read until
+    /// every frame is reported, for up to [`SETTLE_HNS`] (a composed window shows a frame a
+    /// vblank after it takes it); the rest get `-`. Every way out of a loop comes through here.
+    fn settle(&mut self, shown: &mut Shown, miss: Miss) {
+        let until = platform::now_hns() + SETTLE_HNS;
+        while shown.waiting() && platform::now_hns() < until {
+            self.statistics(shown, miss);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for r in shown.finish() {
+            self.log.frame(r, miss);
         }
     }
 
@@ -489,54 +577,76 @@ impl Ctx<'_> {
     }
 }
 
-/// Vsync pacing (README §4.3): wait for the swap chain, read its statistics, draw, present.
+/// Vsync pacing (README §4.3): wait for the swap chain, read its statistics, draw, present with
+/// interval k (the warm-up's black frames with 1).
 fn vsync_loop(ctx: &mut Ctx<'_>, k: u32) -> Result<(), Stop> {
+    let mut pacer = VsyncPacer::new(k, ctx.period, pace::next_whole_second(platform::now_hns()));
+    let result = vsync_frames(ctx, &mut pacer);
+    ctx.settle(pacer.shown(), Miss::Vblank);
+    result
+}
+
+fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
     let loop_start = platform::now_hns();
-    let mut pacer = VsyncPacer::new(k, ctx.period, pace::next_whole_second(loop_start));
     let black = Plan::black();
-    let mut dxgi_stats = false;
-    let mut timing_missing = false;
+    // Until DXGI's statistics come: after the warm-up the monitor's own clock, and without one a
+    // grid from the loop's own time.
+    let mut statistics = false;
+    let mut clock: Option<VblankClock> = None;
+    let mut no_timing = false;
     let mut end = None;
     loop {
         if let Some(reason) = ctx.stop_requested() {
             ctx.log.end_reason = reason;
-            break;
+            return Ok(());
         }
         let now = platform::now_hns();
         if end.is_some_and(|end| now >= end) {
-            break;
+            return Ok(());
         }
-        if let Some(reason) = ctx.check_display(now) {
-            ctx.log.end_reason = reason;
-            break;
+        if end.is_none() && now - loop_start > FIRST_FRAME_LIMIT_HNS {
+            return Err(Stop(
+                exit::DEVICE,
+                "no frame went out: the swap chain took none".to_owned(),
+            ));
+        }
+        if ctx.hdr_changed(now) {
+            ctx.log.end_reason = "hdr_changed";
+            return Ok(());
         }
         if !ctx.chain.wait(1_000) {
             continue;
         }
-        match ctx.chain.stats() {
-            Some(stats) => {
-                dxgi_stats = true;
-                for r in pacer.on_stats(stats) {
-                    ctx.log.frame(r, Miss::Vblank);
-                }
-            }
-            None if !dxgi_stats => match platform::dwm_vblank() {
-                Some((count, t)) => pacer.on_dwm_vblank(count, t),
-                None if !timing_missing && now - loop_start > WARMUP_LIMIT_HNS => {
-                    // Neither DXGI nor DWM says when vblanks happen: a grid from now.
-                    timing_missing = true;
+        ctx.fullscreen_lost()?;
+        if ctx.statistics(pacer.shown(), Miss::Vblank) {
+            statistics = true;
+            clock = None;
+        }
+        let now = platform::now_hns();
+        for r in pacer.shown().expire(now) {
+            ctx.log.frame(r, Miss::Vblank);
+        }
+        if !statistics && now - loop_start > WARMUP_LIMIT_HNS {
+            let clock = clock.get_or_insert_with(|| {
+                ctx.log.event("no_frame_statistics", &[]);
+                VblankClock::start(ctx.target.adapter_luid, ctx.target.hmonitor, ctx.period)
+            });
+            match clock.latest() {
+                Some(t) => pacer.on_vblank(t),
+                None if !no_timing && now - loop_start > WARMUP_LIMIT_HNS + CLOCK_LIMIT_HNS => {
+                    no_timing = true;
                     ctx.log.event("no_vblank_timing", &[]);
-                    pacer.on_dwm_vblank(0, now);
+                    pacer.on_vblank(now);
                 }
                 None => {}
-            },
-            None => {}
+            }
         }
         match pacer.next(platform::now_hns()) {
             Step::Warmup => {
                 ctx.chain.draw(&black);
                 ctx.present(1)?;
             }
+            Step::Lost => return Err(lost_clock()),
             Step::Frame {
                 frame,
                 target_hns,
@@ -547,63 +657,64 @@ fn vsync_loop(ctx: &mut Ctx<'_>, k: u32) -> Result<(), Stop> {
                 }
                 let plan = ctx.plan(frame)?;
                 ctx.chain.draw(&plan);
-                ctx.present(if frame == 0 { 1 } else { k })?;
+                if !ctx.present(pacer.interval())? {
+                    ctx.log.missed(frame, Miss::Vblank);
+                    continue;
+                }
                 let present_hns = platform::now_hns();
                 let id = ctx.chain.present_count().unwrap_or(0);
                 pacer.presented(frame, target_hns, id, present_hns);
-                if frame == 0 {
-                    ctx.started(target_hns)?;
-                    end = Some(ctx.end_hns(target_hns));
+                if end.is_none() {
+                    // Frame 0's time, even when a late start skipped it.
+                    let start = pacer.anchor().unwrap_or(target_hns);
+                    ctx.started(start)?;
+                    end = Some(ctx.end_hns(start));
                 }
             }
         }
     }
-    // What the statistics can still say about the last frames.
-    ctx.chain.wait(200);
-    if let Some(stats) = ctx.chain.stats() {
-        for r in pacer.on_stats(stats) {
-            ctx.log.frame(r, Miss::Vblank);
-        }
-    }
-    for r in pacer.finish() {
-        ctx.log.frame(r, Miss::Vblank);
-    }
-    Ok(())
 }
 
 /// Timer pacing (README §4.3): draw, wait for the slot, `Present(0, 0)`.
 fn timer_loop(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
-    let timer = Timer::new();
-    let start = pace::next_whole_second(platform::now_hns());
-    let end = ctx.end_hns(start);
-    let mut pacer = TimerPacer::new(start, ctx.fps);
+    let mut pacer = TimerPacer::new(pace::next_whole_second(platform::now_hns()), ctx.fps);
     let mut shown = Shown::new(None, ctx.period);
+    let result = timer_frames(ctx, &mut pacer, &mut shown);
+    ctx.settle(&mut shown, Miss::Slot);
+    result
+}
+
+fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) -> Result<(), Stop> {
+    let timer = Timer::new();
+    // Frame 0's slot, even when the loop first runs after it.
+    let start = pacer.slot_time(0);
+    let end = ctx.end_hns(start);
     let mut started = false;
     loop {
         if let Some(reason) = ctx.stop_requested() {
             ctx.log.end_reason = reason;
-            break;
+            return Ok(());
         }
         let now = platform::now_hns();
-        if let Some(reason) = ctx.check_display(now) {
-            ctx.log.end_reason = reason;
-            break;
+        if ctx.hdr_changed(now) {
+            ctx.log.end_reason = "hdr_changed";
+            return Ok(());
         }
-        if let Some(stats) = ctx.chain.stats() {
-            for r in shown.on_stats(stats) {
-                ctx.log.frame(r, Miss::Slot);
-            }
+        ctx.statistics(shown, Miss::Slot);
+        for r in shown.expire(now) {
+            ctx.log.frame(r, Miss::Slot);
         }
-        let Step::Frame {
-            frame,
-            target_hns,
-            skipped,
-        } = pacer.next(now)
-        else {
-            continue;
+        let (frame, target_hns, skipped) = match pacer.next(now) {
+            Step::Frame {
+                frame,
+                target_hns,
+                skipped,
+            } => (frame, target_hns, skipped),
+            Step::Lost => return Err(lost_clock()),
+            Step::Warmup => continue,
         };
         if target_hns >= end {
-            break;
+            return Ok(());
         }
         for s in skipped {
             ctx.log.missed(s, Miss::Slot);
@@ -619,24 +730,17 @@ fn timer_loop(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
                 }
             }
         }
-        ctx.present(0)?;
+        if !ctx.present(0)? {
+            ctx.log.missed(frame, Miss::Slot);
+            continue;
+        }
         let present_hns = platform::now_hns();
         let id = ctx.chain.present_count().unwrap_or(0);
         let missed = pacer.missed(frame, present_hns);
         shown.presented(frame, target_hns, id, present_hns, missed);
         if !started {
             started = true;
-            ctx.started(target_hns)?;
+            ctx.started(start)?;
         }
     }
-    std::thread::sleep(Duration::from_millis(100));
-    if let Some(stats) = ctx.chain.stats() {
-        for r in shown.on_stats(stats) {
-            ctx.log.frame(r, Miss::Slot);
-        }
-    }
-    for r in shown.finish() {
-        ctx.log.frame(r, Miss::Slot);
-    }
-    Ok(())
 }

@@ -218,7 +218,7 @@ Each item gives the decision, then the reason and its sources. **Conflict** mark
 |---|---|---|---|---|
 | `kairo-core` (exists) | lib | forbidden (core/lib.rs:15) | none new | + `testsig`, `testbed_log`, `cadence::steps` |
 | `kairo-verify` | lib + bin | forbidden | `serde`, `serde_json`, `kairo-core`; Windows only: `ffmpeg-next` =9.0.0 (`default-features = false`, `codec`, `format`) and `ffmpeg-sys-next` =9.0.1 (`default-features = false`, `avcodec`, `avformat`, as the M0 `ffcheck` prototype does: its defaults would add avdevice, avfilter, swresample and swscale through feature unification). Feature `dev-tools` (default) | `mp4/`, `h264.rs`, `aac.rs`, `decode/{linked,cli,synthetic}.rs`, `analyze/{barcode,flash,cadence,bars,levels,hdr,tones,av,routing,cue}.rs`, `checks/`, `profile.rs`, `report.rs`, `synth.rs` (incl. I_PCM), `mutate.rs`, `corpus.rs` |
-| `kairo-testbed` | bins `testbed`, `kairo-tone` | only in `gpu`, `audio`, `platform`, with `// SAFETY:` (CL:32) | `windows` =0.62.2, `wasapi` =0.26.0, `kairo-core`, `kairo-display` | window, swap chain, pacing, renderer, beeps, logs |
+| `kairo-testbed` | bins `testbed`, `kairo-tone` | only in `gpu`, `audio`, `platform`, with `// SAFETY:` (CL:32) | `windows` =0.62.2, `wasapi` =0.26.0, `kairo-core`, `kairo-display`, `serde_json` | window, swap chain, pacing, renderer, beeps, logs |
 | `kairo-display` | lib | only in `platform` | `windows` =0.62.2 | QueryDisplayConfig: device path → GDI name → HMONITOR → rect, refresh, HDR state → adapter LUID → DXGI index and vendor:device (R08 §7.2–7.3) |
 | `kairo-harness` | bin | only in `platform`, with `// SAFETY:`: `GetDiskFreeSpaceExW`, `SetThreadExecutionState`, and a Toolhelp `TH32CS_SNAPPROCESS` snapshot matched by image name (allowed, ci:58). It opens no other process | `kairo-core`, `kairo-display`, `serde_json`, `windows` =0.62.2 | verbs `run`, `corpus`, `probe`, `displays` |
 
@@ -269,13 +269,13 @@ kairo_core::testsig (pattern v1: Scene(N) = solid rects + 1-D bands + texture ba
 ### 4.1 Window modes
 
 - **Borderless (default).** A `WS_POPUP` window covering the monitor's rect, shown with `SW_SHOWNOACTIVATE`. Window capture needs no focus.
-- **Windowed.** A framed window of client `--size` (default 1280×720), centred on the monitor.
+- **Windowed.** A framed window of client `--size` (default 1280×720), centred on the monitor. The window, frame included, must fit on the monitor (else exit 2), so the pattern never spills onto a neighbouring screen.
 - **Exclusive.** It needs keyboard focus: `SetFullscreenState` fails with `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` when "the output window does not have keyboard focus" (MS). So exclusive implies `--activate`, then:
   1. `SetFullscreenState(TRUE, output)` on the `IDXGIOutput` whose `Monitor` equals the HMONITOR;
   2. `ResizeBuffers`, which flip-model swap chains need after the switch (MS);
   3. `GetFullscreenState` must report TRUE: `e fse result=ok`, otherwise `e fse result=failed` and exit 5.
 
-  Losing fullscreen later logs `e fullscreen_lost`. It keeps the desktop's display mode, uses vsync only, and runs on the 180 Hz monitor only. It exists for M1:159 and SP6.
+  Losing fullscreen later (DXGI leaves it when the window loses focus) logs `e fullscreen_lost`; after the `ResizeBuffers` that flip-model swap chains need before their next `Present` (MS), the run goes on in the window. It keeps the desktop's display mode, uses vsync only, and runs on the 180 Hz monitor only. It exists for M1:159 and SP6.
 - **`--activate`** (exclusive mode, and M1:159's fullscreen test, which `watch.json` can only see as a fullscreen *foreground* window, M0:74). The testbed waits until the owner's last input (`GetLastInputInfo`) is older than the foreground lock time-out (`SPI_GETFOREGROUNDLOCKTIMEOUT`, 200 s by default) plus 5 s. Then it shows the window with `SW_SHOW`, calls `SetForegroundWindow`, checks `GetForegroundWindow` and retries for 10 s: `e activate result=ok`, otherwise `e activate result=failed` and exit 5.
   - An expired lock time-out is one of the conditions MS lists, but "it is possible for a process to be denied the right to set the foreground window even if it meets these conditions" (MS) [Unverified for a task-launched process; PR 8's attended run settles it].
   - It never synthesises input, presses keys or attaches to another thread's input (CL:10, ci:59).
@@ -293,21 +293,23 @@ kairo_core::testsig (pattern v1: Scene(N) = solid rects + 1-D bands + texture ba
 ### 4.3 Pacing and frame numbering
 
 - **`--pace vsync` (default).** `Present(k, 0)` with k = refresh/fps and k ≤ 4, since SyncInterval runs 1–4 (MS). It refuses rates that are not within 0.5% of refresh/k: 60, 90 and 180 on the 180 Hz monitor; 90, 120, 180 and 360 at 360 Hz. 60 and 72 at 360 Hz need `--pace timer`.
+  - In the flip model a present's interval is how long its frame stays on screen: the next frame can flip no earlier than k vblanks after it (MS's queue example). So every frame, frame 0 included, is presented with k, and the black warm-up frames before frame 0 with 1, so that frame 0 can take the anchor's vblank.
+  - Targets are QPC times, never vblank counts: DXGI counts vblanks from boot in fullscreen and from the swap chain's creation in a window, and a vblank clock counts its own. Each frame is aimed k vblanks after the vblank the previous one really showed at (less a composed window's latency, learned as the least display − target), or, after a stall, at the first vblank still reachable, where it then shows.
 - **`--pace timer`.** A `CreateWaitableTimerExW(HIGH_RESOLUTION)` on absolute QPC slots from core/timeline.rs's tick maths, then `Present(0, 0)` with flip-discard and no tearing flag. Composition shows the newest frame each vblank. Rates are 60–360 fps.
 - The process opts out of EcoQoS (CB:57, P16).
-- **Frame number N is time-based.** N is the index of the vblank group (vsync) or the slot (timer) the frame targets. A late frame shows up as a skipped N plus an `m` log line, the way a game's clock keeps running, so a testbed miss is never mistaken for a capture drop.
-- **Start.** Frame 0 is presented at the first vblank (vsync) or slot (timer) at or after the next whole QPC second. That anchors the flash and the game beep to the voice beep's QPC grid (§2 item 8).
-- **Swap chain.** `FLIP_DISCARD`, 2 buffers, a frame-latency waitable object, `SetMaximumFrameLatency(1)`. Format: BGRA8, or `R16G16B16A16_FLOAT` with `SetColorSpace1(RGB_FULL_G10_NONE_P709)` in HDR mode (R08:666–669).
+- **Frame number N is time-based.** N is the index of the vblank group (vsync, rounded to the nearest group) or the slot (timer) the frame targets. A late frame shows up as a skipped N plus an `m` log line, the way a game's clock keeps running, so a testbed miss is never mistaken for a capture drop. A frame shown more than k vblanks after the one before it, by DXGI's own counts, gets an `m` line too. A jump of more than an hour of frames ends the run (exit 4).
+- **Start.** Frame 0 is presented at the first vblank (vsync) or slot (timer) at or after the next whole QPC second. That anchors the flash and the game beep to the voice beep's QPC grid (§2 item 8). If no vblank timing came before that vblank, frame 0 moves to the next whole second; a loop that stalls past frame 0 skips frames with `m` lines, and `start_hns` stays frame 0's time. A vsync run that presents no frame within 6 s exits 4.
+- **Swap chain.** `FLIP_DISCARD`, 2 buffers, a frame-latency waitable object, `SetMaximumFrameLatency(1)`. In exclusive fullscreen, where D3D11 doesn't support the waitable object (MS), `IDXGIDevice1::SetMaximumFrameLatency(1)` instead, and the blocking `Present` paces the loop. Format: BGRA8, or `R16G16B16A16_FLOAT` with `SetColorSpace1(RGB_FULL_G10_NONE_P709)` in HDR mode (R08:666–669).
 
 ### 4.4 Rendering
 
 - Every element of pattern v1 is either a solid rectangle or a horizontal 1-D band. There is no HLSL and nothing from OBS (CL:17, M1:192).
   - **Background:** `ClearRenderTargetView` black, so OLED pixels are off.
   - **Solid rectangles** (barcode cells, flash, patches): `ID3D11DeviceContext1::ClearView` on the back buffer's RTV with one rect list per colour.
-  - **1-D bands** (bars, ramp): each frame the CPU evaluates one row with `testsig` at device pixel centres, uploads it with `UpdateSubresource` into a W×1 texture of the back-buffer format, and fills the band by doubling `CopySubresourceRegion` (1 → 2 → 4 … rows). [PR 8a: D3D11 can't copy within one subresource, so the doubling goes through a scratch texture: the rows done so far go into it and back below themselves.]
-  - **Load band:** `CopySubresourceRegion` from a texture made once, one period of the band wide: 512·H/gcd(H, 135) px (4,096 at 1080p, 8,192 at 720p, 16,384 at 1440p), read with a moving source box that splits into two copies where it wraps (the motion pattern copies each of its 12 block rows that way). Every frame's band is a window of that texture, whole pixels included. Heights whose period is above D3D11's 16,384 px (1200 and 1600, for example) have the CPU evaluate the 12 block rows each frame instead. Per-frame upload is about 20 KB. [PR 8a evaluates the 12 block rows on the CPU at every height, about 14 rows of upload a frame: a window of a pre-made texture is exact only where the 5 u step is a whole number of pixels.]
+  - **1-D bands** (bars, ramp, and the load band's block rows): each frame the CPU evaluates each distinct row with `testsig` at device pixel centres, through a table of the 256 codes' values in FP16. One `UpdateSubresource` uploads the frame's 14–15 rows into a W×32 row texture of the back-buffer format: about 105 KiB at 1080p in SDR, twice that in FP16. Each run of identical rows is then filled by doubling copies (1 → 2 → 4 … rows) through a scratch texture: plain `CopySubresourceRegion` can't copy within one subresource (`CopySubresourceRegion1` can, where the driver reports `CopyWithOverlap`), so the rows done so far go into the scratch texture and back below themselves.
+  - **Load band:** its 12 block rows (2 more where the motion pattern splits one at the wrap) are evaluated on the CPU each frame and counted in the upload above. A window of a texture made once would be exact only where the 5 u step is a whole number of pixels.
 - **Pixel rounding.** Every u→px conversion uses `testsig::px(x_u) = round_half_away(x_u·H/1080)`, everywhere.
-- **WARP test** (Windows CI, PLAN:342). The same ops on a WARP device and an offscreen texture must equal `testsig`'s CPU raster byte for byte, for N in {0, 1, 179, 180, 181, 5000}, at 1920×1080 and 2560×1440.
+- **WARP test** (Windows CI, PLAN:342). The same ops on a WARP device and an offscreen texture must equal `testsig`'s CPU raster byte for byte, for N in {0, 1, 179, 180, 181, 5000}, at 1920×1080 and 2560×1440; and the motion pattern with the scroll and churn loads, the full pattern with none, at 1280×720 and 641×361, and FP16 with patches above SDR white.
 - **[Unverified]** `ClearView` with rects and copies into a flip-model back buffer on the AMD driver. Fallback: copy from pre-made solid tiles, or a 10-line pass-through shader that only `Load`s those textures (runtime `D3DCompile`, CB:377). Either way no pattern maths lives in HLSL.
 
 ### 4.5 Pattern v1: geometry
@@ -380,13 +382,15 @@ h pattern=1 run=93 mode=borderless pace=vsync fps=180 F=180 size=2560x1440 refre
 f <N> <target_hns> <present_hns> <display_hns|->
 b <m> <N_f> <target_hns> <played_hns|->
 m <N> vblank|slot
-e <name> [k=v …]   (ready, activate result=ok|failed, fse result=ok|failed, fullscreen_lost, hdr_changed,
-                    device_lost, audio_failed, audio_device_changed, end reason=…)
+e <name> [k=v …]   (ready, activate result=ok|failed, fse result=ok|failed, fullscreen_lost,
+                    hdr_changed hdr=0|1, device_lost, no_frame_statistics, no_vblank_timing,
+                    audio_failed, audio_device_changed, end reason=…)
 ```
 
 - **Times** are absolute QPC in 100 ns (core/timeline.rs:88).
   - `display`: the vblank where frame N first appeared, from `GetFrameStatistics` (PresentCount → SyncQPCTime); `-` if unknown or never shown.
-  - **[Unverified]** for composed borderless and windowed modes. The fallback is the vblank grid from `DwmGetCompositionTimingInfo`.
+  - A frame the statistics haven't reported a second after its present gets `-`; so do frames between two reported ones unless those two kept exact cadence.
+  - **[Unverified]** for composed borderless and windowed modes. If `GetFrameStatistics` gives nothing through the 3 s warm-up, the log says `e no_frame_statistics`, the pacer takes its vblanks from the monitor's own clock (a thread on `IDXGIOutput::WaitForVBlank`, its wake times filtered) and every `display` is `-`: unknown, not missed. DWM's composition clock isn't used: since Windows 8.1 it follows the primary or fastest display, not necessarily this one. With no clock either, `e no_vblank_timing`, and the grid comes from the loop's own time.
 - **Writing.** Each line goes out in one `write_all`. The parser drops a torn last line, as `Trace::parse` does (core/trace.rs:130–165).
 - **Privacy.** No device paths, monitor, adapter or PC names, window titles or wall-clock time (CL:16). It is a raw result: `C:\kairo\logs` and `.dogfood/` only (M1:72–74). A committed fixture would be rebased to 0 and needs the owner's OK (M1:195).
 
@@ -401,7 +405,8 @@ testbed.exe --monitor <monitorDevicePath> [--mode borderless|windowed|exclusive]
 
 - `--fps` defaults to the rounded refresh rate. `--seconds` defaults to 60 and has no cap of its own: devrun's `max_seconds` bounds every run (soaks with verified saves run for hours, PLAN:345), and the OLED's 600 s cap is enforced where the OLED is known (§4.11).
 - The testbed exits at `--seconds`, at WM_CLOSE, or at EOF on stdin only with `--stop-on-stdin-eof`, which the harness passes along with a piped stdin. devrun starts every job with a NUL stdin (devrun/run.rs:160), which reads as EOF at once.
-- **`ready.json`** is written after the first present: pid, hwnd, client rect, refresh in mHz, adapter LUID, DXGI adapter and output index (valid in this process only), format, mode, fps and `start_hns`. It stays local.
+- **`ready.json`** is written after the first present: pid, hwnd, client rect, refresh in mHz, adapter LUID, DXGI adapter and output index (valid in this process only), format, mode, fps and `start_hns`. It stays local. It is linked in whole from a temporary file, which fails if a file got there during the run (exit 2) where a rename would replace it.
+- A run that fails before its window exists removes its empty log; one that fails before frame 0 writes the header with the failure's time as `start_hns`.
 - **Exit codes:** 0 ok · 2 usage · 3 monitor not found or rate refused · 4 device or swap-chain failure · 5 focus or exclusive fullscreen not obtained.
 
 ### 4.11 Screens, OLED and the 180 Hz monitor
@@ -793,7 +798,7 @@ The schema is M0's (M0:72, core/job.rs:37). devrun stops the whole job tree on o
 |---|---|---|---|
 | 0 setup | Hold `ES_DISPLAY_REQUIRED`; run folder `harness-<stamp>\`; prune to the newest 5; ≥2 GB free (`GetDiskFreeSpaceExW`); refuse if any process named `ffmpeg.exe` is running (a Toolhelp snapshot by name; one session at a time, M1:94); resolve device path → rect, refresh, HDR (exit 3 if HDR), LUID → DXGI index and vendor:device; pick a run tag | 5 s | <1 s |
 | 1 testbed | `testbed.exe --monitor … --mode borderless --fps 180 --seconds 150 --stop-on-stdin-eof --run-tag T --log testbed.log --ready ready.json` (stdin piped); wait for `ready.json`. 150 s outlasts phases 1–3 (≤78 s) | 15 s | 1–2 s |
-| 2 warm-up | Steady presents, and display times (or the DWM composition grid where those are unavailable, risk 7) advancing at the refresh ±1% (else exit 3, "display off") | 3 s | 3 s |
+| 2 warm-up | Steady presents, and display times (or present times where the log says `e no_frame_statistics`, risk 7) advancing at the refresh ±1% (else exit 3, "display off") | 3 s | 3 s |
 | 3 capture | §8.4, `-t 30`, killed 30 s after the expected end | 60 s | 32 s |
 | 4 stop | Close the testbed's stdin, wait for `e end`, kill after 5 s | 5 s | <1 s |
 | 5 verify | `kairo-verify check capture.mp4 --profile capture\|smoke --expect expect.json --testbed-log testbed.log --json verify.json --summary verify.txt` | 120 s | 10–15 s |
@@ -977,7 +982,7 @@ Branches follow `m1/<slug>`; Conventional Commits with DCO; squash after CI (CL:
 | 4 | libclang on `windows-latest` [Unverified] | PR 6's CI | Install a pinned LLVM with a checksum |
 | 5 | DXGI adapter order per process [Unverified] | `Using device vvvv:dddd`, `Using provided hw_device_ctx` and `AMF via D3D11.` on every run | Exit 4; retry with the index that matches |
 | 6 | `ClearView` with rects, and copies into flip back buffers on AMD [Unverified] | PR 8's WARP test, then the attended run | Solid-tile copies, or a pass-through shader |
-| 7 | Display times per frame in composed modes [Unverified] | PR 8's attended run | `DwmGetCompositionTimingInfo` grid; else `-` and log-free analysis |
+| 7 | Display times per frame in composed modes [Unverified] | PR 8's attended run | Pacing by the monitor's own vblank clock (`IDXGIOutput::WaitForVBlank`), display times `-`, and log-free analysis |
 | 8 | WGC delivers ≈180/s at `max_framerate=360` on the 180 Hz monitor [Unverified; modelled] | The first harness captures | Report as found; SP2 decides; not a verifier bug |
 | 9 | AMF's clean bars PSNR at 25 Mbps [Unverified; VideoToolbox ≥49.3 dB] | The PC corpus | Below 43 dB: revisit load and bitrate and propose a per-preset limit in the gate report; 40 dB stays the plan's rule |
 | 10 | Line-error threshold on AMF [proposed 4 codes] | The PC corpus calibrates max(4, 2 × clean) (§7.4) | A warning outside `test` |

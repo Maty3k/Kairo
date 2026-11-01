@@ -8,14 +8,18 @@
 //! - each run of identical band rows ([`Scene::band_runs`]) is one row, evaluated by `testsig`
 //!   at the device's pixel centres and uploaded once into a row texture. It is copied into the
 //!   run's first row, then doubled: the rows done so far go into a scratch texture and back below
-//!   themselves. D3D11 can't copy within one subresource, hence the scratch texture;
+//!   themselves. Plain `CopySubresourceRegion` can't copy within one subresource
+//!   (`CopySubresourceRegion1` can, where the driver reports `CopyWithOverlap`), so the scratch
+//!   texture keeps to the D3D11.0 call;
 //! - the rectangles (patches, flash, barcode cells) are `ClearView` calls, one per colour, each
 //!   with its list of rectangles. They come after the bands, as in `Scene::raster_srgb`.
 //!
 //! In SDR the swap chain is BGRA8 and holds sRGB codes. In HDR it is FP16 scRGB, where 1.0 is
 //! 80 nits: SDR elements are their sRGB-decoded value × the OS's SDR white / 80, as Windows
 //! composes SDR apps, and the HDR patches are their nits / 80 (README §4.8). Colours given to
-//! `ClearView` are rounded to the format first, so the GPU's conversion is exact.
+//! `ClearView` are rounded to the format first, so the GPU's conversion is exact. The 256 codes'
+//! FP16 values are worked out once per frame, into a palette: an sRGB decode for every band
+//! pixel would cost milliseconds.
 
 use std::fmt;
 
@@ -65,21 +69,42 @@ impl Format {
             }
         }
     }
+}
+
+/// The pixel bytes of each sRGB code in a format.
+struct Palette {
+    format: Format,
+    /// FP16 only: each code's half, little-endian.
+    halves: [[u8; 2]; 256],
+}
+
+impl Palette {
+    fn new(format: Format) -> Palette {
+        let halves = match format {
+            Format::Bgra8 => [[0; 2]; 256],
+            Format::Fp16 { sdr_white_nits } => std::array::from_fn(|code| {
+                f16_bits(sdr_linear(code as u8, sdr_white_nits)).to_le_bytes()
+            }),
+        };
+        Palette { format, halves }
+    }
 
     /// The bytes of a pixel of sRGB codes.
-    fn pixel(self, codes: [u8; 3]) -> [u8; 8] {
-        match self {
-            Format::Bgra8 => {
-                let [r, g, b] = codes;
-                [b, g, r, 255, 0, 0, 0, 0]
-            }
-            Format::Fp16 { sdr_white_nits } => {
-                let [r, g, b] = codes.map(|c| sdr_linear(c, sdr_white_nits));
-                fp16_pixel([r, g, b, 1.0])
+    fn pixel(&self, codes: [u8; 3]) -> [u8; 8] {
+        let [r, g, b] = codes;
+        match self.format {
+            Format::Bgra8 => [b, g, r, 255, 0, 0, 0, 0],
+            Format::Fp16 { .. } => {
+                let [r, g, b] = [r, g, b].map(|c| self.halves[usize::from(c)]);
+                let [a0, a1] = ONE_F16.to_le_bytes();
+                [r[0], r[1], g[0], g[1], b[0], b[1], a0, a1]
             }
         }
     }
 }
+
+/// 1.0 in half precision.
+const ONE_F16: u16 = 0x3C00;
 
 /// An SDR code's scRGB value in HDR: sRGB-decoded × SDR white / 80, rounded to FP16.
 fn sdr_linear(code: u8, sdr_white_nits: f64) -> f32 {
@@ -88,7 +113,7 @@ fn sdr_linear(code: u8, sdr_white_nits: f64) -> f32 {
 
 /// `value` rounded to the nearest FP16 and back, so it converts to FP16 exactly.
 fn exact_f16(value: f64) -> f32 {
-    f16_to_f32(f16_bits(value as f32))
+    f16_to_f32(f16_bits_f64(value))
 }
 
 /// An RGBA pixel's FP16 bytes, little-endian.
@@ -132,6 +157,46 @@ pub fn f16_bits(x: f32) -> u16 {
     let mut value = ((e as u32) << 10) | (mantissa >> 13);
     let rest = mantissa & 0x1FFF;
     if rest > 0x1000 || (rest == 0x1000 && value & 1 == 1) {
+        // A carry into the exponent is the right result, up to infinity.
+        value += 1;
+    }
+    sign | value as u16
+}
+
+/// IEEE 754 half precision of `x`, rounded to nearest, ties to even, straight from f64: going
+/// through f32 first can round twice and miss the nearest half.
+pub fn f16_bits_f64(x: f64) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa = bits & 0xF_FFFF_FFFF_FFFF;
+    if exponent == 0x7FF {
+        // Infinity, or NaN with a quiet bit set.
+        return sign | 0x7C00 | if mantissa == 0 { 0 } else { 0x200 };
+    }
+    let e = exponent - 1_023 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        // A subnormal half, or zero: shift the full significand into 10 bits and round.
+        if e < -10 {
+            return sign;
+        }
+        let significand = mantissa | (1 << 52);
+        let shift = (43 - e) as u32;
+        let half = 1_u64 << (shift - 1);
+        let rest = significand & ((1 << shift) - 1);
+        let mut value = significand >> shift;
+        if rest > half || (rest == half && value & 1 == 1) {
+            value += 1;
+        }
+        return sign | value as u16;
+    }
+    let mut value = ((e as u64) << 10) | (mantissa >> 42);
+    let rest = mantissa & ((1 << 42) - 1);
+    let half = 1 << 41;
+    if rest > half || (rest == half && value & 1 == 1) {
         // A carry into the exponent is the right result, up to infinity.
         value += 1;
     }
@@ -263,7 +328,9 @@ pub fn plan(scene: &Scene, format: Format) -> Result<Plan, DrawError> {
     let size = scene.size();
     let bpp = format.bytes_per_pixel();
     let scratch = scratch_rows(size.height());
-    let mut rows = Vec::new();
+    let palette = Palette::new(format);
+    // A frame has 14 or 15 distinct band rows.
+    let mut rows = Vec::with_capacity(16 * size.width() as usize * bpp);
     let mut row_count = 0_u32;
     let mut copies = Vec::new();
     for band in scene.bands() {
@@ -272,7 +339,7 @@ pub fn plan(scene: &Scene, format: Format) -> Result<Plan, DrawError> {
                 return Err(DrawError::TooManyRows(row_count as usize + 1));
             }
             for codes in scene.band_row(band, y0) {
-                rows.extend_from_slice(&format.pixel(codes)[..bpp]);
+                rows.extend_from_slice(&palette.pixel(codes)[..bpp]);
             }
             let (y0, n) = (y0 as u32, (y1 - y0) as u32);
             if n.div_ceil(2) > scratch {
@@ -384,7 +451,8 @@ pub fn reference(scene: &Scene, format: Format) -> Result<Vec<u8>, DrawError> {
         for y in band.y0..band.y1 {
             for (x, codes) in scene.band_row(band, y).into_iter().enumerate() {
                 let at = (y as usize * w + x) * bpp;
-                out[at..at + bpp].copy_from_slice(&format.pixel(codes)[..bpp]);
+                let pixel = pixel_by_hand(format, codes);
+                out[at..at + bpp].copy_from_slice(&pixel[..bpp]);
             }
         }
     }
@@ -398,6 +466,20 @@ pub fn reference(scene: &Scene, format: Format) -> Result<Vec<u8>, DrawError> {
         }
     }
     Ok(out)
+}
+
+/// A pixel's bytes worked out on its own, without the palette: the reference's way.
+fn pixel_by_hand(format: Format, codes: [u8; 3]) -> [u8; 8] {
+    match format {
+        Format::Bgra8 => {
+            let [r, g, b] = codes;
+            [b, g, r, 255, 0, 0, 0, 0]
+        }
+        Format::Fp16 { sdr_white_nits } => {
+            let [r, g, b] = codes.map(|c| sdr_linear(c, sdr_white_nits));
+            fp16_pixel([r, g, b, 1.0])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +516,64 @@ mod tests {
         // Every half converts back and forth exactly.
         for bits in (0..0x7C00_u16).step_by(7) {
             assert_eq!(f16_bits(f16_to_f32(bits)), bits, "{bits:#x}");
+        }
+    }
+
+    #[test]
+    fn halves_round_straight_from_f64() {
+        // Exact in f32 too: both roundings agree.
+        let mut x = 1.0e-9_f32;
+        while x < 70_000.0 {
+            for v in [x, -x, x * 1.000_7] {
+                assert_eq!(f16_bits_f64(f64::from(v)), f16_bits(v), "{v}");
+            }
+            x *= 1.001_3;
+        }
+        assert_eq!(f16_bits_f64(f64::INFINITY), 0x7C00);
+        assert_eq!(f16_bits_f64(f64::NAN) & 0x7E00, 0x7E00);
+        assert_eq!(f16_bits_f64(2_f64.powi(-25)), 0);
+        assert_eq!(f16_bits_f64(2_f64.powi(-25) * 1.000_001), 1);
+        // Just above the midpoint between an even half and the odd one after it, by less than
+        // half an f32 step: through f32 it lands on the midpoint and ties to the even one,
+        // below; straight from f64 it goes up, to the nearest.
+        let low = f64::from(f16_to_f32(0x2A02));
+        let high = f64::from(f16_to_f32(0x2A03));
+        let x = (low + high) / 2.0 + 1.0e-12;
+        assert_eq!(f16_bits(x as f32), 0x2A02);
+        assert_eq!(f16_bits_f64(x), 0x2A03);
+        // Against the halves on either side: never farther than a neighbour, and even on a tie.
+        let mut seed = 99_u64;
+        for _ in 0..200_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let x = 2_f64.powf((seed >> 11) as f64 / (1_u64 << 53) as f64 * 42.0 - 26.0);
+            if x > 65_504.0 {
+                continue;
+            }
+            let h = f16_bits_f64(x);
+            let error = |bits: u16| (f64::from(f16_to_f32(bits)) - x).abs();
+            for other in [h.saturating_sub(1), h + 1] {
+                assert!(
+                    error(h) < error(other) || (error(h) == error(other) && h & 1 == 0),
+                    "{x}: {h:#x}"
+                );
+            }
+        }
+        // The palette's halves are the pixels worked out one by one.
+        for white in [80.0, 100.24, 203.0, 240.0, 480.0] {
+            let format = Format::Fp16 {
+                sdr_white_nits: white,
+            };
+            let palette = Palette::new(format);
+            for c in 0..=255_u8 {
+                let codes = [c, 255 - c, c / 3];
+                assert_eq!(
+                    palette.pixel(codes),
+                    pixel_by_hand(format, codes),
+                    "{white} {c}"
+                );
+            }
         }
     }
 

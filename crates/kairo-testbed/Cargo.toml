@@ -22,8 +22,7 @@ windows = { workspace = true, features = [
     "Win32_Foundation",             # handles, HWND, LUID, RECT
     "Win32_Graphics_Direct3D",      # driver types, feature levels
     "Win32_Graphics_Direct3D11",    # the device, textures, clears and copies
-    "Win32_Graphics_Dwm",           # DWM's vblank timing, when DXGI has no statistics
-    "Win32_Graphics_Dxgi",          # factory, adapter by LUID, outputs, swap chain
+    "Win32_Graphics_Dxgi",          # factory, adapter by LUID, outputs, vblanks, swap chain
     "Win32_Graphics_Dxgi_Common",   # formats, colour spaces
     "Win32_Graphics_Gdi",           # HMONITOR, the black brush, ClientToScreen
     "Win32_Security",               # CreateWaitableTimerExW's attributes

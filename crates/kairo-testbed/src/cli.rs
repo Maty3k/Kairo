@@ -14,8 +14,8 @@ pub const USAGE: &str =
                [--run-tag 0..127] [--log FILE] [--ready FILE] [--stop-on-stdin-eof]
        testbed --version | --help
 --monitor takes the monitor's device path (pc harness displays lists them); there is no
-default screen. --size is for windowed mode (default 1280x720). --fps defaults to the
-monitor's rounded refresh rate. --seconds defaults to 60. Exclusive mode needs focus, so it
+default screen. --size is for windowed mode (default 1280x720), and the window, frame
+included, must fit on the monitor. --fps defaults to the monitor's rounded refresh rate. --seconds defaults to 60. Exclusive mode needs focus, so it
 implies --activate, which waits until the foreground lock time-out has passed since the last
 input. The log and the ready file must not exist yet.
 Exit codes: 0 ok, 2 usage, 3 monitor not found or rate refused, 4 device or swap chain,
@@ -292,12 +292,36 @@ pub fn default_fps(refresh_mhz: u64) -> u32 {
 }
 
 /// Why a rate can't be paced, if it can't (exit 3): vsync needs a whole number of vblanks per
-/// frame, 1 to 4 (`Refresh::fits_vsync`); timer pacing runs 60 to 360 fps (README §4.3).
-pub fn refuse_rate(pace: Pace, fps: u32, vsync_k: Option<u32>) -> Option<String> {
+/// frame, 1 to 4 (`Refresh::fits_vsync`), and `vsync_rates` are the whole rates that have one;
+/// timer pacing runs 60 to 360 fps, outside exclusive mode (README §4.3). The advice names
+/// only what would be accepted.
+pub fn refuse_rate(
+    pace: Pace,
+    mode: Mode,
+    fps: u32,
+    vsync_k: Option<u32>,
+    vsync_rates: &[u32],
+) -> Option<String> {
     match pace {
-        Pace::Vsync if vsync_k.is_none() => Some(format!(
-            "{fps} fps isn't the refresh rate divided by 1 to 4 within 0.5%: use --pace timer"
-        )),
+        Pace::Vsync if vsync_k.is_none() => {
+            let mut why = vec![format!(
+                "{fps} fps isn't the refresh rate divided by 1 to 4 within 0.5%"
+            )];
+            if let Some((last, rest)) = vsync_rates.split_last() {
+                let rates = match rest {
+                    [] => last.to_string(),
+                    _ => {
+                        let rest: Vec<String> = rest.iter().map(u32::to_string).collect();
+                        format!("{} or {last}", rest.join(", "))
+                    }
+                };
+                why.push(format!("vsync runs at {rates} fps here"));
+            }
+            if mode != Mode::Exclusive && (60..=360).contains(&fps) {
+                why.push("or use --pace timer".to_owned());
+            }
+            Some(why.join("; "))
+        }
         Pace::Timer if !(60..=360).contains(&fps) => {
             Some(format!("timer pacing runs 60 to 360 fps, not {fps}"))
         }
@@ -390,11 +414,24 @@ mod tests {
         assert_eq!(default_fps(179_960), 180);
         assert_eq!(default_fps(59_940), 60);
         assert_eq!(default_fps(0), 1);
-        assert!(refuse_rate(Pace::Vsync, 180, Some(1)).is_none());
-        assert!(refuse_rate(Pace::Vsync, 144, None).is_some());
-        assert!(refuse_rate(Pace::Timer, 240, None).is_none());
-        assert!(refuse_rate(Pace::Timer, 59, None).is_some());
-        assert!(refuse_rate(Pace::Timer, 361, None).is_some());
+        let rates = [180, 90, 60, 45];
+        let (borderless, exclusive) = (Mode::Borderless, Mode::Exclusive);
+        assert!(refuse_rate(Pace::Vsync, borderless, 180, Some(1), &rates).is_none());
+        assert_eq!(
+            refuse_rate(Pace::Vsync, borderless, 144, None, &rates).as_deref(),
+            Some(
+                "144 fps isn't the refresh rate divided by 1 to 4 within 0.5%; vsync runs at \
+                 180, 90, 60 or 45 fps here; or use --pace timer"
+            )
+        );
+        // Timer pacing isn't offered where it would be refused too.
+        let why = refuse_rate(Pace::Vsync, exclusive, 144, None, &rates).unwrap();
+        assert!(!why.contains("timer"), "{why}");
+        let why = refuse_rate(Pace::Vsync, borderless, 30, None, &[180]).unwrap();
+        assert!(why.ends_with("vsync runs at 180 fps here"), "{why}");
+        assert!(refuse_rate(Pace::Timer, borderless, 240, None, &rates).is_none());
+        assert!(refuse_rate(Pace::Timer, borderless, 59, None, &rates).is_some());
+        assert!(refuse_rate(Pace::Timer, borderless, 361, None, &rates).is_some());
         assert!(random_run_tag() <= 127);
     }
 }

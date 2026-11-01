@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! D3D11 and DXGI for the testbed (docs/research/16-verify-testbed/README.md §4.1–4.4, §4.8):
-//! the device on the adapter that drives the monitor, chosen by LUID; a flip-discard swap chain
-//! with two buffers, a frame-latency waitable object and a latency of 1; exclusive fullscreen on
-//! the monitor's own output; the HDR colour space; frame statistics; and the renderer, which
-//! carries out a [`draw::Plan`] with `ClearRenderTargetView`, `ClearView`, `UpdateSubresource`
-//! and `CopySubresourceRegion` only. No shader runs.
+//! D3D11 and DXGI for the testbed (docs/research/16-verify-testbed/README.md §4.1–4.4, §4.8,
+//! §4.9): the device on the adapter that drives the monitor, chosen by LUID; a flip-discard swap
+//! chain with two buffers and a frame latency of 1, with a frame-latency waitable object except
+//! in exclusive fullscreen, where D3D11 doesn't support one; exclusive fullscreen on the
+//! monitor's own output, and the `ResizeBuffers` that losing it needs; the HDR colour space and a
+//! watch on the monitor's HDR state; frame statistics; the monitor's own vblank clock, for swap
+//! chains without statistics; and the renderer, which carries out a [`draw::Plan`] with
+//! `ClearRenderTargetView`, `ClearView`, `UpdateSubresource` and `CopySubresourceRegion` only.
+//! No shader runs.
+
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use kairo_display::Luid;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, HWND, LUID, RECT, WAIT_OBJECT_0};
@@ -23,19 +31,19 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_ERROR_DEVICE_RESET, DXGI_FRAME_STATISTICS, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
-    DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1,
-    IDXGIFactory2, IDXGIFactory4, IDXGIOutput, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain2,
-    IDXGISwapChain3,
+    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_FRAME_STATISTICS_DISJOINT, DXGI_FRAME_STATISTICS,
+    DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE,
+    DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice1, IDXGIFactory2,
+    IDXGIFactory4, IDXGIOutput, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain2, IDXGISwapChain3,
 };
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::WaitForSingleObject;
-use windows::core::{BOOL, Interface};
+use windows::core::{BOOL, HRESULT, Interface};
 
 use crate::draw::{self, Copy, Format, Plan};
-use crate::pace::Stats;
+use crate::pace::{Period, Stats, WakeGrid};
 
 /// The monitor's output, as DXGI reports it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,9 +76,7 @@ fn luid_of(luid: Luid) -> LUID {
 impl Gpu {
     /// A D3D11 device on the adapter with `luid`, and the output that shows `hmonitor`.
     pub fn on_adapter(luid: Luid, hmonitor: isize) -> Result<Gpu, String> {
-        // SAFETY: plain factory creation.
-        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
-            .map_err(|e| format!("DXGI factory: {e}"))?;
+        let factory = new_factory().ok_or("no DXGI factory")?;
         // SAFETY: looks the adapter up by the LUID kairo-display found for the monitor.
         let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapterByLuid(luid_of(luid)) }
             .map_err(|e| format!("no adapter with LUID {luid}: {e}"))?;
@@ -107,15 +113,9 @@ impl Gpu {
         read_hdr(self.output.as_ref()?)
     }
 
-    /// Whether DXGI's view of the displays is still current: an HDR toggle or a mode change
-    /// makes it stale.
-    pub fn is_current(&self) -> bool {
-        // SAFETY: reads our factory's state.
-        unsafe { self.factory.IsCurrent() }.as_bool()
-    }
-
     /// A swap chain for window `hwnd`'s client area of `width` × `height` in `format`, with a
-    /// frame-latency waitable object when `waitable` (vsync pacing).
+    /// frame-latency waitable object when `waitable` (vsync pacing in a window). Without one the
+    /// device's frame latency is set to 1 instead, and `Present` blocks.
     pub fn swap_chain(
         &self,
         hwnd: isize,
@@ -153,7 +153,8 @@ impl Gpu {
                 .CreateSwapChainForHwnd(&self.device, window, &desc, None, None)
         }
         .map_err(|e| format!("swap chain: {e}"))?;
-        // SAFETY: the testbed never sends input, and Alt+Enter mustn't change the mode either.
+        // SAFETY: this factory made the swap chain for this live window; the call only stops
+        // DXGI from acting on Alt+Enter, so the mode never changes behind the run's back.
         let _ = unsafe {
             self.factory
                 .MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER)
@@ -165,6 +166,10 @@ impl Gpu {
             unsafe { swap2.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
             // SAFETY: as above; the handle is ours to close (Drop).
             waitable_handle = Some(unsafe { swap2.GetFrameLatencyWaitableObject() });
+        } else {
+            let device: IDXGIDevice1 = self.device.cast().map_err(|e| format!("device: {e}"))?;
+            // SAFETY: our own device.
+            unsafe { device.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
         }
         if let Format::Fp16 { .. } = format {
             let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swap chain 3: {e}"))?;
@@ -224,15 +229,134 @@ fn read_hdr(output: &IDXGIOutput) -> Option<OutputHdr> {
     })
 }
 
-/// The monitor's HDR state read afresh through a new factory, since a display change leaves the
-/// old factory's outputs stale.
-pub fn output_hdr_now(luid: Luid, hmonitor: isize) -> Option<OutputHdr> {
+fn new_factory() -> Option<IDXGIFactory4> {
     // SAFETY: plain factory creation.
-    let factory: IDXGIFactory4 =
-        unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
+    unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()
+}
+
+/// The output of the adapter with `luid` that shows `hmonitor`, through `factory`.
+fn output_of(factory: &IDXGIFactory4, luid: Luid, hmonitor: isize) -> Option<IDXGIOutput> {
     // SAFETY: looks the adapter up by its LUID.
     let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapterByLuid(luid_of(luid)) }.ok()?;
-    read_hdr(&find_output(&adapter, hmonitor)?.0)
+    Some(find_output(&adapter, hmonitor)?.0)
+}
+
+/// Watches the monitor's HDR state (README §4.8) through a DXGI factory of its own. A factory
+/// goes stale at the first display change and stays stale, so after each change the watch reads
+/// the state through a new one and keeps it: `IsCurrent` stays a cheap check until the next
+/// change.
+pub struct HdrWatch {
+    factory: IDXGIFactory4,
+    luid: Luid,
+    hmonitor: isize,
+}
+
+impl HdrWatch {
+    /// A watch on the monitor `hmonitor` of the adapter with `luid`.
+    pub fn new(luid: Luid, hmonitor: isize) -> Option<HdrWatch> {
+        Some(HdrWatch {
+            factory: new_factory()?,
+            luid,
+            hmonitor,
+        })
+    }
+
+    /// `None` while the displays haven't changed; after a change, whether the monitor's output
+    /// is in HDR (PQ) now (no, if it can't be read).
+    pub fn changed(&mut self) -> Option<bool> {
+        // SAFETY: reads our factory's state.
+        if unsafe { self.factory.IsCurrent() }.as_bool() {
+            return None;
+        }
+        let factory = new_factory()?;
+        let pq = output_of(&factory, self.luid, self.hmonitor)
+            .and_then(|output| read_hdr(&output))
+            .is_some_and(|o| o.pq);
+        self.factory = factory;
+        Some(pq)
+    }
+}
+
+/// `latest` before the first vblank.
+const NO_VBLANK: i64 = i64::MIN;
+
+/// The monitor's own vblank clock (README §4.9), for swap chains without frame statistics: a
+/// thread that waits for each vblank of the monitor's output (`IDXGIOutput::WaitForVBlank`,
+/// through a factory of its own) and keeps the latest vblank's time, as [`WakeGrid`] places it.
+pub struct VblankClock {
+    latest: Arc<AtomicI64>,
+    stop: Arc<AtomicBool>,
+    done: mpsc::Receiver<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl VblankClock {
+    /// Starts the clock on the output of the adapter with `luid` that shows `hmonitor`, whose
+    /// refresh period is `period`.
+    pub fn start(luid: Luid, hmonitor: isize, period: Period) -> VblankClock {
+        let latest = Arc::new(AtomicI64::new(NO_VBLANK));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, done) = mpsc::channel();
+        let thread = {
+            let latest = Arc::clone(&latest);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("vblank clock".to_owned())
+                .spawn(move || {
+                    tick(luid, hmonitor, period, &latest, &stop);
+                    let _ = sender.send(());
+                })
+                .ok()
+        };
+        VblankClock {
+            latest,
+            stop,
+            done,
+            thread,
+        }
+    }
+
+    /// The latest vblank's QPC time in 100 ns, once there has been one.
+    pub fn latest(&self) -> Option<i64> {
+        let t = self.latest.load(Ordering::Relaxed);
+        (t != NO_VBLANK).then_some(t)
+    }
+}
+
+/// The clock's thread: vblank after vblank until `stop`, or until the output can't be found or
+/// fails 100 waits in a row.
+fn tick(luid: Luid, hmonitor: isize, period: Period, latest: &AtomicI64, stop: &AtomicBool) {
+    let Some(output) = new_factory().and_then(|f| output_of(&f, luid, hmonitor)) else {
+        return;
+    };
+    let mut grid = WakeGrid::new(period);
+    let mut failures = 0;
+    while !stop.load(Ordering::Relaxed) {
+        // SAFETY: waits on this thread's own output object.
+        if unsafe { output.WaitForVBlank() }.is_err() {
+            failures += 1;
+            if failures == 100 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        failures = 0;
+        latest.store(grid.on_wake(crate::platform::now_hns()), Ordering::Relaxed);
+    }
+}
+
+impl Drop for VblankClock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // The thread ends at its next vblank; one that a stopped output holds is left behind
+        // rather than waited for.
+        if self.done.recv_timeout(Duration::from_millis(200)).is_ok()
+            && let Some(thread) = self.thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn dxgi_format(format: Format) -> DXGI_FORMAT {
@@ -315,6 +439,21 @@ fn copy_texture(
     texture.ok_or_else(|| "texture: none".to_owned())
 }
 
+/// What `GetFrameStatistics` said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Statistics {
+    /// A reading.
+    Read(Stats),
+    /// `DXGI_ERROR_FRAME_STATISTICS_DISJOINT`: the first call, or a change such as fullscreen to
+    /// windowed, after which counts don't compare with the ones before.
+    Disjoint,
+    /// Nothing to say, yet or at all.
+    Nothing,
+}
+
+/// `D3DDDIERR_DEVICEREMOVED`, which `Present` returns for a card removed or a driver upgraded.
+const D3DDDIERR_DEVICEREMOVED: HRESULT = HRESULT(0x8876_0870_u32 as i32);
+
 /// Why presenting failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresentError {
@@ -363,16 +502,27 @@ impl Chain {
         }
     }
 
-    /// `Present(interval, 0)`.
+    /// `Present(interval, 0)`. A failure is a lost device when the device says it was removed
+    /// or reset, whatever code `Present` gave.
     pub fn present(&self, interval: u32) -> Result<(), PresentError> {
         // SAFETY: presents our own swap chain; no flags.
         let result = unsafe { self.swap.Present(interval, DXGI_PRESENT(0)) };
-        if result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET {
-            // SAFETY: reads why the device went away.
-            let reason = unsafe { self.device.GetDeviceRemovedReason() };
-            return Err(PresentError::DeviceLost(format!("{result:?} ({reason:?})")));
-        }
         // DXGI_STATUS_OCCLUDED is a success: the frame still counts.
+        if result.is_ok() {
+            return Ok(());
+        }
+        // SAFETY: reads whether, and why, the device went away.
+        let removed = unsafe { self.device.GetDeviceRemovedReason() };
+        let lost = [
+            DXGI_ERROR_DEVICE_REMOVED,
+            DXGI_ERROR_DEVICE_RESET,
+            D3DDDIERR_DEVICEREMOVED,
+        ];
+        if removed.is_err() || lost.contains(&result) {
+            return Err(PresentError::DeviceLost(format!(
+                "{result:?} ({removed:?})"
+            )));
+        }
         result
             .ok()
             .map_err(|e| PresentError::Other(format!("present: {e}")))
@@ -384,17 +534,20 @@ impl Chain {
         unsafe { self.swap.GetLastPresentCount() }.ok()
     }
 
-    /// The frame statistics, if DXGI has any.
-    pub fn stats(&self) -> Option<Stats> {
+    /// The frame statistics.
+    pub fn stats(&self) -> Statistics {
         let mut s = DXGI_FRAME_STATISTICS::default();
         // SAFETY: `s` is ours.
-        unsafe { self.swap.GetFrameStatistics(&mut s) }.ok()?;
-        Some(Stats {
-            present_count: s.PresentCount,
-            present_refresh: s.PresentRefreshCount,
-            sync_refresh: s.SyncRefreshCount,
-            sync_hns: crate::platform::qpc_to_hns(s.SyncQPCTime),
-        })
+        match unsafe { self.swap.GetFrameStatistics(&mut s) } {
+            Ok(()) => Statistics::Read(Stats {
+                present_count: s.PresentCount,
+                present_refresh: s.PresentRefreshCount,
+                sync_refresh: s.SyncRefreshCount,
+                sync_hns: crate::platform::qpc_to_hns(s.SyncQPCTime),
+            }),
+            Err(e) if e.code() == DXGI_ERROR_FRAME_STATISTICS_DISJOINT => Statistics::Disjoint,
+            Err(_) => Statistics::Nothing,
+        }
     }
 
     /// Exclusive fullscreen on the monitor's output (README §4.1): `SetFullscreenState`, then
@@ -409,12 +562,40 @@ impl Chain {
         unsafe { self.swap.SetFullscreenState(true, &output) }
             .map_err(|e| format!("SetFullscreenState: {e}"))?;
         self.fullscreen = true;
-        // The back buffer's references must go before ResizeBuffers.
+        self.resize_buffers()?;
+        if self.is_fullscreen() {
+            Ok(())
+        } else {
+            Err("GetFullscreenState says windowed".to_owned())
+        }
+    }
+
+    /// Whether DXGI has taken the swap chain out of exclusive fullscreen (the window lost
+    /// focus); if so, the `ResizeBuffers` a flip-model swap chain needs before its next
+    /// `Present` (MS), and the run goes on in the window.
+    pub fn leave_if_lost(&mut self) -> Result<bool, String> {
+        if !self.fullscreen || self.is_fullscreen() {
+            return Ok(false);
+        }
+        self.fullscreen = false;
+        self.resize_buffers()?;
+        Ok(true)
+    }
+
+    /// `ResizeBuffers` at the same count, size and format, as a change between fullscreen and
+    /// windowed needs; then the new back buffer.
+    fn resize_buffers(&mut self) -> Result<(), String> {
+        // Every reference to the back buffer must go first.
         self.rtv = None;
         self.texture = None;
-        // SAFETY: (re)flushes our immediate context so nothing still holds the old buffers.
-        unsafe { self.context.ClearState() };
-        // SAFETY: same count, size and format as before; the flags it was made with.
+        // SAFETY: unbinds everything from our immediate context, then submits what it queued,
+        // with the views just released, so nothing still holds the old buffers.
+        unsafe {
+            self.context.ClearState();
+            self.context.Flush();
+        }
+        // SAFETY: our swap chain, with no references to its buffers left; the flags it was made
+        // with.
         unsafe {
             self.swap.ResizeBuffers(
                 0,
@@ -428,11 +609,7 @@ impl Chain {
         let (texture, rtv) = back_buffer(&self.device, &self.swap)?;
         self.texture = Some(texture);
         self.rtv = Some(rtv);
-        if self.is_fullscreen() {
-            Ok(())
-        } else {
-            Err("GetFullscreenState says windowed".to_owned())
-        }
+        Ok(())
     }
 
     /// Whether the swap chain is in exclusive fullscreen.
@@ -668,6 +845,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The motion pattern, the other loads, 720p and an odd size on a device, where boxes reach
+    /// the client's last row and bands split where they wrap.
+    #[test]
+    fn warp_draws_motion_loads_and_odd_sizes() {
+        for (w, h) in [(1_280, 720), (641, 361)] {
+            let size = Size::new(w, h).unwrap();
+            let mut cases = vec![(Pattern::Full, Load::None, 33)];
+            for frame in [150, 200, 700, 800, 1_079] {
+                for load in [Load::Scroll, Load::Churn] {
+                    cases.push((Pattern::Motion, load, frame));
+                }
+            }
+            for (pattern, load, frame) in cases {
+                let options = Options {
+                    pattern,
+                    nominal_fps: 60,
+                    run_tag: 5,
+                    load,
+                    patches: Patches::Sdr,
+                };
+                let scene = Scene::new(size, frame, &options).unwrap();
+                let plan = draw::plan(&scene, Format::Bgra8).unwrap();
+                let drawn = draw_on_warp(&plan, Format::Bgra8, w, h);
+                let want = draw::reference(&scene, Format::Bgra8).unwrap();
+                assert!(
+                    drawn == want,
+                    "{w}x{h} {pattern:?} {load:?} frame {frame}: {}",
+                    first_difference(&drawn, &want, w, 4)
+                );
+            }
+        }
+        // FP16, with the patches above SDR white.
+        let format = Format::Fp16 {
+            sdr_white_nits: 203.0,
+        };
+        let options = Options {
+            pattern: Pattern::Motion,
+            nominal_fps: 60,
+            run_tag: 5,
+            load: Load::Scroll,
+            patches: Patches::Hdr {
+                sdr_white_nits: 203.0,
+                bright: true,
+            },
+        };
+        let scene = Scene::new(Size::new(1_280, 720).unwrap(), 1_079, &options).unwrap();
+        let plan = draw::plan(&scene, format).unwrap();
+        let drawn = draw_on_warp(&plan, format, 1_280, 720);
+        let want = draw::reference(&scene, format).unwrap();
+        assert!(
+            drawn == want,
+            "{}",
+            first_difference(&drawn, &want, 1_280, 8)
+        );
     }
 
     /// The same operations in FP16 scRGB, against the CPU reference.

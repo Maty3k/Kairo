@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pacing and frame numbering (docs/research/16-verify-testbed/README.md §4.3).
 //!
-//! Frame number N is time-based, the way a game's clock keeps running: N is the index of the
-//! vblank group (vsync pacing) or the timer slot (timer pacing) the frame is drawn for. A frame
-//! that can't make its vblank or slot shows up as a skipped N plus an `m` line, so a testbed miss
-//! is never mistaken for a capture drop. Frame 0 is drawn for the first vblank, or is the slot,
-//! at or after the next whole QPC second.
+//! Frame number N is time-based, the way a game's clock keeps running: N is the vblank group
+//! (vsync pacing) or the timer slot (timer pacing) the frame is drawn for, counted from frame 0's
+//! anchor, the first vblank or slot at or after a whole QPC second. A frame that can't make its
+//! vblank or slot shows up as a skipped N plus an `m` line, so a testbed miss is never mistaken
+//! for a capture drop.
 //!
-//! Everything here is pure: the Windows loop passes in QPC times (100 ns) and the swap chain's
-//! frame statistics, and gets back what to draw and which log records to write.
+//! Everything here is pure: the Windows loop passes in QPC times (100 ns), the swap chain's frame
+//! statistics and the monitor's own vblank times, and gets back what to draw and which log
+//! records to write.
 //!
-//! **Vsync.** `Present(k, 0)` shows each frame for k vblanks. [`VsyncPacer`] keeps the vblank
-//! grid from the latest statistics (or from DWM's timing when DXGI has none) and aims each frame
-//! k vblanks after the previous one: after the vblank it was shown at once the statistics say,
-//! else after the one it was drawn for. When that vblank has already gone by, it skips ahead by
-//! whole groups of k. N is the group on the grid that starts at frame 0's vblank, and only grows. Statistics report only the newest frame on screen and the vblank
-//! it first appeared at. A frame shown later than k vblanks after the frame before it, by DXGI's
-//! own vblank counts, missed its vblank. A frame the statistics never reported is filled in from
-//! its neighbours when the two of them were exactly on cadence, since each frame stays at least
-//! k vblanks; otherwise its display time is unknown (`-`) and the next frame shown is the late
+//! **Vsync.** With the flip model, a present's sync interval is how long that frame stays on
+//! screen: the next frame can show no earlier than k vblanks after it (Microsoft's
+//! `IDXGISwapChain::Present`). So every frame is presented with interval k, and frame 0 follows
+//! warm-up frames of interval 1, the last of which shows the vblank before the anchor.
+//! [`VsyncPacer`] keeps frame 0's anchor and every target as QPC times, never as vblank counts:
+//! DXGI counts vblanks in one domain (from boot in full screen, from the swap chain's creation
+//! in a window) and the monitor's own vblank clock in another, so counts from two sources never
+//! meet. Each frame is aimed k vblanks after the vblank the previous frame really showed at, or
+//! at the first vblank still reachable when that one has gone by, and is numbered by the vblank
+//! group its target falls in. A composed window shows a frame a vblank after it takes it; that
+//! latency is learned from the frames on time (the least of display − target) and taken out, so
+//! it doesn't move the cadence.
+//!
+//! Statistics report only the newest frame on screen and the vblank it first appeared at
+//! ([`Shown`]). A frame shown later than k vblanks after the frame before it, by DXGI's own
+//! vblank counts, missed its vblank. A frame the statistics never reported is filled in from its
+//! neighbours when the two of them were exactly on cadence, since each frame stays at least k
+//! vblanks; otherwise its display time is unknown (`-`) and the next frame shown is the late
 //! one.
 //!
 //! **Timer.** [`TimerPacer`] presents frame N at slot N's time, `start + ⌈N × 10⁷ / fps⌉`
@@ -30,6 +40,10 @@ use std::ops::Range;
 
 use kairo_core::testbed_log::FrameRecord;
 use kairo_core::timeline::HNS_PER_SECOND;
+
+/// The most frames one stall may skip before the pacer takes its clock for lost: an hour at
+/// 360 fps. A real stall that long is a run to redo, not a million `m` lines.
+pub const MAX_SKIP: u64 = 3_600 * 360;
 
 /// The QPC time, in 100 ns, of the first whole second at or after `now_hns`.
 pub fn next_whole_second(now_hns: i64) -> i64 {
@@ -74,6 +88,11 @@ impl Period {
     pub fn count(self, d: i64) -> i64 {
         saturate((i128::from(d) * self.den).div_euclid(self.num))
     }
+
+    /// The periods in `d` 100 ns, rounded to nearest (halves up).
+    pub fn nearest(self, d: i64) -> i64 {
+        saturate((2 * i128::from(d) * self.den + self.num).div_euclid(2 * self.num))
+    }
 }
 
 fn saturate(x: i128) -> i64 {
@@ -100,6 +119,7 @@ impl Widen {
 }
 
 /// The vblank grid: vblank `count` happened at `t_hns`, and the others follow every `period`.
+/// Counts mean something only within one grid's source; times mean the same in all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
     count: i64,
@@ -142,6 +162,12 @@ impl Grid {
     pub fn at_or_after(&self, t_hns: i64) -> i64 {
         self.next_after(t_hns.saturating_sub(1))
     }
+
+    /// The time of the vblank nearest `t_hns`.
+    pub fn snap(&self, t_hns: i64) -> i64 {
+        let half = self.period.times(1) / 2;
+        self.time_of(self.at_or_after(t_hns.saturating_sub(half)))
+    }
 }
 
 /// One `GetFrameStatistics` reading, as DXGI gives it.
@@ -181,6 +207,8 @@ pub enum Step {
         /// Frames passed over because their vblank or slot had gone by.
         skipped: Range<u64>,
     },
+    /// The pacer's clock jumped by more than [`MAX_SKIP`] frames: the run can't go on.
+    Lost,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,8 +233,11 @@ pub struct Shown {
     pending: VecDeque<Pending>,
     /// Frames the statistics passed over, waiting for the next frame they report.
     unseen: Vec<Pending>,
-    /// The last frame reported on screen, and its first vblank.
-    last_shown: Option<(u64, i64)>,
+    /// The last frame reported on screen, the vblank it first appeared at (DXGI's count) and
+    /// when.
+    last_shown: Option<(u64, i64, i64)>,
+    /// The least display − target seen, in vblanks: a composed window's latency.
+    latency: Option<i64>,
     presents: Widen,
     shown_vblanks: Widen,
     sync_vblanks: Widen,
@@ -222,6 +253,7 @@ impl Shown {
             pending: VecDeque::new(),
             unseen: Vec::new(),
             last_shown: None,
+            latency: None,
             presents: Widen::default(),
             shown_vblanks: Widen::default(),
             sync_vblanks: Widen::default(),
@@ -233,9 +265,24 @@ impl Shown {
         self.grid
     }
 
-    /// The last frame reported on screen, and its first vblank.
+    /// The last frame reported on screen, and when it first appeared.
     pub fn last_shown(&self) -> Option<(u64, i64)> {
-        self.last_shown
+        self.last_shown.map(|(frame, _, t)| (frame, t))
+    }
+
+    /// The display latency in vblanks: the least display − target seen (0 until a frame shows).
+    pub fn latency(&self) -> i64 {
+        self.latency.unwrap_or(0).max(0)
+    }
+
+    /// The statistics went away and came back (`DXGI_ERROR_FRAME_STATISTICS_DISJOINT`, as after
+    /// a change between full screen and a window): their vblank counts may now be in another
+    /// domain, so nothing is compared across the change.
+    pub fn disjoint(&mut self) {
+        self.grid = None;
+        self.last_shown = None;
+        self.shown_vblanks = Widen::default();
+        self.sync_vblanks = Widen::default();
     }
 
     /// Frame `frame` (drawn for `target_hns`) was presented as present `present_id`
@@ -259,6 +306,11 @@ impl Shown {
         });
     }
 
+    /// Whether frames still wait for statistics.
+    pub fn waiting(&self) -> bool {
+        !self.pending.is_empty() || !self.unseen.is_empty()
+    }
+
     /// A statistics reading: updates the grid and returns the frames it settles, in order.
     pub fn on_stats(&mut self, stats: Stats) -> Vec<Resolved> {
         let sync = self.sync_vblanks.widen(stats.sync_refresh);
@@ -277,10 +329,11 @@ impl Shown {
                 continue;
             }
             // Frame p is on screen and first appeared at vblank shown_v.
+            let shown_t = grid.time_of(shown_v);
             let mut late = false;
             let unseen = std::mem::take(&mut self.unseen);
             match (self.k, self.last_shown) {
-                (Some(k), Some((frame, v))) => {
+                (Some(k), Some((frame, v, _))) => {
                     let cadence = k * (p.frame - frame) as i64;
                     if shown_v - v == cadence {
                         // Every frame between them stayed exactly k vblanks.
@@ -295,8 +348,32 @@ impl Shown {
                 }
                 _ => out.extend(unseen.into_iter().map(|u| resolved(u, None, false))),
             }
-            out.push(resolved(p, Some(grid.time_of(shown_v)), late));
-            self.last_shown = Some((p.frame, shown_v));
+            let lag = self.period.nearest(shown_t - p.target_hns);
+            self.latency = Some(self.latency.map_or(lag, |l| l.min(lag)));
+            out.push(resolved(p, Some(shown_t), late));
+            self.last_shown = Some((p.frame, shown_v, shown_t));
+        }
+        out
+    }
+
+    /// The frames presented more than a second before `now_hns` that the statistics still
+    /// haven't reported: their display times are unknown (statistics that stopped, or none).
+    pub fn expire(&mut self, now_hns: i64) -> Vec<Resolved> {
+        let cutoff = now_hns.saturating_sub(HNS_PER_SECOND);
+        let old = self
+            .unseen
+            .iter()
+            .take_while(|u| u.present_hns < cutoff)
+            .count();
+        let mut out: Vec<Resolved> = self
+            .unseen
+            .drain(..old)
+            .map(|u| resolved(u, None, false))
+            .collect();
+        if self.unseen.is_empty() {
+            while let Some(p) = self.pending.pop_front_if(|p| p.present_hns < cutoff) {
+                out.push(resolved(p, None, false));
+            }
         }
         out
     }
@@ -317,37 +394,47 @@ impl Shown {
 pub struct VsyncPacer {
     k: i64,
     period: Period,
+    /// The whole second frame 0 is anchored at.
     start_hns: i64,
-    /// DWM's grid, until DXGI's statistics give one.
-    dwm_grid: Option<Grid>,
-    /// Frame 0's vblank, once it is chosen.
-    v0: Option<i64>,
+    /// The monitor's own vblank clock, for when DXGI has no statistics.
+    clock: Option<Grid>,
+    /// Frame 0's vblank, once a grid has placed it.
+    t0: Option<i64>,
     /// The last frame drawn, and the vblank it was drawn for.
     last: Option<(u64, i64)>,
     shown: Shown,
 }
 
 impl VsyncPacer {
-    /// A pacer for one frame every `k` vblanks of `period`, starting at the first vblank at or
-    /// after `start_hns`.
+    /// A pacer for one frame every `k` vblanks of `period`, frame 0 at the first vblank at or
+    /// after `start_hns` (a whole second); if no grid came until that vblank had gone by, at the
+    /// first vblank at or after the next whole second.
     pub fn new(k: u32, period: Period, start_hns: i64) -> VsyncPacer {
         VsyncPacer {
             k: i64::from(k.max(1)),
             period,
             start_hns,
-            dwm_grid: None,
-            v0: None,
+            clock: None,
+            t0: None,
             last: None,
             shown: Shown::new(Some(k), period),
         }
     }
 
-    /// The grid from DWM's timing, for a swap chain without frame statistics: no display times
-    /// are known then. Ignored once DXGI's statistics have given a grid, since the two count
-    /// vblanks differently; switch before frame 0.
-    pub fn on_dwm_vblank(&mut self, count: u64, t_hns: i64) {
-        let count = i64::try_from(count).unwrap_or(i64::MAX);
-        self.dwm_grid = Some(Grid::new(count, t_hns, self.period));
+    /// The interval to present every frame with, frame 0 included (the warm-up uses 1).
+    pub fn interval(&self) -> u32 {
+        u32::try_from(self.k).unwrap_or(1)
+    }
+
+    /// Frame 0's vblank, once known: the log header's `start_hns`.
+    pub fn anchor(&self) -> Option<i64> {
+        self.t0
+    }
+
+    /// A vblank of the monitor's own (`IDXGIOutput::WaitForVBlank`): the grid while DXGI's
+    /// statistics have none.
+    pub fn on_vblank(&mut self, t_hns: i64) {
+        self.clock = Some(Grid::new(0, t_hns, self.period));
     }
 
     /// A statistics reading: updates the grid and returns the frames it settles, in order.
@@ -355,42 +442,77 @@ impl VsyncPacer {
         self.shown.on_stats(stats)
     }
 
+    /// The statistics were disjoint: see [`Shown::disjoint`].
+    pub fn disjoint(&mut self) {
+        self.shown.disjoint();
+    }
+
+    /// The frames on their way to the screen.
+    pub fn shown(&mut self) -> &mut Shown {
+        &mut self.shown
+    }
+
+    fn grid(&self) -> Option<Grid> {
+        self.shown.grid().or(self.clock)
+    }
+
+    /// The vblank group a target time falls in, counted from frame 0's anchor `t0`, rounded to
+    /// nearest (halves up), so a cadence moved by a stall keeps whole groups.
+    fn group(&self, t0: i64, target_hns: i64) -> i64 {
+        let vblanks = self.period.nearest(target_hns - t0);
+        (2 * vblanks + self.k).div_euclid(2 * self.k)
+    }
+
+    /// When the last frame drawn really showed, by the statistics less the learned latency;
+    /// else the vblank it was drawn for.
+    fn last_shown_at(&self) -> Option<(u64, i64)> {
+        let (previous, target) = self.last?;
+        Some(match self.shown.last_shown() {
+            Some((frame, shown_t)) if frame == previous => {
+                (previous, shown_t - self.period.times(self.shown.latency()))
+            }
+            _ => (previous, target),
+        })
+    }
+
     /// What to draw now, at `now_hns`.
     pub fn next(&mut self, now_hns: i64) -> Step {
-        let Some(grid) = self.shown.grid().or(self.dwm_grid) else {
+        let Some(grid) = self.grid() else {
             return Step::Warmup;
         };
-        let earliest = grid.next_after(now_hns);
-        let (Some(v0), Some((previous, last_target))) = (self.v0, self.last) else {
-            let start = grid.at_or_after(self.start_hns);
-            if earliest < start {
-                return Step::Warmup;
+        let reachable = grid.next_after(now_hns);
+        let earliest = grid.time_of(reachable);
+        let t0 = match self.t0 {
+            Some(t0) => t0,
+            None => {
+                let mut v = grid.at_or_after(self.start_hns);
+                if v < reachable {
+                    v = grid.at_or_after(next_whole_second(earliest));
+                }
+                *self.t0.insert(grid.time_of(v))
             }
-            // Frame 0 at the start vblank, or at the first one still reachable.
-            self.v0 = Some(earliest);
-            self.last = Some((0, earliest));
-            return Step::Frame {
-                frame: 0,
-                target_hns: grid.time_of(earliest),
-                skipped: 0..0,
-            };
         };
-        // k vblanks after the last frame: after the vblank it was shown at once the statistics
-        // say so, which keeps the cadence's phase after a late frame.
-        let after = match self.shown.last_shown() {
-            Some((frame, v)) if frame == previous => v,
-            _ => last_target,
+        let (target, previous) = match self.last_shown_at() {
+            // Warm-up frames of interval 1 show until the anchor's vblank is next; a late start
+            // takes the first vblank still reachable, and the frames before it are skipped.
+            None if earliest < t0 - self.period.times(1) / 2 => return Step::Warmup,
+            None => (earliest, None),
+            Some((previous, shown)) => {
+                let want = grid.snap(shown + self.period.times(self.k));
+                (want.max(earliest), Some(previous))
+            }
         };
-        let want = after + self.k;
-        // Gone by: the first vblank still reachable in the same phase.
-        let groups = ((earliest - want).max(0) + self.k - 1) / self.k;
-        let target = want + self.k * groups;
-        let frame = (((target - v0) / self.k) as u64).max(previous + 1);
+        let group = u64::try_from(self.group(t0, target)).unwrap_or(0);
+        let first = previous.map_or(0, |p| p + 1);
+        let frame = group.max(first);
+        if frame - first > MAX_SKIP {
+            return Step::Lost;
+        }
         self.last = Some((frame, target));
         Step::Frame {
             frame,
-            target_hns: grid.time_of(target),
-            skipped: previous + 1..frame,
+            target_hns: target,
+            skipped: first..frame,
         }
     }
 
@@ -399,6 +521,11 @@ impl VsyncPacer {
     pub fn presented(&mut self, frame: u64, target_hns: i64, present_id: u32, present_hns: i64) {
         self.shown
             .presented(frame, target_hns, present_id, present_hns, false);
+    }
+
+    /// Whether frames still wait for statistics.
+    pub fn waiting(&self) -> bool {
+        self.shown.waiting()
     }
 
     /// The frames still waiting for statistics at the end: their display times are unknown.
@@ -416,6 +543,56 @@ fn resolved(p: Pending, display_hns: Option<i64>, late: bool) -> Resolved {
             display_hns,
         },
         missed: late || p.missed,
+    }
+}
+
+/// The monitor's vblank grid from the times a thread wakes after each
+/// `IDXGIOutput::WaitForVBlank`, for runs without frame statistics (README §4.9). A wake comes
+/// after its vblank by however long the scheduler takes, now and then by more than half a period,
+/// so the grid runs through the 10th percentile of the last second's wakes, each measured from
+/// the vblank nearest it.
+#[derive(Debug, Clone)]
+pub struct WakeGrid {
+    period: Period,
+    /// A vblank time the grid runs through.
+    base: Option<i64>,
+    /// The last second's wakes.
+    wakes: VecDeque<i64>,
+}
+
+impl WakeGrid {
+    /// A grid for a display of `period`.
+    pub fn new(period: Period) -> WakeGrid {
+        WakeGrid {
+            period,
+            base: None,
+            wakes: VecDeque::new(),
+        }
+    }
+
+    /// A wake at `t_hns`; returns the time of the grid's last vblank at or before it.
+    pub fn on_wake(&mut self, t_hns: i64) -> i64 {
+        self.wakes.push_back(t_hns);
+        while self
+            .wakes
+            .front()
+            .is_some_and(|&w| t_hns - w > HNS_PER_SECOND)
+        {
+            self.wakes.pop_front();
+        }
+        let base = self.base.unwrap_or(t_hns);
+        let mut lags: Vec<i64> = self
+            .wakes
+            .iter()
+            .map(|&w| {
+                let d = w - base;
+                d - self.period.times(self.period.nearest(d))
+            })
+            .collect();
+        lags.sort_unstable();
+        let base = base + lags.get(lags.len() / 10).copied().unwrap_or(0);
+        self.base = Some(base);
+        base.saturating_add(self.period.times(self.period.count(t_hns - base)))
     }
 }
 
@@ -469,6 +646,9 @@ impl TimerPacer {
         } else {
             self.next
         };
+        if frame - self.next > MAX_SKIP {
+            return Step::Lost;
+        }
         let skipped = self.next..frame;
         self.next = frame + 1;
         Step::Frame {
@@ -506,6 +686,9 @@ mod tests {
         assert_eq!(p.count(55_567), 0);
         assert_eq!(p.count(55_568), 1);
         assert_eq!(p.count(-1), -1);
+        assert_eq!(p.nearest(27_783), 0);
+        assert_eq!(p.nearest(27_784), 1);
+        assert_eq!(p.nearest(-27_000), 0);
         assert!(Period::from_refresh(0, 1).is_none());
         assert!(Period::from_refresh(60, 0).is_none());
     }
@@ -531,6 +714,8 @@ mod tests {
         assert_eq!(g.at_or_after(1_000_001), 101);
         assert_eq!(g.next_after(1_055_555), 101);
         assert_eq!(g.next_after(1_055_556), 102);
+        assert_eq!(g.snap(1_020_000), 1_000_000);
+        assert_eq!(g.snap(1_030_000), 1_055_556);
         // Exhaustively, over a few seconds: next_after is the first vblank later than t.
         for t in (0..30_000_000).step_by(997) {
             let v = g.next_after(t);
@@ -538,24 +723,32 @@ mod tests {
         }
     }
 
-    /// A display that shows each present at the first vblank it can reach, k vblanks after the
-    /// one before (plus `slow` more for a present the GPU is late with), with DXGI's statistics
-    /// read just before each frame is drawn.
+    /// A display that follows the flip model's rule: a frame is taken at the first vblank after
+    /// it is presented, but no earlier than the previous frame's vblank plus the previous
+    /// present's interval, and `slow` vblanks later when the GPU is late with it. A composed
+    /// window shows it `latency` vblanks after it takes it. DXGI's statistics count vblanks from
+    /// `dxgi_offset`; the monitor's own clock from 0.
     struct Display {
         period: Period,
-        /// Present id → first vblank shown.
-        shown: Vec<(u32, i64)>,
+        latency: i64,
+        dxgi_offset: i64,
+        /// Present id → the vblank it was taken at.
+        taken: Vec<(u32, i64)>,
         presents: u32,
         last_v: i64,
+        last_interval: i64,
     }
 
     impl Display {
-        fn new() -> Display {
+        fn new(latency: i64, dxgi_offset: i64) -> Display {
             Display {
                 period: HZ180,
-                shown: Vec::new(),
+                latency,
+                dxgi_offset,
+                taken: Vec::new(),
                 presents: 0,
                 last_v: -1,
+                last_interval: 1,
             }
         }
 
@@ -563,50 +756,58 @@ mod tests {
             self.period.times(v)
         }
 
-        /// Presents at `t` with sync interval `k`; returns the present id.
-        fn present(&mut self, t: i64, k: i64, slow: i64) -> u32 {
+        /// Presents at `t` with sync interval `interval`; returns the present id.
+        fn present(&mut self, t: i64, interval: i64, slow: i64) -> u32 {
             self.presents += 1;
             let earliest = Grid::new(0, 0, self.period).next_after(t) + slow;
             let v = if self.last_v < 0 {
                 earliest
             } else {
-                earliest.max(self.last_v + k)
+                earliest.max(self.last_v + self.last_interval)
             };
             self.last_v = v;
-            self.shown.push((self.presents, v));
+            self.last_interval = interval;
+            self.taken.push((self.presents, v));
             self.presents
         }
 
-        /// The statistics at time `t`: the newest present on screen.
-        fn stats(&self, t: i64) -> Stats {
+        /// The statistics at time `t`: the newest present on screen, in DXGI's counts; none
+        /// until the first present shows.
+        fn stats(&self, t: i64) -> Option<Stats> {
             let now_v = Grid::new(0, 0, self.period).next_after(t) - 1;
             let (id, v) = self
-                .shown
+                .taken
                 .iter()
                 .rev()
-                .find(|(_, v)| *v <= now_v)
-                .copied()
-                .unwrap_or((0, 0));
-            Stats {
+                .find(|(_, v)| v + self.latency <= now_v)
+                .copied()?;
+            Some(Stats {
                 present_count: id,
-                present_refresh: v as u32,
-                sync_refresh: now_v as u32,
+                present_refresh: (v + self.latency + self.dxgi_offset) as u32,
+                sync_refresh: (now_v + self.dxgi_offset) as u32,
                 sync_hns: self.time(now_v),
-            }
+            })
         }
     }
 
-    /// Runs `frames` frames: the loop wakes `wake(i)` hns after each vblank it waits for, reads
-    /// statistics, draws and presents, and the GPU is `slow(n)` vblanks late with frame n.
-    /// Returns the records and the skipped frames.
+    /// What a vsync run did: the records, the frames skipped, and frame 0's anchor.
+    struct Run {
+        out: Vec<Resolved>,
+        skipped: Vec<u64>,
+        anchor: i64,
+    }
+
+    /// Runs `frames` frames on `d`: the loop wakes `wake(i)` hns after the vblank the last
+    /// present was taken at (the waitable object), reads statistics (and the monitor's own clock
+    /// until they come), draws and presents; the GPU is `slow(n)` vblanks late with frame n.
     fn run_vsync(
         k: i64,
         frames: usize,
+        mut d: Display,
+        start: i64,
         wake: impl Fn(usize) -> i64,
         slow: impl Fn(u64) -> i64,
-    ) -> (Vec<Resolved>, Vec<u64>) {
-        let mut d = Display::new();
-        let start = 2 * HNS_PER_SECOND / 10;
+    ) -> Run {
         let mut pacer = VsyncPacer::new(k as u32, HZ180, start);
         let mut out = Vec::new();
         let mut skipped = Vec::new();
@@ -616,10 +817,9 @@ mod tests {
         while drawn < frames {
             let now = d.time(v) + wake(i);
             i += 1;
-            if d.presents > 0 {
-                out.extend(pacer.on_stats(d.stats(now)));
-            } else {
-                pacer.on_dwm_vblank(v as u64, d.time(v));
+            match d.stats(now) {
+                Some(stats) => out.extend(pacer.on_stats(stats)),
+                None => pacer.on_vblank(d.time(v)),
             }
             match pacer.next(now) {
                 Step::Warmup => {
@@ -631,101 +831,243 @@ mod tests {
                     skipped: s,
                 } => {
                     skipped.extend(s);
-                    let interval = if frame == 0 { 1 } else { k };
-                    let id = d.present(now, interval, slow(frame));
+                    let id = d.present(now, i64::from(pacer.interval()), slow(frame));
                     pacer.presented(frame, target_hns, id, now + 1_000);
                     drawn += 1;
                 }
+                Step::Lost => panic!("lost the clock"),
             }
-            // The waitable object signals once the last present is on screen.
             v = d.last_v;
         }
-        let end = d.time(v + 4 * k);
-        out.extend(pacer.on_stats(d.stats(end)));
+        for extra in 1..=6 {
+            if let Some(stats) = d.stats(d.time(v + extra * k + 2)) {
+                out.extend(pacer.on_stats(stats));
+            }
+        }
         out.extend(pacer.finish());
-        (out, skipped)
+        Run {
+            out,
+            skipped,
+            anchor: pacer.anchor().unwrap(),
+        }
     }
 
-    /// `a` and `b` within 1 hns: the grid is re-anchored on each reading, so a vblank's time can
-    /// round either way.
+    /// `a` and `b` within 2 hns: each grid's vblank times are rounded once from the reading and
+    /// once from the period, and a target and a display time come from different readings.
     fn near(a: i64, b: i64) -> bool {
-        (a - b).abs() <= 1
+        (a - b).abs() <= 2
     }
 
     #[test]
     fn steady_vsync_numbers_frames_by_vblank_group() {
-        for k in [1, 2, 3] {
-            let (out, skipped) = run_vsync(k, 200, |_| 20_000, |_| 0);
-            assert!(skipped.is_empty(), "k {k}");
-            assert_eq!(out.len(), 200, "k {k}");
-            let first = out[0].record;
-            assert_eq!(first.frame, 0);
-            // Frame 0 is drawn for the first vblank at or after the simulated start (0.2 s):
-            // vblank 36 at 180 Hz.
-            assert!(near(first.target_hns, HZ180.times(36)));
-            for (n, r) in out.iter().enumerate() {
-                assert_eq!(r.record.frame, n as u64, "k {k}");
-                assert!(!r.missed, "k {k} frame {n}");
-                let want = HZ180.times(36 + k * n as i64);
-                assert!(near(r.record.target_hns, want), "k {k} frame {n}");
-                let shown = r.record.display_hns.unwrap();
-                assert!(near(shown, want), "k {k} frame {n}");
+        for latency in [0, 1] {
+            for k in [1, 2, 3, 4] {
+                let start = 2 * HNS_PER_SECOND / 10;
+                let run = run_vsync(k, 200, Display::new(latency, 0), start, |_| 20_000, |_| 0);
+                assert!(run.skipped.is_empty(), "k {k} latency {latency}");
+                assert_eq!(run.out.len(), 200, "k {k} latency {latency}");
+                // Frame 0 at the first vblank at or after the start: vblank 36 at 180 Hz.
+                assert!(near(run.anchor, HZ180.times(36)));
+                for (n, r) in run.out.iter().enumerate() {
+                    let what = format!("k {k} latency {latency} frame {n}");
+                    assert_eq!(r.record.frame, n as u64, "{what}");
+                    assert!(!r.missed, "{what}");
+                    let want = HZ180.times(36 + k * n as i64);
+                    assert!(near(r.record.target_hns, want), "{what}");
+                    let shown = r.record.display_hns.unwrap();
+                    let latency_hns = HZ180.times(36 + k * n as i64 + latency);
+                    assert!(near(shown, latency_hns), "{what}");
+                }
             }
         }
     }
 
     #[test]
-    fn a_stall_skips_frames_and_keeps_time() {
-        // At 180 fps the loop stalls 3.5 periods once.
-        let stall = |i: usize| {
-            if i == 52 { 3 * 55_556 + 30_000 } else { 20_000 }
-        };
-        let (out, skipped) = run_vsync(1, 120, stall, |_| 0);
-        // The three vblanks that went by are three frames never drawn, each an `m` line.
-        assert_eq!(skipped.len(), 3, "{skipped:?}");
-        let frames: Vec<u64> = out.iter().map(|r| r.record.frame).collect();
-        for s in &skipped {
-            assert!(!frames.contains(s));
-        }
-        assert_eq!(
-            frames.len() + skipped.len(),
-            *frames.last().unwrap() as usize + 1
-        );
-        // Every frame drawn is shown at its own vblank group, so none of them was late.
-        assert!(out.iter().all(|r| !r.missed));
-        for r in &out {
-            let shown = r.record.display_hns.unwrap();
-            assert!(near(shown, r.record.target_hns), "frame {}", r.record.frame);
+    fn a_stall_skips_frames_numbers_by_group_and_keeps_showing_on_target() {
+        // The loop stalls 3.5 vblanks once, after frame 24 (taken at vblank V): for k ≤ 3 frame
+        // 25's vblank V + k has gone by, so the pacer aims at V + 4. That is group 28 for k = 1
+        // (25–27 skipped), 26 for k = 2 (25 skipped) and 25 for k = 3, shown a vblank late;
+        // k = 4 isn't held up.
+        let cases: [(i64, &[u64], &[u64]); 4] = [
+            (1, &[25, 26, 27], &[]),
+            (2, &[25], &[]),
+            (3, &[], &[25]),
+            (4, &[], &[]),
+        ];
+        for latency in [0, 1] {
+            for (k, skipped, late) in cases {
+                let stall = |i: usize| {
+                    if i == 60 { 3 * 55_556 + 30_000 } else { 20_000 }
+                };
+                let start = 2 * HNS_PER_SECOND / 10;
+                let run = run_vsync(k, 120, Display::new(latency, 0), start, stall, |_| 0);
+                let what = format!("k {k} latency {latency}");
+                assert_eq!(run.skipped, skipped, "{what}");
+                let missed: Vec<u64> = run
+                    .out
+                    .iter()
+                    .filter(|r| r.missed)
+                    .map(|r| r.record.frame)
+                    .collect();
+                assert_eq!(missed, late, "{what}");
+                let frames: Vec<u64> = run.out.iter().map(|r| r.record.frame).collect();
+                for s in &run.skipped {
+                    assert!(!frames.contains(s), "{what}");
+                }
+                assert!(frames.windows(2).all(|w| w[0] < w[1]), "{what}");
+                for r in &run.out {
+                    // Every frame shows where it was drawn for, and N is the vblank group of its
+                    // target counted from frame 0.
+                    let shown = r.record.display_hns.unwrap();
+                    let latency_hns = HZ180.times(latency);
+                    assert!(
+                        near(shown, r.record.target_hns + latency_hns),
+                        "{what}: {r:?}"
+                    );
+                    let vblanks = HZ180.nearest(r.record.target_hns - run.anchor);
+                    let group = (2 * vblanks + k).div_euclid(2 * k);
+                    assert_eq!(r.record.frame as i64, group, "{what}: {r:?}");
+                }
+            }
         }
     }
 
     #[test]
     fn a_frame_shown_late_is_marked() {
-        for k in [1, 2] {
-            // The GPU is a vblank late with frame 40, so it misses its vblank; the cadence then
-            // carries on k vblanks after it.
-            let slow = |n| i64::from(n == 40) * k;
-            let (out, skipped) = run_vsync(k, 80, |_| 20_000, slow);
-            let late: Vec<u64> = out
-                .iter()
-                .filter(|r| r.missed)
-                .map(|r| r.record.frame)
-                .collect();
-            assert_eq!(late, [40], "k {k}; skipped {skipped:?}");
-            // At k = 1 frame 40 took frame 41's vblank; at k = 2 the next frame keeps its number
-            // in the new phase.
-            let want: &[u64] = if k == 1 { &[41] } else { &[] };
-            assert_eq!(skipped, want, "k {k}");
-            let numbers: Vec<u64> = out.iter().map(|r| r.record.frame).collect();
-            assert!(numbers.windows(2).all(|w| w[0] < w[1]));
-            // Frames after it are shown where they were drawn for.
-            for r in out.iter().filter(|r| r.record.frame > 41) {
-                let shown = r.record.display_hns.unwrap();
-                assert!(
-                    near(shown, r.record.target_hns),
-                    "k {k} frame {}",
-                    r.record.frame
-                );
+        for latency in [0, 1] {
+            for k in [1, 2, 3] {
+                // The GPU is k vblanks late with frame 40, so it misses its vblank; the cadence
+                // then carries on k vblanks after it.
+                let slow = |n| i64::from(n == 40) * k;
+                let start = 2 * HNS_PER_SECOND / 10;
+                let run = run_vsync(k, 80, Display::new(latency, 0), start, |_| 20_000, slow);
+                let late: Vec<u64> = run
+                    .out
+                    .iter()
+                    .filter(|r| r.missed)
+                    .map(|r| r.record.frame)
+                    .collect();
+                assert_eq!(late, [40], "k {k} latency {latency}");
+                let numbers: Vec<u64> = run.out.iter().map(|r| r.record.frame).collect();
+                assert!(numbers.windows(2).all(|w| w[0] < w[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn dxgi_and_the_monitor_clock_never_mix_counts() {
+        // Review 8a-gpu-1: frame 0 is chosen on the monitor's own clock before DXGI's first
+        // statistics, whose counts start millions of vblanks away (or before 0).
+        for offset in [5_000_000, -40] {
+            for k in [1, 3] {
+                let start = 2 * HNS_PER_SECOND / 10;
+                let run = run_vsync(k, 60, Display::new(1, offset), start, |_| 20_000, |_| 0);
+                let what = format!("offset {offset} k {k}");
+                assert!(run.skipped.is_empty(), "{what}: {:?}", run.skipped);
+                let frames: Vec<u64> = run.out.iter().map(|r| r.record.frame).collect();
+                assert_eq!(frames, (0..60).collect::<Vec<u64>>(), "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_start_skips_to_the_frame_now_due() {
+        // Frame 0 is placed at vblank 36, then the loop stalls until 10 vblanks after it: frames
+        // 0–10 never drawn, frame 0's time still the anchor.
+        let start = 2 * HNS_PER_SECOND / 10;
+        let mut pacer = VsyncPacer::new(1, HZ180, start);
+        pacer.on_vblank(0);
+        assert_eq!(pacer.next(20_000), Step::Warmup);
+        assert!(near(pacer.anchor().unwrap(), HZ180.times(36)));
+        pacer.on_vblank(HZ180.times(46));
+        let now = HZ180.times(46) + 20_000;
+        let Step::Frame {
+            frame,
+            target_hns,
+            skipped,
+        } = pacer.next(now)
+        else {
+            panic!("warm-up")
+        };
+        assert_eq!((frame, skipped), (11, 0..11));
+        assert!(near(target_hns, HZ180.times(47)));
+        assert!(near(pacer.anchor().unwrap(), HZ180.times(36)));
+    }
+
+    #[test]
+    fn a_grid_after_the_start_moves_frame_0_to_the_next_whole_second() {
+        // The first vblank timing comes after vblank 36, the one after the start.
+        let start = 2 * HNS_PER_SECOND / 10;
+        let mut pacer = VsyncPacer::new(1, HZ180, start);
+        pacer.on_vblank(HZ180.times(46));
+        assert_eq!(pacer.next(HZ180.times(46) + 20_000), Step::Warmup);
+        assert!(near(pacer.anchor().unwrap(), HNS_PER_SECOND));
+        // A grid that comes in time keeps the start's vblank.
+        let mut pacer = VsyncPacer::new(1, HZ180, start);
+        pacer.on_vblank(HZ180.times(35));
+        let Step::Frame { frame, .. } = pacer.next(HZ180.times(35) + 20_000) else {
+            panic!("warm-up")
+        };
+        assert_eq!(frame, 0);
+        assert!(near(pacer.anchor().unwrap(), HZ180.times(36)));
+    }
+
+    #[test]
+    fn frames_the_statistics_never_report_expire_after_a_second() {
+        let mut shown = Shown::new(Some(1), HZ180);
+        for f in 0..4_u32 {
+            let t = HZ180.times(i64::from(f));
+            shown.presented(u64::from(f), t, f + 1, t, false);
+        }
+        assert!(shown.expire(HNS_PER_SECOND).is_empty());
+        // A second after frame 1 was presented, frames 0 and 1 go out unknown, in order.
+        let gone = shown.expire(HZ180.times(1) + HNS_PER_SECOND + 1);
+        let frames: Vec<(u64, Option<i64>)> = gone
+            .iter()
+            .map(|r| (r.record.frame, r.record.display_hns))
+            .collect();
+        assert_eq!(frames, [(0, None), (1, None)]);
+        assert!(gone.iter().all(|r| !r.missed));
+        assert!(shown.waiting());
+        // Frame 3 reported: frame 2 between is filled in from its neighbours' cadence only when
+        // the one before it was reported, so here it stays unknown.
+        let out = shown.on_stats(Stats {
+            present_count: 4,
+            present_refresh: 3,
+            sync_refresh: 3,
+            sync_hns: HZ180.times(3),
+        });
+        let frames: Vec<u64> = out.iter().map(|r| r.record.frame).collect();
+        assert_eq!(frames, [2, 3]);
+        assert_eq!(out[0].record.display_hns, None);
+        assert!(!shown.waiting());
+    }
+
+    #[test]
+    fn the_wake_grid_finds_the_vblanks_under_late_wakes() {
+        // The display runs 50 ppm slow: vblank v at 1,234 + v periods × 1.00005. A wake comes
+        // 0.1–0.85 ms after its vblank, 3 % of them 3 ms after (past half a period), and 3 % of
+        // the vblanks are slept through.
+        let true_period = 10_000_000.0 * 1.000_05 / 180.0;
+        let mut grid = WakeGrid::new(HZ180);
+        let mut seed = 7_u64;
+        for v in 0..3_000_i64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let r = ((seed >> 33) % 1_000) as i64;
+            if r < 30 {
+                continue;
+            }
+            let lag = if r < 60 { 30_000 } else { 500 + 8 * r };
+            let vblank = 1_234 + (v as f64 * true_period).round() as i64;
+            let t = vblank + lag;
+            let last = grid.on_wake(t);
+            assert!(last <= t);
+            if v >= 180 {
+                // On the display's grid, at most the lag of the soonest tenth of wakes late.
+                let off = (last - vblank).rem_euclid(55_558);
+                assert!(off <= 2_500 || off >= 55_558 - 600, "vblank {v}: {off}");
             }
         }
     }
@@ -733,7 +1075,7 @@ mod tests {
     #[test]
     fn frames_the_statistics_skip_are_filled_in_on_cadence() {
         let mut pacer = VsyncPacer::new(1, HZ180, 0);
-        pacer.on_dwm_vblank(0, 0);
+        pacer.on_vblank(0);
         let mut targets = Vec::new();
         for i in 0..4_u32 {
             let Step::Frame {
@@ -766,7 +1108,7 @@ mod tests {
     #[test]
     fn a_gap_the_statistics_skip_leaves_times_unknown_and_marks_the_next() {
         let mut pacer = VsyncPacer::new(1, HZ180, 0);
-        pacer.on_dwm_vblank(0, 0);
+        pacer.on_vblank(0);
         for i in 0..3_u32 {
             let Step::Frame {
                 frame, target_hns, ..
@@ -793,18 +1135,46 @@ mod tests {
     }
 
     #[test]
+    fn a_disjoint_reading_resets_the_counts_but_not_the_frames() {
+        let mut pacer = VsyncPacer::new(1, HZ180, 0);
+        pacer.on_vblank(0);
+        let stats = |id: u32, v: u32, sync: u32, t: i64| Stats {
+            present_count: id,
+            present_refresh: v,
+            sync_refresh: sync,
+            sync_hns: t,
+        };
+        for i in 0..3_u32 {
+            let Step::Frame {
+                frame, target_hns, ..
+            } = pacer.next(HZ180.times(i64::from(i)) - 1)
+            else {
+                panic!("warm-up")
+            };
+            pacer.presented(frame, target_hns, 1 + i, target_hns);
+        }
+        assert_eq!(pacer.on_stats(stats(1, 1_000, 1_000, 0)).len(), 1);
+        // Full screen to windowed: counts restart near 0; frame 2 isn't taken as late.
+        pacer.disjoint();
+        let rest = pacer.on_stats(stats(3, 2, 2, HZ180.times(2)));
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|r| !r.missed), "{rest:?}");
+    }
+
+    #[test]
     fn without_a_grid_the_vsync_pacer_warms_up() {
         let mut pacer = VsyncPacer::new(1, HZ180, 0);
         assert_eq!(pacer.next(0), Step::Warmup);
         // Frames never reported get unknown display times at the end.
-        pacer.on_dwm_vblank(0, 0);
+        pacer.on_vblank(0);
         let Step::Frame {
             frame, target_hns, ..
-        } = pacer.next(1)
+        } = pacer.next(-1)
         else {
             panic!("warm-up")
         };
         pacer.presented(frame, target_hns, 1, 2);
+        assert!(pacer.waiting());
         let end = pacer.finish();
         assert_eq!(end.len(), 1);
         assert_eq!(end[0].record.display_hns, None);
@@ -884,5 +1254,7 @@ mod tests {
         };
         assert_eq!((frame, skipped), (5, 2..5));
         assert_eq!(target_hns, t.slot_time(5));
+        // A clock that jumps an hour and more is lost, not a million `m` lines.
+        assert_eq!(t.next(t.slot_time(MAX_SKIP + 100)), Step::Lost);
     }
 }

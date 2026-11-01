@@ -59,13 +59,17 @@ impl Ready {
             + "\n"
     }
 
-    /// Writes the file whole: into `<path>.partial`, then renamed, so a reader never sees half
-    /// of it.
+    /// Writes the file whole, and only if it doesn't exist: the text goes into
+    /// `<path>.<pid>.partial`, which is linked in as `path` (a step that fails with
+    /// `AlreadyExists` if a file got there first, where a rename would replace it) and then
+    /// removed. A reader never sees half of it.
     pub fn write(&self, path: &Path) -> io::Result<()> {
         let mut partial = path.as_os_str().to_owned();
-        partial.push(".partial");
+        partial.push(format!(".{}.partial", self.pid));
         fs::write(&partial, self.json())?;
-        fs::rename(&partial, path)
+        let linked = fs::hard_link(&partial, path);
+        let _ = fs::remove_file(&partial);
+        linked
     }
 }
 
@@ -100,7 +104,17 @@ mod tests {
         let path = dir.join("ready.json");
         ready.write(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
-        assert!(!dir.join("ready.json.partial").exists());
+        let partial = dir.join("ready.json.4242.partial");
+        assert!(!partial.exists());
+        // A second run given the same file leaves the first one's alone.
+        let other = Ready {
+            pid: 77,
+            ..ready.clone()
+        };
+        let err = other.write(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert!(!dir.join("ready.json.77.partial").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
