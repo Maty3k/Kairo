@@ -144,8 +144,24 @@ fn expected_patches(plan: &Plan) -> Expected {
 
 /// Runs `decoder` over the clip's video: each picture's barcodes and flash, and, once its frame
 /// number is known, its bars and patches. Nothing but these numbers is kept (README §6.7). Then
-/// each audio track, `audio` giving their channel counts in file order: its (L+R)/2.
-pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan, audio: &[usize]) -> Decoded {
+/// each audio track, `audio` giving their channel and packet counts in file order: its (L+R)/2,
+/// up to [`profile::AUDIO_MAX_SECONDS`].
+pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan, audio: &[(usize, usize)]) -> Decoded {
+    decode_capped(
+        decoder,
+        plan,
+        audio,
+        (profile::AUDIO_MAX_SECONDS * 48_000) as usize,
+    )
+}
+
+/// [`decode`], keeping at most `cap` sample frames of each audio track.
+fn decode_capped(
+    decoder: &mut dyn Decoder,
+    plan: &Plan,
+    audio: &[(usize, usize)],
+    cap: usize,
+) -> Decoded {
     let expected = expected_patches(plan);
     let mut decoded = Decoded {
         kind: decoder.kind(),
@@ -228,9 +244,10 @@ pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan, audio: &[usize]) ->
         ControlFlow::Continue(())
     });
     decoded.stats = stats;
-    let cap = (profile::AUDIO_MAX_SECONDS * 48_000) as usize;
-    for (track, &channels) in audio.iter().enumerate() {
-        let mut samples = Vec::new();
+    for (track, &(channels, packets)) in audio.iter().enumerate() {
+        // AAC gives 1,024 sample frames a packet: room for exactly those, so a 10-minute track
+        // holds 115 MB, not the 134 MB a doubling vector would reach.
+        let mut samples = Vec::with_capacity(cap.min(packets.saturating_mul(1_024)));
         let mut truncated = false;
         let stats = decoder.audio(track, channels, &mut |chunk| {
             analyze::audio::downmix(chunk, channels, &mut samples);
@@ -436,6 +453,12 @@ pub(crate) fn findings(
         .take(profile::PATTERN_PROBE_FRAMES)
         .any(|r| r.code.is_some());
     let analysis = analyse(ctx, decoded);
+    // The audio checks judge every track or none: one that didn't decode would read as silence
+    // and fail routes it never got to show (README §6.6: a decoder that can't, exit 3).
+    let audio_failed = decoded.audio.iter().enumerate().find_map(|(i, a)| {
+        let error = a.stats.as_ref().err()?;
+        Some(format!("audio track {} didn't decode: {error}", i + 1))
+    });
     // The audio analysis, made when the first audio check runs: `Some(None)` without audio.
     let mut sound: Option<Option<audio::Audio<'_>>> = None;
     let mut out = Vec::with_capacity(profile::CONTENT_CHECKS.len());
@@ -495,6 +518,10 @@ pub(crate) fn findings(
             continue;
         }
         let hdr = plan.expect.as_ref().is_some_and(|e| e.hdr.is_some());
+        if let Some(why) = audio_failed.as_ref().filter(|_| AUDIO_CHECKS.contains(&id)) {
+            out.push(weigh(id, Outcome::cannot(why.clone()), mode));
+            continue;
+        }
         if AUDIO_CHECKS.contains(&id) && sound.is_none() {
             sound = Some(audio_analysis(ctx, plan, decoded, &analysis));
         }
@@ -563,6 +590,7 @@ fn audio_analysis<'d>(
                 .audio
                 .get(i)
                 .map_or(&[][..], |a| a.samples.as_slice()),
+            truncated: decoded.audio.get(i).is_some_and(|a| a.truncated),
         })
         .collect();
     let flash_fps = analysis
@@ -624,6 +652,9 @@ fn decode_clean(ctx: &Ctx<'_>, decoded: &Decoded) -> Outcome {
         ..Outcome::default()
     };
     let mut audio = Vec::new();
+    // Tracks this decoder can't decode: the clip can't be judged on them, but failures found
+    // elsewhere still fail it.
+    let mut cannot = Vec::new();
     for (i, ((_, track), decoded)) in ctx.audio().zip(&decoded.audio).enumerate() {
         let n = i + 1;
         let packets = track.sizes.len() as u64;
@@ -634,7 +665,7 @@ fn decode_clean(ctx: &Ctx<'_>, decoded: &Decoded) -> Outcome {
             .sum();
         match &decoded.stats {
             Err(error @ (DecodeError::Start(_) | DecodeError::Unsupported(_))) => {
-                return Outcome::cannot(format!("audio track {n}: {error}"));
+                cannot.push(format!("audio track {n}: {error}"));
             }
             Err(error) => outcome.fails.push(format!("audio track {n}: {error}")),
             Ok(stats) => {
@@ -687,6 +718,12 @@ fn decode_clean(ctx: &Ctx<'_>, decoded: &Decoded) -> Outcome {
                 audio.len()
             );
         }
+    }
+    if outcome.fails.is_empty() && !cannot.is_empty() {
+        return Outcome {
+            value: outcome.value,
+            ..Outcome::cannot(cannot.join("; "))
+        };
     }
     outcome
 }
@@ -1184,6 +1221,57 @@ mod tests {
     use super::*;
     use crate::expect::Expect;
     use kairo_core::testsig::Barcode;
+
+    /// A decoder with no pictures and `chunks` chunks of 1,024 stereo sample frames per track.
+    struct Chunks(usize);
+
+    impl Decoder for Chunks {
+        fn kind(&self) -> &'static str {
+            "synthetic"
+        }
+
+        fn video(
+            &mut self,
+            _: &mut dyn FnMut(usize, &crate::decode::Planes<'_>) -> ControlFlow<()>,
+        ) -> Result<DecodeStats, DecodeError> {
+            Ok(DecodeStats::default())
+        }
+
+        fn audio(
+            &mut self,
+            _: usize,
+            channels: usize,
+            each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
+        ) -> Result<DecodeStats, DecodeError> {
+            let chunk = vec![0.25_f32; 1_024 * channels];
+            let mut stats = DecodeStats::default();
+            for _ in 0..self.0 {
+                stats.frames += 1_024;
+                if each(&chunk).is_break() {
+                    break;
+                }
+            }
+            Ok(stats)
+        }
+    }
+
+    #[test]
+    fn audio_fills_its_packets_room_and_stops_at_the_cap() {
+        // Review F8: room for exactly 1,024 frames a packet, so no doubling past the cap.
+        let decoded = decode_capped(&mut Chunks(3), &plan(Profile::Test), &[(2, 3)], 10_000);
+        let track = &decoded.audio[0];
+        assert_eq!((track.samples.len(), track.truncated), (3_072, false));
+        assert!(
+            track.samples.capacity() < 4_096,
+            "{}",
+            track.samples.capacity()
+        );
+        assert!(track.samples.iter().all(|&v| v == 0.25));
+        // Cut at the cap: kept up to it and marked, so the checks judge the start only.
+        let decoded = decode_capped(&mut Chunks(8), &plan(Profile::Test), &[(1, 8)], 5_000);
+        let track = &decoded.audio[0];
+        assert_eq!((track.samples.len(), track.truncated), (5_000, true));
+    }
 
     fn plan(profile: Profile) -> Plan {
         let text = r#"{"kairo_expect":1,"pattern":1,"fps":60,"source_hz":180,"seconds":20,

@@ -208,7 +208,8 @@ pub const CUE_PRESENT_NCC: f64 = 0.5;
 pub const CUE_POSSIBLE_NCC: f64 = 0.2;
 pub const CUE_MIN_DB: f64 = -70.0;
 /// How much of each audio track is decoded and judged, in seconds: 10 minutes of (L+R)/2 is
-/// 115 MB; longer clips are judged on their start (M13's hour-long files need streaming).
+/// 115 MB a track, about 0.6 GB for a clip with five, held while its audio is judged; longer
+/// clips are judged on their start (M13's hour-long files need streaming).
 pub const AUDIO_MAX_SECONDS: u64 = 600;
 /// The AAC lead the cut gives a clip, in samples: one priming packet plus up to one more
 /// (PLAN:179, cookbook P8, core/cut.rs).

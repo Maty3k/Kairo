@@ -445,13 +445,6 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
     if energy <= 0.0 {
         return None;
     }
-    let mut prefix = Vec::with_capacity(x.len() + 1);
-    prefix.push(0.0);
-    let mut total = 0.0;
-    for &v in x {
-        total += f64::from(v).powi(2);
-        prefix.push(total);
-    }
     let floor = len as f64 * 10_f64.powf(SILENCE_DB / 10.0);
     let size = (2 * len).next_power_of_two().max(1 << 15);
     let step = size - len + 1;
@@ -464,11 +457,17 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
     let last = x.len() - len;
     let mut best: Option<CueMatch> = None;
     let (mut re, mut im) = (vec![0.0; size], vec![0.0; size]);
+    // The block's running sum of squares, for each window's energy: a block's windows all lie
+    // inside it, so no whole-track array is needed.
+    let mut energies = vec![0.0; size + 1];
     let mut block = 0;
     while block <= last {
+        let mut total = 0.0;
         for (i, (r, m)) in re.iter_mut().zip(im.iter_mut()).enumerate() {
             *r = x.get(block + i).map_or(0.0, |&v| f64::from(v));
             *m = 0.0;
+            total += *r * *r;
+            energies[i + 1] = total;
         }
         fft(&mut re, &mut im, false);
         for k in 0..size {
@@ -482,7 +481,7 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
             if at > last {
                 break;
             }
-            let window = prefix[at + len] - prefix[at];
+            let window = energies[m + 1] - energies[m + 1 - len];
             if window < floor {
                 continue;
             }

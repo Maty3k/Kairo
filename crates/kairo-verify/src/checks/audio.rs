@@ -97,11 +97,13 @@ impl Expected {
                 cue: absent,
             };
         }
+        // Everything else holds the game only in plan A; plan B and Windows 10 hear it there
+        // too (README §6.4), so without tones from an expect file it may carry it.
         let (game, voice) = match title {
             "Mix" => (present, if has_voice_track { present } else { absent }),
             "Game" => (present, absent),
             "Voice chat" => (absent, present),
-            "Everything else" => (absent, absent),
+            "Everything else" => (any, absent),
             _ => (any, any),
         };
         Self {
@@ -119,6 +121,8 @@ pub(crate) struct Track<'a> {
     pub expected: Expected,
     /// Its (L+R)/2 at 48 kHz.
     pub samples: &'a [f32],
+    /// Whether it was cut at [`profile::AUDIO_MAX_SECONDS`], so it ends before the clip does.
+    pub truncated: bool,
 }
 
 /// Where the game beeps belong: each flash m with its expected onset, in audio samples.
@@ -186,10 +190,37 @@ pub(crate) struct Audio<'a> {
     no_game: Option<String>,
 }
 
-/// How far a beep is searched for around where it should be: ±250 ms around a flash (A/V up to
-/// that), ±100 ms around another track's beep.
+/// How far a beep is searched for around where it should be: ±250 ms around a flash, then ±500
+/// ms (half the flash period) around a flash with no beep that close, and ±100 ms around
+/// another track's beep.
 const FLASH_RADIUS: f64 = 250.0 * MS;
+const WIDE_RADIUS: f64 = 500.0 * MS;
 const EVENT_RADIUS: f64 = 100.0 * MS;
+
+/// A beep's length, in samples.
+const BEEP_LEN: f64 = 100.0 * MS;
+
+/// One beep timed against the pictures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Timed {
+    /// The flash it belongs to, for the game beep; `None` for a voice or mic beep.
+    pub flash: Option<i64>,
+    /// Where it should start (the game beep) or starts, in seconds.
+    pub at_s: f64,
+    /// How far after its picture it plays, in ms; `None` where a track that carries the game
+    /// beep has none within [`WIDE_RADIUS`] of this flash.
+    pub offset_ms: Option<f64>,
+}
+
+impl Timed {
+    /// The beep, for messages: its flash and time, or its time.
+    fn label(&self, kind: &str) -> String {
+        match self.flash {
+            Some(m) => format!("the {kind} beep of flash {m} at {:.3} s", self.at_s),
+            None => format!("the {kind} beep at {:.3} s", self.at_s),
+        }
+    }
+}
 
 /// Prefers the track titled `first`, then the Mix, then the others in order.
 fn preference(tracks: &[Track<'_>], first: &str) -> Vec<usize> {
@@ -219,14 +250,21 @@ impl<'a> Audio<'a> {
         let mut events: BTreeMap<Kind, Vec<f64>> = BTreeMap::new();
         let mut beeps: Vec<BTreeMap<Kind, Vec<Option<Beep>>>> =
             tracks.iter().map(|_| BTreeMap::new()).collect();
-        // The game: every track measured at each flash; the reference onset is the first
-        // carrying track's beep that counts, else the expected time.
+        // The game: every track measured at each flash, further out where no beep that counts
+        // is near it, so a late or slipping track is timed rather than missed; the reference
+        // onset is the first carrying track's beep that counts, else the expected time.
         let game_detector = &detectors[&Kind::Game];
         for (i, track) in tracks.iter().enumerate() {
             beeps[i].insert(
                 Kind::Game,
                 game.iter()
-                    .map(|&(_, e)| game_detector.measure(track.samples, e, FLASH_RADIUS))
+                    .map(|&(_, e)| {
+                        let near = game_detector.measure(track.samples, e, FLASH_RADIUS);
+                        if near.is_some_and(|b| game_detector.counts(&b)) {
+                            return near;
+                        }
+                        game_detector.find(track.samples, e, WIDE_RADIUS).or(near)
+                    })
                     .collect(),
             );
         }
@@ -274,6 +312,7 @@ impl<'a> Audio<'a> {
             .collect();
         let mut levels = Vec::with_capacity(tracks.len());
         let mut scans = Vec::with_capacity(tracks.len());
+        let longest = tracks.iter().map(|t| t.samples.len()).max().unwrap_or(0);
         for track in &tracks {
             let mut per_kind = BTreeMap::new();
             let mut scanned = BTreeMap::new();
@@ -288,13 +327,17 @@ impl<'a> Audio<'a> {
                     scanned.insert(kind, scan_level(track.samples, kind.hz(), skip));
                     continue;
                 }
+                // A window past this track's end but inside a longer track's is silence: the
+                // track stopped early. Past the 10-minute cap, or the clip's end, it isn't judged.
                 per_kind.insert(
                     kind,
                     onsets
                         .iter()
                         .filter_map(|&at| {
                             let (start, len) = audio::plateau(at)?;
-                            audio::level_db(track.samples, kind.hz(), start, len)
+                            audio::level_db(track.samples, kind.hz(), start, len).or_else(|| {
+                                (!track.truncated && start + len <= longest).then(|| audio::db(0.0))
+                            })
                         })
                         .collect(),
                 );
@@ -317,62 +360,97 @@ impl<'a> Audio<'a> {
         }
     }
 
-    /// Each track's A/V offsets in ms, game-carrying tracks from their own beeps and the others
-    /// through the Mix (README §6.3 av.offset): (offsets, how).
-    fn offsets(&self) -> Vec<Option<(Vec<f64>, &'static str)>> {
+    /// Each track's beeps timed against the pictures (README §6.3 av.offset), with how. A track
+    /// that should carry the game beep and does is timed at every flash whose beep lies inside
+    /// it, a flash without one counting as missing. A voice-only or mic-only track is timed
+    /// through the anchor, the Mix if it times the game beep, else the first track that does:
+    /// each of its beeps is the anchor's offset at the nearest flash plus the beep's distance
+    /// from the anchor's same beep.
+    fn offsets(&self) -> Vec<Option<(Vec<Timed>, Kind, String)>> {
         let game_detector = Detector::new(Kind::Game.hz());
-        let direct: Vec<Option<Vec<f64>>> = self
+        let direct: Vec<Option<Vec<Timed>>> = self
             .tracks
             .iter()
             .enumerate()
             .map(|(i, track)| {
-                (track.expected.game == Tone::Present).then(|| {
-                    self.beeps[i][&Kind::Game]
+                let beeps = &self.beeps[i][&Kind::Game];
+                // A track without a single game beep is routing's to judge.
+                if track.expected.game != Tone::Present
+                    || !beeps.iter().flatten().any(|b| game_detector.counts(b))
+                {
+                    return None;
+                }
+                let end = track.samples.len() as f64;
+                Some(
+                    beeps
                         .iter()
                         .zip(&self.game)
-                        .filter_map(|(b, &(_, e))| {
-                            b.filter(|b| game_detector.counts(b))
-                                .map(|b| (b.at - e) / MS)
+                        .filter_map(|(b, &(m, e))| {
+                            let counted = b.filter(|b| game_detector.counts(b));
+                            // A beep that would run past the track's end isn't expected in it.
+                            if counted.is_none() && e + BEEP_LEN > end {
+                                return None;
+                            }
+                            Some(Timed {
+                                flash: Some(m),
+                                at_s: e / RATE,
+                                offset_ms: counted.map(|b| (b.at - e) / MS),
+                            })
                         })
-                        .collect()
-                })
+                        .collect(),
+                )
             })
             .collect();
-        // The anchor: the Mix if it times the game beep, else the first track that does.
-        let anchor = preference(&self.tracks, "Mix")
-            .into_iter()
-            .find(|&i| direct[i].as_ref().is_some_and(|o| !o.is_empty()));
+        let anchor = preference(&self.tracks, "Mix").into_iter().find(|&i| {
+            direct[i]
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|t| t.offset_ms.is_some()))
+        });
         (0..self.tracks.len())
             .map(|i| {
-                if let Some(o) = direct[i].as_ref().filter(|o| !o.is_empty()) {
-                    return Some((o.clone(), "game beeps"));
+                if let Some(timed) = &direct[i] {
+                    return Some((timed.clone(), Kind::Game, "game beeps".to_owned()));
                 }
                 let a = anchor.filter(|&a| a != i)?;
-                let base = median(direct[a].as_deref()?)?;
-                // A voice-only or mic-only track: the anchor's offset plus its own beeps'
-                // distance from the anchor's.
+                let anchor_timed: Vec<(f64, f64)> = direct[a]
+                    .as_ref()?
+                    .iter()
+                    .filter_map(|t| Some((t.at_s, t.offset_ms?)))
+                    .collect();
                 [Kind::Voice, Kind::Mic].into_iter().find_map(|kind| {
                     if self.tracks[i].expected.tone(kind) != Tone::Present {
                         return None;
                     }
                     let d = Detector::new(kind.hz());
-                    let gaps: Vec<f64> = self.beeps[i][&kind]
+                    let timed: Vec<Timed> = self.beeps[i][&kind]
                         .iter()
                         .zip(&self.beeps[a][&kind])
                         .filter_map(|(x, y)| {
                             let (x, y) = (x.filter(|b| d.counts(b))?, y.filter(|b| d.counts(b))?);
-                            ((x.at - y.at).abs() <= 5.0 * MS).then_some((x.at - y.at) / MS)
+                            let at = y.at / RATE;
+                            let base = anchor_timed
+                                .iter()
+                                .min_by(|p, q| (p.0 - at).abs().total_cmp(&(q.0 - at).abs()))?
+                                .1;
+                            Some(Timed {
+                                flash: None,
+                                at_s: x.at / RATE,
+                                offset_ms: Some(base + (x.at - y.at) / MS),
+                            })
                         })
                         .collect();
-                    let gap = median(&gaps)?;
-                    Some((
-                        vec![base + gap],
-                        if kind == Kind::Voice {
-                            "voice beeps, through the Mix"
+                    (!timed.is_empty()).then(|| {
+                        let what = if kind == Kind::Voice {
+                            "voice beeps"
                         } else {
-                            "mic markers, through the Mix"
-                        },
-                    ))
+                            "mic markers"
+                        };
+                        (
+                            timed,
+                            kind,
+                            format!("{what}, through {}", self.tracks[a].title),
+                        )
+                    })
                 })
             })
             .collect()
@@ -412,7 +490,8 @@ fn fmt_ms(v: f64) -> String {
     format!("{v:+.2} ms")
 }
 
-/// `av.offset`: each track's beeps against the pictures, every event within 40 ms.
+/// `av.offset`: each track's beeps against the pictures, every event within 40 ms, and no flash
+/// without its beep on a track that carries the game beep.
 pub(crate) fn av_offset(audio: &Audio<'_>) -> Outcome {
     if let Some(why) = &audio.no_game {
         return Outcome::cannot(why.clone());
@@ -425,10 +504,11 @@ pub(crate) fn av_offset(audio: &Audio<'_>) -> Outcome {
     let mut values = Vec::new();
     let mut medians = Vec::new();
     for (track, found) in audio.tracks.iter().zip(audio.offsets()) {
-        let Some((offsets, how)) = found else {
+        let Some((timed, kind, how)) = found else {
             values.push(json!({"track": track.title, "measured": false}));
             continue;
         };
+        let offsets: Vec<f64> = timed.iter().filter_map(|t| t.offset_ms).collect();
         let (min, max) = offsets
             .iter()
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &o| {
@@ -437,15 +517,26 @@ pub(crate) fn av_offset(audio: &Audio<'_>) -> Outcome {
         let mid = median(&offsets).unwrap_or(0.0);
         medians.push(format!("{} {}", track.title, fmt_ms(mid)));
         values.push(json!({"track": track.title, "measured": true, "via": how,
-                           "events": offsets.len(), "median_ms": mid, "min_ms": min, "max_ms": max}));
-        for (j, &o) in offsets.iter().enumerate() {
-            outcome.require(o.abs() <= limit, || {
-                format!(
-                    "{}: beep {j} is {} off the pictures",
+                           "events": offsets.len(), "missing": timed.len() - offsets.len(),
+                           "median_ms": mid, "min_ms": min, "max_ms": max}));
+        for t in &timed {
+            match t.offset_ms {
+                Some(o) => outcome.require(o.abs() <= limit, || {
+                    format!(
+                        "{}: {} is {} off the pictures",
+                        track.title,
+                        t.label(kind.name()),
+                        fmt_ms(o)
+                    )
+                }),
+                None => outcome.fails.push(format!(
+                    "{}: no game beep within {} ms of flash {} at {:.3} s",
                     track.title,
-                    fmt_ms(o)
-                )
-            });
+                    WIDE_RADIUS / MS,
+                    t.flash.unwrap_or_default(),
+                    t.at_s
+                )),
+            }
         }
     }
     if medians.is_empty() {
@@ -469,9 +560,11 @@ pub(crate) fn av_offset_tight(audio: &Audio<'_>) -> Outcome {
     };
     let mut measured = 0;
     for (track, found) in audio.tracks.iter().zip(audio.offsets()) {
-        let Some((offsets, "game beeps")) = found else {
+        let Some((timed, Kind::Game, _)) = found else {
             continue;
         };
+        // A missing beep is av.offset's to report.
+        let offsets: Vec<f64> = timed.iter().filter_map(|t| t.offset_ms).collect();
         measured += 1;
         let mid = median(&offsets).unwrap_or(0.0);
         let worst = offsets.iter().fold(0.0_f64, |a, &o| a.max(o.abs()));
@@ -497,7 +590,8 @@ pub(crate) fn av_offset_tight(audio: &Audio<'_>) -> Outcome {
 }
 
 /// `av.inter_track`: the same beep on the Mix and on each other track that carries it agrees
-/// within ±0.5 ms.
+/// within ±0.5 ms. Beeps pair by event, however far apart (each track is searched near the same
+/// flash or onset); a track missing a beep the Mix has is routing's to judge.
 pub(crate) fn av_inter_track(audio: &Audio<'_>) -> Outcome {
     let limit = profile::AV_INTER_TRACK_MS;
     let mut outcome = Outcome {
@@ -522,7 +616,7 @@ pub(crate) fn av_inter_track(audio: &Audio<'_>) -> Outcome {
                 .zip(&audio.beeps[mix][&kind])
                 .filter_map(|(x, y)| {
                     let (x, y) = (x.filter(|b| d.counts(b))?, y.filter(|b| d.counts(b))?);
-                    ((x.at - y.at).abs() <= 5.0 * MS).then_some((x.at - y.at) / MS)
+                    Some((x.at - y.at) / MS)
                 })
                 .collect();
             if gaps.is_empty() {
@@ -548,8 +642,8 @@ pub(crate) fn av_inter_track(audio: &Audio<'_>) -> Outcome {
 }
 
 /// `audio.tone_snr`: each beep a track should carry, fitted over its steady part, jointly with
-/// any other tone there: SNR ≥35 dB and within 1 Hz. In engine clips with a Mic track, the Mix's
-/// SNR only warns (room noise, README §6.5).
+/// any other tone there: SNR ≥35 dB and within 1 Hz. In engine clips with a Mic track, and their
+/// `original` copies, the Mix's SNR only warns (room noise, README §6.5).
 pub(crate) fn tone_snr(audio: &Audio<'_>, plan: &Plan) -> Outcome {
     let (min_db, hz_tolerance) = (profile::TONE_SNR_MIN_DB, profile::TONE_HZ_TOLERANCE);
     let mut outcome = Outcome {
@@ -560,7 +654,9 @@ pub(crate) fn tone_snr(audio: &Audio<'_>, plan: &Plan) -> Outcome {
     let mut worst: Option<f64> = None;
     let mut fitted = 0;
     for (i, track) in audio.tracks.iter().enumerate() {
-        let soft = plan.profile == Profile::Engine && track.title == "Mix" && has_mic;
+        let soft = matches!(plan.profile, Profile::Engine | Profile::Original)
+            && track.title == "Mix"
+            && has_mic;
         for kind in Kind::ALL {
             if track.expected.tone(kind) != Tone::Present {
                 continue;

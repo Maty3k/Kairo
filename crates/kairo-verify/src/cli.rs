@@ -226,6 +226,17 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         return Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}"));
     }
     let profile = profile.ok_or_else(|| format!("check needs --profile\n{USAGE}"))?;
+    // Flags that would do nothing under this profile are refused, not ignored.
+    if av_tight && profile != Profile::Engine {
+        return Err(format!(
+            "--av-tight goes with --profile engine (M3 task 9)\n{USAGE}"
+        ));
+    }
+    if voice_included && !profile.is_share_export() {
+        return Err(format!(
+            "--voice-included goes with a share export's profile: share, discord, whatsapp or reels\n{USAGE}"
+        ));
+    }
     if json == Some(Output::Stdout) && summary == Some(Output::Stdout) {
         return Err("--json - and --summary - can't both use stdout".to_owned());
     }
@@ -812,12 +823,17 @@ mod tests {
             })
         );
         assert!(matches!(
-            parse_args(&args(
-                "check a.mp4 --profile engine --cue c.wav --av-tight --voice-included"
-            )),
+            parse_args(&args("check a.mp4 --profile engine --cue c.wav --av-tight")),
             Ok(Command::Check {
                 cue: Some(_),
                 av_tight: true,
+                voice_included: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_args(&args("check a.mp4 --profile discord --voice-included")),
+            Ok(Command::Check {
                 voice_included: true,
                 ..
             })
@@ -933,6 +949,8 @@ mod tests {
             "check a.mp4 b.mp4 --profile engine",
             "check a.mp4 --profile engine --frobnicate",
             "check a.mp4 --profile",
+            "check a.mp4 --profile test --av-tight",
+            "check a.mp4 --profile engine --voice-included",
             "boxes",
             "boxes a b",
             "mutate",

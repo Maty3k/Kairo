@@ -196,7 +196,7 @@ pub fn check_with(
         Some(decoder) if clip.problems.is_empty() => {
             report.decoder.kind = decoder.kind();
             let decode_started = Instant::now();
-            let decoded = checks::decode(decoder, plan, &checks::audio_channels(&clip));
+            let decoded = checks::decode(decoder, plan, &checks::audio_tracks(&clip));
             report.timings_ms.decode = decode_started.elapsed().as_millis() as u64;
             Some(decoded)
         }
