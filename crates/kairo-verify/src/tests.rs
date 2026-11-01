@@ -1377,6 +1377,89 @@ mod cli {
     }
 
     #[test]
+    fn synth_writes_the_wavs_after_the_frames_and_never_replaces_one() {
+        let dir = Dir::new();
+        let folder = dir.0.to_string_lossy().into_owned();
+        let expect = dir.0.join("e.json");
+        let synth = |defect: &str| {
+            let args: Vec<OsString> = [
+                "synth",
+                "--preset",
+                "64x36@60",
+                "--seconds",
+                "1",
+                "--defect",
+                defect,
+                "--wav-dir",
+            ]
+            .iter()
+            .map(OsString::from)
+            .chain([dir.0.clone().into_os_string(), OsString::from("--expect")])
+            .chain([expect.clone().into_os_string()])
+            .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = crate::cli::run_with(&args, &mut out, &mut err, false);
+            let err = String::from_utf8(err).unwrap();
+            assert!(!err.contains(&folder), "{err}");
+            (code, out, err)
+        };
+        let (code, out, err) = synth("cue");
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out.len(), 60 * 64 * 36 * 3 / 2);
+        assert!(
+            err.ends_with("defect cue; the expect file is e.json; the WAVs are mix.wav, game.wav, mic.wav and voice.wav\n"),
+            "{err}"
+        );
+        for (file, channels) in [
+            ("mix.wav", 2),
+            ("game.wav", 2),
+            ("mic.wav", 1),
+            ("voice.wav", 2),
+        ] {
+            let wav = crate::wav::read(&std::fs::read(dir.0.join(file)).unwrap()).unwrap();
+            assert_eq!((wav.rate, wav.channels), (48_000, channels), "{file}");
+            assert_eq!(wav.samples.len(), 48_000 * usize::from(channels), "{file}");
+        }
+        let written = Expect::parse(&std::fs::read_to_string(&expect).unwrap()).unwrap();
+        assert_eq!(written.tracks.len(), 4);
+        let partials = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".partial")
+            })
+            .count();
+        assert_eq!(partials, 0);
+        // A WAV that exists already stops the run before any frame, and nothing is written.
+        std::fs::remove_file(&expect).unwrap();
+        let mix = std::fs::read(dir.0.join("mix.wav")).unwrap();
+        let (code, out, err) = synth("leak");
+        assert_eq!((code, out.len()), (4, 0), "{err}");
+        assert!(err.contains("mix.wav: already exists"), "{err}");
+        assert!(!expect.exists());
+        assert_eq!(std::fs::read(dir.0.join("mix.wav")).unwrap(), mix);
+        // A WAV folder that doesn't exist, likewise, without naming it.
+        let args: Vec<OsString> = ["synth", "--preset", "64x36@60", "--seconds", "1"]
+            .iter()
+            .map(OsString::from)
+            .chain([
+                OsString::from("--wav-dir"),
+                dir.0.join("Carol").into_os_string(),
+                OsString::from("--expect"),
+                expect.clone().into_os_string(),
+            ])
+            .collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = crate::cli::run_with(&args, &mut out, &mut err, false);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!((code, out.len()), (4, 0), "{err}");
+        assert!(!err.contains("Carol"), "{err}");
+    }
+
+    #[test]
     fn boxes_prints_the_tree_and_the_tracks() {
         let dir = Dir::new();
         let good = dir.file("good.mp4", &Spec::good().build());
