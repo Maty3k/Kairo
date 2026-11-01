@@ -1065,11 +1065,15 @@ mod cli {
         let bad = dir.file("bad.mp4", &Spec::with(|s| s.faststart = false).build());
         let expect = dir.file("expect.json", expect_text(2, &ROLES).as_bytes());
         let json = dir.0.join("report.json");
+        // Structure only, on every system: Windows would otherwise decode with the linked FFmpeg,
+        // and the builder's clips hold no real pictures.
         let engine = [
             os("--profile"),
             os("engine"),
             os("--expect"),
             expect.as_os_str(),
+            os("--decoder"),
+            os("none"),
         ];
         let (code, out, err) = run(&[
             &[os("check"), good.as_os_str()][..],
@@ -1097,7 +1101,7 @@ mod cli {
         .concat());
         assert_eq!(code, 0, "{out}");
         assert!(out.starts_with("{\"kairo_verify\":1,"), "{out}");
-        // The test profile needs content checks this build can't run: exit 3.
+        // The test profile needs content checks, which can't run without a decoder: exit 3.
         let (code, out, _) = run(&[
             os("check"),
             good.as_os_str(),
@@ -1105,6 +1109,8 @@ mod cli {
             os("test"),
             os("--expect"),
             expect.as_os_str(),
+            os("--decoder"),
+            os("none"),
         ]);
         assert_eq!(code, 3, "{out}");
         assert!(out.contains("NOT RUN"), "{out}");
