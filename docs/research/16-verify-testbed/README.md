@@ -456,8 +456,8 @@ kairo-verify check <clip.mp4> --profile test|capture|smoke|engine|share|discord|
       [--expect FILE] [--testbed-log FILE] [--voice-log FILE] [--cue FILE.wav] [--av-tight] [--voice-included]
       [--decoder linked|cli|none] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
 kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds N] [--defect D]
-      [--hdr natural|match --lw NITS --sdr-white NITS] [--codec nv12|ipcm [--gop N]] --wav-dir DIR --expect FILE
-      (frames on stdout)
+      [--hdr natural|match --lw NITS --sdr-white NITS] [--codec nv12|ipcm [--gop N]] [--wav-dir DIR] --expect FILE
+      (frames on stdout; without --wav-dir the expect file lists no tracks, for video-only clips)
 kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr|set-default TRACK|perturb-stts S D  IN OUT
 kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm --ffmpeg PATH [--hw-index N] --out DIR
 kairo-verify corpus check DIR [--ffprobe PATH]
@@ -723,7 +723,7 @@ All are made from `good-1080p60`'s recipe with one change. "Synth" means the sam
 | `gop2s` | encode with `-g 120` (I_PCM: `--gop 120`) | `video.gop` | — |
 | `bars-sparse` | synth, +24 every 64 px | `content.bars_lines` | `content.bars` (40.9 dB on VideoToolbox, 0.9 dB above the limit [Mac]) |
 | `unreadable` | synth: barcodes garbled in 5 frames | `content.barcode` | — |
-| `cue` | placeholder cue in Mix: 600 Hz for 100 ms, then 1,500 Hz for 120 ms, at +750 ms, −30 dBFS | `audio.cue` | — |
+| `cue` | placeholder cue in Mix: 600 Hz for 100 ms, then 1,500 Hz for 120 ms, at +700 ms in each second (moved from +750 in PR 5's review: there it began just as the next flash's ±250 ms beep search opened), −30 dBFS | `audio.cue` | — |
 | `leak` | voice tone at −40 dBFS in Game | `audio.routing` | — |
 | `noisy` | white noise at −55 dBFS RMS in Game: tone SNR ≈22 dB, while the absent windows peak at −77 dBFS, so routing still passes [crit: noisy_routing.py, re-run] | `audio.tone_snr` | — |
 | `curve-swap` | synth `--hdr match`, expected `natural` | `hdr.curve_levels` | — |

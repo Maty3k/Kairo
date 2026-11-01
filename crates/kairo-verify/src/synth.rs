@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `kairo-verify synth` (docs/research/16-verify-testbed/README.md §6.1, §7.1–7.3): pattern v1
 //! at a clip's size and rate for an encoder, as raw NV12 or as [`crate::ipcm`]'s lossless H.264
-//! stream, with the clip's `expect.json`.
+//! stream; the clip's audio tracks as 48 kHz WAVs; and the clip's `expect.json`.
 //!
 //! Output frame k shows testbed frame N_k = ⌊k · source_hz / fps⌋ (3k from a 180 Hz testbed at
-//! 60 fps), as an ideal pacer sampling the testbed would, unless a defect changes that. The
-//! audio tracks, their WAVs and the audio defects come with research 16's PR 5, so the expect
-//! file lists no tracks yet.
+//! 60 fps), as an ideal pacer sampling the testbed would, unless a defect changes that. Flash m
+//! is output frame m · fps, at m s, and the game beep starts at m s in its WAV: the AAC
+//! encoder's priming and the mux's held first frame then cancel (cookbook P8).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::str::FromStr;
 
-use kairo_core::testsig::{Curve, Load, Options, Patches, Pattern, Size};
+use kairo_core::testsig::{self, Curve, Load, Options, Patches, Pattern, Size, Tone};
 
 use crate::decode::Picture;
-use crate::decode::synthetic::{Damage, Synthetic};
+use crate::decode::synthetic::{Damage, Sound, Synthetic, SyntheticAudio};
 use crate::expect::{self, Expect, Hdr};
 use crate::ipcm::Ipcm;
 
@@ -57,8 +58,9 @@ impl fmt::Display for Format {
     }
 }
 
-/// A video defect (README §7.3). Its frame, where it has one, defaults to
-/// [`Synth::defect_frame`].
+/// A defect (README §7.3). The video defects change the frames, and a frame, where they take
+/// one, defaults to [`Synth::defect_frame`]. The audio defects (`av50` on) change only the WAVs,
+/// so their clips share the good clip's video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Defect {
     /// `drop[@K]`: from output frame K on, every frame shows the next one's content.
@@ -77,7 +79,40 @@ pub enum Defect {
     BarsSparse,
     /// `unreadable`: both barcodes garbled in 5 frames from the defect frame on.
     Unreadable,
+    /// `av50`: every WAV starts with [`AV50_SAMPLES`] of silence and loses as many at its end,
+    /// so the sound plays 50 ms after its pictures.
+    Av50,
+    /// `swap-game-voice`: the Game WAV carries the voice beeps and the Voice chat WAV the game
+    /// beeps, each under its own title: a swap the container can't see (both stereo).
+    SwapGameVoice,
+    /// `cue`: `testsig`'s placeholder cue in the Mix, at [`testsig::CUE_OFFSET_MS`] in every
+    /// second.
+    Cue,
+    /// `leak`: the voice beep in the Game WAV too, [`LEAK_DB`] under its own level (−40 dBFS).
+    Leak,
+    /// `noisy`: white noise at [`NOISE_DBFS`] RMS in the Game WAV.
+    Noisy,
 }
+
+impl Defect {
+    /// Whether it changes only the WAVs.
+    pub fn is_audio(self) -> bool {
+        matches!(
+            self,
+            Self::Av50 | Self::SwapGameVoice | Self::Cue | Self::Leak | Self::Noisy
+        )
+    }
+}
+
+/// `av50`'s delay: 50 ms at 48 kHz.
+pub const AV50_SAMPLES: usize = 2_400;
+
+/// `leak`'s level against the voice beep's own, in dB.
+pub const LEAK_DB: f64 = -10.0;
+
+/// `noisy`'s level, in dBFS RMS: a tone SNR of about 22 dB, while the narrowband level where a
+/// tone should be absent stays near −77 dBFS, so routing still passes (README §7.3).
+pub const NOISE_DBFS: f64 = -55.0;
 
 /// How many frames `unreadable` garbles.
 pub const UNREADABLE_FRAMES: u64 = 5;
@@ -86,8 +121,7 @@ impl FromStr for Defect {
     type Err = String;
 
     fn from_str(text: &str) -> Result<Self, String> {
-        let usage =
-            || "--defect takes drop[@K], dup[@K], judder, corrupt-bars, bars-sparse or unreadable";
+        let usage = || "--defect takes drop[@K], dup[@K], judder, corrupt-bars, bars-sparse, unreadable, av50, swap-game-voice, cue, leak or noisy";
         let frame = |k: &str| k.parse::<u64>().map_err(|_| usage().to_owned());
         Ok(match text.split_once('@') {
             Some(("drop", k)) => Self::Drop(Some(frame(k)?)),
@@ -100,6 +134,11 @@ impl FromStr for Defect {
                 "corrupt-bars" => Self::CorruptBars,
                 "bars-sparse" => Self::BarsSparse,
                 "unreadable" => Self::Unreadable,
+                "av50" => Self::Av50,
+                "swap-game-voice" => Self::SwapGameVoice,
+                "cue" => Self::Cue,
+                "leak" => Self::Leak,
+                "noisy" => Self::Noisy,
                 _ => return Err(usage().to_owned()),
             },
         })
@@ -117,9 +156,94 @@ impl fmt::Display for Defect {
             Self::CorruptBars => f.write_str("corrupt-bars"),
             Self::BarsSparse => f.write_str("bars-sparse"),
             Self::Unreadable => f.write_str("unreadable"),
+            Self::Av50 => f.write_str("av50"),
+            Self::SwapGameVoice => f.write_str("swap-game-voice"),
+            Self::Cue => f.write_str("cue"),
+            Self::Leak => f.write_str("leak"),
+            Self::Noisy => f.write_str("noisy"),
         }
     }
 }
+
+/// An audio track of a `synth` clip (README §7.1), in the clip's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTrack {
+    /// The default track: every beep. No two overlap, so it peaks at −30 dBFS too.
+    Mix,
+    /// The game beep.
+    Game,
+    /// The mic marker, mono.
+    Mic,
+    /// The voice beep.
+    Voice,
+}
+
+impl AudioTrack {
+    /// Every track, in the clip's order.
+    pub const ALL: [Self; 4] = [Self::Mix, Self::Game, Self::Mic, Self::Voice];
+
+    /// Its title, which the mux writes as its name.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Mix => "Mix",
+            Self::Game => "Game",
+            Self::Mic => "Mic",
+            Self::Voice => "Voice chat",
+        }
+    }
+
+    /// Its WAV's name in `--wav-dir`.
+    pub const fn file(self) -> &'static str {
+        match self {
+            Self::Mix => "mix.wav",
+            Self::Game => "game.wav",
+            Self::Mic => "mic.wav",
+            Self::Voice => "voice.wav",
+        }
+    }
+
+    /// 1 or 2.
+    pub const fn channels(self) -> u16 {
+        match self {
+            Self::Mic => 1,
+            _ => 2,
+        }
+    }
+
+    /// Its AAC bitrate in the mux, in kbps.
+    pub const fn kbps(self) -> u32 {
+        match self {
+            Self::Mic => 128,
+            _ => 160,
+        }
+    }
+
+    /// The beeps it carries in a good clip.
+    pub const fn tones(self) -> &'static [Tone] {
+        match self {
+            Self::Mix => &[Tone::Game, Tone::Mic, Tone::Voice],
+            Self::Game => &[Tone::Game],
+            Self::Mic => &[Tone::Mic],
+            Self::Voice => &[Tone::Voice],
+        }
+    }
+}
+
+/// A tone's name in an expect file.
+fn tone_name(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Game => "game",
+        Tone::Voice => "voice",
+        Tone::Mic => "mic",
+    }
+}
+
+/// The longest clip `synth` writes WAVs for: the checks decode no more audio than this.
+pub const MAX_AUDIO_SECONDS: u32 = crate::profile::AUDIO_MAX_SECONDS as u32;
+
+/// The shortest: flash 0 falls on the held first frame, which `av.offset` leaves out, so a 1 s
+/// clip has no beep to time.
+pub const MIN_AUDIO_SECONDS: u32 = 2;
 
 /// `--hdr`: the HDR source the patch row stands for. The patches show the SDR codes `curve`
 /// should give; every other element keeps its SDR codes, so only the patch check is tested.
@@ -274,6 +398,17 @@ impl Synth {
         Ok(())
     }
 
+    /// Checks that the WAVs can be written too: an audio defect needs nothing more, but a clip
+    /// too short to time a beep, or longer than the checks read, is refused.
+    pub fn check_audio(&self) -> Result<(), SynthError> {
+        if !(MIN_AUDIO_SECONDS..=MAX_AUDIO_SECONDS).contains(&self.seconds) {
+            return Err(SynthError::Settings(format!(
+                "--wav-dir takes clips of {MIN_AUDIO_SECONDS} to {MAX_AUDIO_SECONDS} s: a 1 s clip's only flash falls on its held first frame, and the checks read at most {MAX_AUDIO_SECONDS} s of audio"
+            )));
+        }
+        Ok(())
+    }
+
     /// The number of output frames.
     pub fn frames(&self) -> u64 {
         u64::from(self.seconds) * u64::from(self.format.fps)
@@ -351,8 +486,9 @@ impl Synth {
         }
     }
 
-    /// The clip's `expect.json`, as the encoded clip should come out.
-    pub fn expect(&self) -> Expect {
+    /// The clip's `expect.json`, as the encoded clip should come out: with [`AudioTrack::ALL`]
+    /// as a good clip carries them when its WAVs are muxed in (`audio`), otherwise video only.
+    pub fn expect(&self, audio: bool) -> Expect {
         Expect {
             kairo_expect: expect::VERSION,
             pattern: Some(1),
@@ -372,8 +508,90 @@ impl Synth {
             }),
             trim: None,
             cabac: matches!(self.codec, Codec::Ipcm { .. }).then_some(false),
-            tracks: Vec::new(),
+            tracks: if audio {
+                AudioTrack::ALL
+                    .iter()
+                    .map(|&track| {
+                        let mut tones: BTreeMap<String, expect::Tone> =
+                            [Tone::Game, Tone::Voice, Tone::Mic]
+                                .into_iter()
+                                .map(|tone| {
+                                    let want = if track.tones().contains(&tone) {
+                                        expect::Tone::Present
+                                    } else {
+                                        expect::Tone::Absent
+                                    };
+                                    (tone_name(tone).to_owned(), want)
+                                })
+                                .collect();
+                        tones.insert("cue".to_owned(), expect::Tone::Absent);
+                        expect::Track {
+                            title: track.title().to_owned(),
+                            channels: track.channels(),
+                            default: track == AudioTrack::Mix,
+                            tones,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// Track `track`'s sounds at 48 kHz, mono (each channel carries the same): in every second
+    /// m, each beep the track carries at m s plus the beep's offset, changed by this run's audio
+    /// defect.
+    pub fn track_audio(&self, track: AudioTrack) -> SyntheticAudio {
+        let rate = crate::analyze::audio::RATE;
+        let late = match self.defect {
+            Some(Defect::Av50) => AV50_SAMPLES as f64 / rate,
+            _ => 0.0,
+        };
+        let tones = match (self.defect, track) {
+            (Some(Defect::SwapGameVoice), AudioTrack::Game) => AudioTrack::Voice.tones(),
+            (Some(Defect::SwapGameVoice), AudioTrack::Voice) => AudioTrack::Game.tones(),
+            _ => track.tones(),
+        };
+        let at = |second: f64, ms: u32| second + f64::from(ms) / 1_000.0;
+        let beep = |tone: Tone| Sound::Beep(f64::from(tone.hz()));
+        let mut sounds = Vec::new();
+        for m in 0..self.seconds {
+            let second = f64::from(m) + late;
+            for &tone in tones {
+                sounds.push((beep(tone), at(second, tone.offset_ms()), 0.0));
+            }
+            match (self.defect, track) {
+                (Some(Defect::Cue), AudioTrack::Mix) => {
+                    sounds.push((Sound::Cue, at(second, testsig::CUE_OFFSET_MS), 0.0));
+                }
+                (Some(Defect::Leak), AudioTrack::Game) => {
+                    let voice = Tone::Voice;
+                    sounds.push((beep(voice), at(second, voice.offset_ms()), LEAK_DB));
+                }
+                _ => {}
+            }
+        }
+        SyntheticAudio {
+            frames: self.seconds as usize * rate as usize,
+            sounds,
+            noise_db: (self.defect == Some(Defect::Noisy) && track == AudioTrack::Game)
+                .then_some(NOISE_DBFS),
+        }
+    }
+
+    /// Track `track`'s WAV: 32-bit float at 48 kHz.
+    pub fn write_wav(&self, track: AudioTrack, out: &mut dyn Write) -> io::Result<()> {
+        if let Err(error) = self.check().and_then(|()| self.check_audio()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ));
+        }
+        let mono = self.track_audio(track).render();
+        let mut out = io::BufWriter::with_capacity(1 << 20, out);
+        crate::wav::write_float(&mut out, 48_000, track.channels(), &mono)?;
+        out.flush()
     }
 
     /// The frames' renderer.
@@ -543,13 +761,18 @@ mod tests {
             "corrupt-bars",
             "bars-sparse",
             "unreadable",
+            "av50",
+            "swap-game-voice",
+            "cue",
+            "leak",
+            "noisy",
         ] {
-            assert_eq!(
-                text.parse::<Defect>().map(|d| d.to_string()),
-                Ok(text.to_owned())
-            );
+            let defect = text.parse::<Defect>();
+            assert_eq!(defect.clone().map(|d| d.to_string()), Ok(text.to_owned()));
+            let audio = ["av50", "swap-game-voice", "cue", "leak", "noisy"].contains(&text);
+            assert_eq!(defect.map(Defect::is_audio), Ok(audio), "{text}");
         }
-        for bad in ["drop@", "drop@x", "judder@3", "swap-game-voice", "Drop", ""] {
+        for bad in ["drop@", "drop@x", "judder@3", "av50@3", "Drop", "swap", ""] {
             assert!(bad.parse::<Defect>().is_err(), "{bad}");
         }
     }
@@ -692,22 +915,207 @@ mod tests {
             codec: Codec::Ipcm { gop: 60 },
             ..synth(None)
         };
-        let text = serde_json::to_string(&s.expect()).unwrap();
+        let text = serde_json::to_string(&s.expect(false)).unwrap();
         let expect = Expect::parse(&text).unwrap();
-        assert_eq!(expect, s.expect());
+        assert_eq!(expect, s.expect(false));
         assert_eq!(
             (expect.size, expect.fps, expect.source_hz, expect.seconds),
             (Some([160, 90]), 60, Some(180), 4)
         );
         assert_eq!(expect.cabac, Some(false));
         assert_eq!(expect.hdr.map(|h| h.curve), Some("match".to_owned()));
+        assert!(expect.tracks.is_empty());
         // NV12 leaves the entropy coder to the encoder: no `cabac` at all.
         s.codec = Codec::Nv12;
         assert!(
-            !serde_json::to_string(&s.expect())
+            !serde_json::to_string(&s.expect(false))
                 .unwrap()
                 .contains("cabac")
         );
+        // With its WAVs, README §6.1's tracks: the Mix is the default and carries every beep.
+        let expect = Expect::parse(&serde_json::to_string(&s.expect(true)).unwrap()).unwrap();
+        let tracks: Vec<(&str, u16, bool, Vec<&str>)> = expect
+            .tracks
+            .iter()
+            .map(|t| {
+                let present = t
+                    .tones
+                    .iter()
+                    .filter(|(_, want)| **want == expect::Tone::Present)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                (t.title.as_str(), t.channels, t.default, present)
+            })
+            .collect();
+        assert_eq!(
+            tracks,
+            [
+                ("Mix", 2, true, vec!["game", "mic", "voice"]),
+                ("Game", 2, false, vec!["game"]),
+                ("Mic", 1, false, vec!["mic"]),
+                ("Voice chat", 2, false, vec!["voice"]),
+            ]
+        );
+        assert!(
+            expect
+                .tracks
+                .iter()
+                .all(|t| t.tones.len() == 4 && t.tones.get("cue") == Some(&expect::Tone::Absent))
+        );
+    }
+
+    #[test]
+    fn audio_defects_leave_the_frames_alone() {
+        let good = synth(None);
+        for defect in [
+            Defect::Av50,
+            Defect::SwapGameVoice,
+            Defect::Cue,
+            Defect::Leak,
+            Defect::Noisy,
+        ] {
+            let s = synth(Some(defect));
+            assert!(s.check().is_ok(), "{defect}");
+            assert_eq!(s.content(), good.content(), "{defect}");
+            assert_eq!(s.damage(), good.damage(), "{defect}");
+        }
+    }
+
+    #[test]
+    fn the_wavs_follow_research_16s_layout() {
+        // 2 s: in each second the game beep at 0, the mic marker at 250 ms and the voice beep at
+        // 500 ms, each 100 ms long and on its own track, all of them on the Mix.
+        let s = Synth {
+            seconds: 2,
+            ..synth(None)
+        };
+        let render = |s: &Synth, track| s.track_audio(track).render();
+        let [mix, game, mic, voice] = AudioTrack::ALL.map(|t| render(&s, t));
+        let sounding =
+            |x: &[f32]| -> Vec<usize> { (0..x.len()).filter(|&n| x[n] != 0.0).collect() };
+        let spans = |starts_ms: &[u32]| -> Vec<usize> {
+            let mut n: Vec<usize> = starts_ms
+                .iter()
+                .flat_map(|&ms| {
+                    let first = ms as usize * 48;
+                    // Each burst's first sample is sin(0) = 0.
+                    first + 1..first + 4_800
+                })
+                .collect();
+            n.sort_unstable();
+            n
+        };
+        assert_eq!(game.len(), 96_000);
+        assert_eq!(sounding(&game), spans(&[0, 1_000]));
+        assert_eq!(sounding(&mic), spans(&[250, 1_250]));
+        assert_eq!(sounding(&voice), spans(&[500, 1_500]));
+        for n in 0..mix.len() {
+            assert_eq!(mix[n], game[n] + mic[n] + voice[n], "{n}");
+        }
+        let peak = game.iter().fold(0_f32, |p, v| p.max(v.abs()));
+        assert!(
+            (20.0 * f64::from(peak).log10() + 30.0).abs() < 0.01,
+            "{peak}"
+        );
+        // av50: everything 2,400 samples later, the end cut.
+        let av50 = Synth {
+            defect: Some(Defect::Av50),
+            ..s
+        };
+        for (track, good) in AudioTrack::ALL.into_iter().zip([&mix, &game, &mic, &voice]) {
+            let late = render(&av50, track);
+            assert_eq!(late.len(), good.len());
+            assert!(late[..AV50_SAMPLES].iter().all(|&v| v == 0.0));
+            for n in AV50_SAMPLES..late.len() {
+                assert!((late[n] - good[n - AV50_SAMPLES]).abs() < 1e-7, "{n}");
+            }
+        }
+        // swap-game-voice: the two WAVs trade places under their own titles.
+        let swap = Synth {
+            defect: Some(Defect::SwapGameVoice),
+            ..s
+        };
+        assert_eq!(render(&swap, AudioTrack::Game), voice);
+        assert_eq!(render(&swap, AudioTrack::Voice), game);
+        assert_eq!(render(&swap, AudioTrack::Mix), mix);
+        // cue: the placeholder in the Mix at 700 ms in each second, 220 ms long.
+        let cue = Synth {
+            defect: Some(Defect::Cue),
+            ..s
+        };
+        let extra: Vec<f32> = render(&cue, AudioTrack::Mix)
+            .iter()
+            .zip(&mix)
+            .map(|(a, b)| a - b)
+            .collect();
+        assert_eq!(
+            sounding(&extra),
+            [700, 1_700]
+                .iter()
+                .flat_map(|&ms| ms * 48 + 1..ms * 48 + 10_560)
+                .filter(|&n| n != 700 * 48 + 4_800 && n != 1_700 * 48 + 4_800)
+                .collect::<Vec<usize>>()
+        );
+        assert_eq!(render(&cue, AudioTrack::Game), game);
+        // leak: the voice beep in Game at −40 dBFS.
+        let leak = Synth {
+            defect: Some(Defect::Leak),
+            ..s
+        };
+        let extra: Vec<f32> = render(&leak, AudioTrack::Game)
+            .iter()
+            .zip(&game)
+            .map(|(a, b)| a - b)
+            .collect();
+        assert_eq!(sounding(&extra), spans(&[500, 1_500]));
+        let peak = extra.iter().fold(0_f32, |p, v| p.max(v.abs()));
+        assert!(
+            (20.0 * f64::from(peak).log10() + 40.0).abs() < 0.01,
+            "{peak}"
+        );
+        // noisy: noise at −55 dBFS RMS in Game only.
+        let noisy = Synth {
+            defect: Some(Defect::Noisy),
+            ..s
+        };
+        let noise: Vec<f64> = render(&noisy, AudioTrack::Game)
+            .iter()
+            .zip(&game)
+            .map(|(a, b)| f64::from(a - b))
+            .collect();
+        let rms = (noise.iter().map(|v| v * v).sum::<f64>() / noise.len() as f64).sqrt();
+        assert!((20.0 * rms.log10() + 55.0).abs() < 0.1, "{rms}");
+        assert_eq!(render(&noisy, AudioTrack::Mix), mix);
+    }
+
+    #[test]
+    fn the_wavs_are_float_at_48_khz() {
+        let s = Synth {
+            seconds: 2,
+            ..synth(None)
+        };
+        for track in AudioTrack::ALL {
+            let mut out = Vec::new();
+            s.write_wav(track, &mut out).unwrap();
+            let wav = crate::wav::read(&out).unwrap();
+            assert_eq!((wav.rate, wav.channels), (48_000, track.channels()));
+            let mono = s.track_audio(track).render();
+            assert_eq!(
+                wav.samples.len(),
+                mono.len() * usize::from(track.channels())
+            );
+            for (frame, &want) in wav.samples.chunks(usize::from(track.channels())).zip(&mono) {
+                assert!(frame.iter().all(|&v| v == want));
+            }
+        }
+        let long = Synth {
+            seconds: MAX_AUDIO_SECONDS + 1,
+            ..s
+        };
+        assert!(long.check_audio().is_err());
+        assert!(long.write_wav(AudioTrack::Mic, &mut Vec::new()).is_err());
+        let short = Synth { seconds: 1, ..s };
+        assert!(short.check_audio().is_err());
     }
 
     #[test]
@@ -772,7 +1180,7 @@ mod tests {
             }),
             ..good
         };
-        let mut swapped = hdr(Curve::MatchSdrApps).expect();
+        let mut swapped = hdr(Curve::MatchSdrApps).expect(false);
         if let Some(h) = swapped.hdr.as_mut() {
             h.curve = "natural".to_owned();
         }
@@ -785,46 +1193,46 @@ mod tests {
             &'static [&'static str],
         );
         let cases: Vec<Case> = vec![
-            ("good", good, good.expect(), &[], &[]),
+            ("good", good, good.expect(false), &[], &[]),
             (
                 "drop1",
                 defect(Defect::Drop(None)),
-                good.expect(),
+                good.expect(false),
                 &["cadence.drops_dups"],
                 &[],
             ),
             (
                 "dup1",
                 defect(Defect::Dup(None)),
-                good.expect(),
+                good.expect(false),
                 &["cadence.drops_dups"],
                 &[],
             ),
             (
                 "judder",
                 defect(Defect::Judder),
-                good.expect(),
+                good.expect(false),
                 &["cadence.judder"],
                 &[],
             ),
             (
                 "bars",
                 defect(Defect::CorruptBars),
-                good.expect(),
+                good.expect(false),
                 &["content.bars"],
                 &["content.bars_lines"],
             ),
             (
                 "bars-sparse",
                 defect(Defect::BarsSparse),
-                good.expect(),
+                good.expect(false),
                 &["content.bars_lines"],
                 &["content.bars"],
             ),
             (
                 "unreadable",
                 defect(Defect::Unreadable),
-                good.expect(),
+                good.expect(false),
                 &["content.barcode"],
                 &[],
             ),
@@ -834,14 +1242,14 @@ mod tests {
                     codec: Codec::Ipcm { gop: 120 },
                     ..good
                 },
-                good.expect(),
+                good.expect(false),
                 &["video.gop"],
                 &[],
             ),
             (
                 "good-hdr",
                 hdr(Curve::Natural),
-                hdr(Curve::Natural).expect(),
+                hdr(Curve::Natural).expect(false),
                 &[],
                 &[],
             ),

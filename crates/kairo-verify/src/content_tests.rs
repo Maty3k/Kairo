@@ -887,6 +887,86 @@ fn routes_hold_for_saves_copies_and_short_tracks() {
 }
 
 #[test]
+fn synth_audio_defects_fail_their_own_checks() {
+    // `synth`'s 2 s clip on the builder with research 16 §7.1's four tracks, its WAVs as AAC
+    // decodes them (1,024 samples of priming first): the good clip passes `test`, and each audio
+    // defect of §7.3 fails its `must_fail` and nothing else.
+    use crate::synth::{AudioTrack, Codec, Defect, Synth};
+    use crate::testkit::AudioSpec;
+
+    const PACKETS: usize = 95;
+    let spec = Spec::with(|s| {
+        s.audio = AudioTrack::ALL
+            .iter()
+            .map(|&t| AudioSpec::new(t.title(), t.channels(), t == AudioTrack::Mix, PACKETS))
+            .collect();
+    });
+    let bytes = spec.build();
+    let good = Synth {
+        format: "320x180@60".parse().unwrap(),
+        source_hz: 180,
+        seconds: 2,
+        defect: None,
+        hdr: None,
+        codec: Codec::Nv12,
+    };
+    let plan = Plan::new(Profile::Test, false, Some(good.expect(true))).unwrap();
+    let cases: [(Option<Defect>, &[&str]); 6] = [
+        (None, &[]),
+        (Some(Defect::Av50), &["av.offset"]),
+        (Some(Defect::SwapGameVoice), &["audio.routing"]),
+        (Some(Defect::Cue), &["audio.cue"]),
+        (Some(Defect::Leak), &["audio.routing"]),
+        (Some(Defect::Noisy), &["audio.tone_snr"]),
+    ];
+    for (defect, must_fail) in cases {
+        let synth = Synth { defect, ..good };
+        let tracks = AudioTrack::ALL
+            .map(|track| {
+                let mut audio = synth.track_audio(track);
+                for sound in &mut audio.sounds {
+                    sound.1 += 1_024.0 / 48_000.0;
+                }
+                audio.frames = PACKETS * 1_024;
+                audio
+            })
+            .to_vec();
+        let mut decoder = synth.source().unwrap().with_audio(tracks);
+        let report = check_with(&mut bytes.as_slice(), "clip.mp4", &plan, Some(&mut decoder));
+        let name = defect.map_or("good".to_owned(), |d| d.to_string());
+        assert_eq!(failing(&report), must_fail, "{name}: {}", report.to_text());
+        if defect.is_none() {
+            assert_eq!(report.verdict, crate::Verdict::Pass, "{}", report.to_text());
+        }
+        // The corpus requires av50 to measure +50 ± 1 ms (README §7.4), and the good clip 0 ± 1.
+        let late = if defect == Some(Defect::Av50) {
+            50.0
+        } else {
+            0.0
+        };
+        let offsets = report
+            .checks
+            .iter()
+            .find(|f| f.id == "av.offset")
+            .and_then(|f| f.value.get("tracks")?.as_array().cloned())
+            .unwrap();
+        let measured: Vec<f64> = offsets
+            .iter()
+            .filter(|t| t["measured"] == true)
+            .map(|t| t["median_ms"].as_f64().unwrap())
+            .collect();
+        assert!(!measured.is_empty(), "{name}");
+        // Every track still timed beside a cue or noise: a defect may not blind the detector.
+        if !matches!(defect, Some(Defect::SwapGameVoice)) {
+            assert_eq!(measured.len(), 4, "{name}: {offsets:?}");
+        }
+        for median in measured {
+            assert!((median - late).abs() < 1.0, "{name}: {median} ms");
+        }
+    }
+}
+
+#[test]
 fn a_clip_that_shows_the_pattern_is_held_to_every_required_check() {
     // Engine with no pattern named, but the pattern shows: the checks this build lacks are
     // errors, not skips (review F3).
@@ -1376,43 +1456,24 @@ fn a_1080p_videotoolbox_clip_passes_the_line_rule() {
     }
 }
 
-/// Writes `samples` (interleaved at `channels`) as a 48 kHz float WAV.
-#[cfg(feature = "dev-tools")]
-fn write_wav(path: &std::path::Path, channels: u16, samples: &[f32]) {
-    let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let mut out = b"RIFF".to_vec();
-    out.extend((36 + data.len() as u32).to_le_bytes());
-    out.extend(b"WAVEfmt ");
-    out.extend(16_u32.to_le_bytes());
-    out.extend(3_u16.to_le_bytes());
-    out.extend(channels.to_le_bytes());
-    out.extend(48_000_u32.to_le_bytes());
-    out.extend((48_000 * 4 * u32::from(channels)).to_le_bytes());
-    out.extend((4 * channels).to_le_bytes());
-    out.extend(32_u16.to_le_bytes());
-    out.extend(b"data");
-    out.extend((data.len() as u32).to_le_bytes());
-    out.extend(data);
-    std::fs::write(path, out).unwrap();
-}
-
-/// Opt-in, as above: research 16 §7.2's two-step recipe with real AAC. An I_PCM clip from
-/// `synth`, stream-copied, then muxed with four tracks of beeps encoded by FFmpeg's `aac`: the
-/// game beep at each whole second, the mic marker 250 ms after it and the voice beep 500 ms
-/// after it. Every audio check passes, with every track's A/V offset within a millisecond: the
-/// decoded priming and the held first frame cancel (cookbook P8). A track one AAC packet late,
-/// or a Voice chat track 50 ms late, fails (review F1).
+/// Opt-in, as above: research 16 §7.2's two-step recipe with real AAC. `synth`'s I_PCM video,
+/// stream-copied once into a video-only file, then muxed with each case's four WAVs, encoded by
+/// FFmpeg's `aac`. The good clip passes every audio check with every track's A/V offset within a
+/// millisecond (the decoded priming and the held first frame cancel, cookbook P8); each audio
+/// defect of §7.3 fails its own check and nothing else, and `av50` measures +50 ± 1 ms; a track
+/// one AAC packet late, or a Voice chat track 50 ms late, fails too (review F1).
 #[cfg(feature = "dev-tools")]
 #[test]
 #[ignore = "needs KAIRO_FFMPEG"]
-fn an_aac_clip_passes_the_audio_checks() {
+fn aac_clips_from_synth_behave() {
+    use std::io::Write;
     use std::process::{Command, Stdio};
 
-    use crate::synth::{Codec, Synth};
+    use crate::synth::{AudioTrack, Codec, Defect, Synth};
 
     let ffmpeg = ffmpeg();
     let dir = Scratch::new("aac");
-    let synth = Synth {
+    let good = Synth {
         format: "480x270@60".parse().unwrap(),
         source_hz: 180,
         seconds: 4,
@@ -1437,138 +1498,111 @@ fn an_aac_clip_passes_the_audio_checks() {
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
-    synth.write(&mut child.stdin.take().unwrap()).unwrap();
+    good.write(&mut child.stdin.take().unwrap()).unwrap();
     assert!(child.wait().unwrap().success());
-    // (title, channels, game, mic, voice)
-    let layout = [
-        ("Mix", 2_u16, true, true, true),
-        ("Game", 2, true, false, false),
-        ("Mic", 1, false, true, false),
-        ("Voice chat", 2, false, false, true),
-    ];
-    let tones = |game: &str, voice: &str, mic: &str| {
-        format!(r#"{{"game":"{game}","voice":"{voice}","mic":"{mic}","cue":"absent"}}"#)
-    };
-    let text = format!(
-        r#"{{"kairo_expect":1,"pattern":1,"size":[480,270],"fps":60,"source_hz":180,"seconds":4,
-            "run_tag":0,"cabac":false,"tracks":[
-            {{"title":"Mix","channels":2,"default":true,"tones":{}}},
-            {{"title":"Game","channels":2,"default":false,"tones":{}}},
-            {{"title":"Mic","channels":1,"default":false,"tones":{}}},
-            {{"title":"Voice chat","channels":2,"default":false,"tones":{}}}]}}"#,
-        tones("present", "present", "present"),
-        tones("present", "absent", "absent"),
-        tones("absent", "absent", "present"),
-        tones("absent", "present", "absent"),
+    let plan = Plan::new(Profile::Test, false, Some(good.expect(true))).unwrap();
+    // (case, its defect, a track made late by some samples, what fails)
+    type Case = (
+        &'static str,
+        Option<Defect>,
+        Option<(AudioTrack, f64)>,
+        &'static [&'static str],
     );
-    let plan = Plan::new(Profile::Test, false, Some(Expect::parse(&text).unwrap())).unwrap();
-    // (case, the track that is late, by how many samples, what fails)
-    let cases: [(&str, &str, f64, &[&str]); 3] = [
-        ("good", "", 0.0, &[]),
-        ("game-late", "Game", 1_024.0, &["av.inter_track"]),
+    let cases: [Case; 8] = [
+        ("good", None, None, &[]),
+        ("av50", Some(Defect::Av50), None, &["av.offset"]),
+        (
+            "swap-game-voice",
+            Some(Defect::SwapGameVoice),
+            None,
+            &["audio.routing"],
+        ),
+        ("cue", Some(Defect::Cue), None, &["audio.cue"]),
+        ("leak", Some(Defect::Leak), None, &["audio.routing"]),
+        ("noisy", Some(Defect::Noisy), None, &["audio.tone_snr"]),
+        (
+            "game-late",
+            None,
+            Some((AudioTrack::Game, 1_024.0)),
+            &["av.inter_track"],
+        ),
         (
             "voice-late",
-            "Voice chat",
-            2_400.0,
+            None,
+            Some((AudioTrack::Voice, 2_400.0)),
             &["av.offset", "av.inter_track"],
         ),
     ];
-    for (case, late_track, late, fails) in cases {
-        for (title, channels, game, mic, voice) in layout {
-            let shift = if title == late_track {
-                late / 48_000.0
-            } else {
-                0.0
-            };
-            let mut sounds = Vec::new();
-            for m in 0..4 {
-                let t = f64::from(m) + shift;
-                if game {
-                    sounds.push((Sound::Beep(1_000.0), t, 0.0));
-                }
-                if mic {
-                    sounds.push((Sound::Beep(3_000.0), t + 0.25, 0.0));
-                }
-                if voice {
-                    sounds.push((Sound::Beep(2_000.0), t + 0.5, 0.0));
+    for (name, defect, late, must_fail) in cases {
+        let synth = Synth { defect, ..good };
+        let folder = dir.0.join(name);
+        std::fs::create_dir(&folder).unwrap();
+        for track in AudioTrack::ALL {
+            let mut audio = synth.track_audio(track);
+            if let Some((_, samples)) = late.filter(|(t, _)| *t == track) {
+                for sound in &mut audio.sounds {
+                    sound.1 += samples / 48_000.0;
                 }
             }
-            let mono = SyntheticAudio {
-                frames: 4 * 48_000,
-                sounds,
-                noise_db: None,
-            }
-            .render();
-            let samples: Vec<f32> = mono
-                .iter()
-                .flat_map(|&v| std::iter::repeat_n(v, usize::from(channels)))
-                .collect();
-            write_wav(
-                &dir.0.join(format!("{case}-{title}.wav")),
-                channels,
-                &samples,
-            );
+            let file = std::fs::File::create(folder.join(track.file())).unwrap();
+            let mut file = std::io::BufWriter::new(file);
+            crate::wav::write_float(&mut file, 48_000, track.channels(), &audio.render()).unwrap();
+            file.flush().unwrap();
         }
-        let clip_name = format!("{case}.mp4");
         let mut mux = Command::new(&ffmpeg);
-        mux.current_dir(&dir.0).args([
-            "-hide_banner",
-            "-nostdin",
-            "-v",
-            "error",
-            "-y",
-            "-i",
-            "v.mp4",
-        ]);
-        for (title, ..) in layout {
-            mux.arg("-i").arg(format!("{case}-{title}.wav"));
+        mux.current_dir(&folder)
+            .args(["-hide_banner", "-nostdin", "-v", "error", "-y"])
+            .arg("-i")
+            .arg(dir.0.join("v.mp4"));
+        for track in AudioTrack::ALL {
+            mux.args(["-i", track.file()]);
         }
-        mux.args(["-map", "0:v"]);
-        for (i, (title, ..)) in layout.iter().enumerate() {
-            mux.args(["-map", &format!("{}:a", i + 1)]);
-            mux.arg(format!("-metadata:s:a:{i}"))
-                .arg(format!("title={title}"));
-            mux.arg(format!("-metadata:s:a:{i}"))
-                .arg(format!("handler_name={title}"));
-            mux.arg(format!("-disposition:a:{i}"))
+        mux.args(["-map", "0:v", "-c:v", "copy", "-c:a", "aac"]);
+        for (i, track) in AudioTrack::ALL.iter().enumerate() {
+            let title = track.title();
+            mux.args(["-map", &format!("{}:a", i + 1)])
+                .arg(format!("-b:a:{i}"))
+                .arg(format!("{}k", track.kbps()))
+                .arg(format!("-metadata:s:a:{i}"))
+                .arg(format!("title={title}"))
+                .arg(format!("-metadata:s:a:{i}"))
+                .arg(format!("handler_name={title}"))
+                .arg(format!("-disposition:a:{i}"))
                 .arg(if i == 0 { "default" } else { "0" });
         }
-        mux.args([
-            "-c:v", "copy", "-c:a", "aac", "-b:a:0", "160k", "-b:a:1", "160k",
-        ])
-        .args(["-b:a:2", "128k", "-b:a:3", "160k"])
-        .args(["-movflags", "+faststart", "-use_editlist", "0"])
-        .arg(&clip_name);
-        assert!(mux.status().unwrap().success(), "{case}");
-        let clip = dir.0.join(&clip_name);
+        mux.args(["-movflags", "+faststart", "-use_editlist", "0", "clip.mp4"]);
+        assert!(mux.status().unwrap().success(), "{name}");
+        let clip = folder.join("clip.mp4");
         let mut decoder = crate::decode::cli::Cli::new(&ffmpeg, &clip);
         let mut file = std::fs::File::open(&clip).unwrap();
-        let report = check_with(&mut file, &clip_name, &plan, Some(&mut decoder));
-        assert_eq!(failing(&report), fails, "{case}: {}", report.to_text());
-        if case != "good" {
-            continue;
+        let report = check_with(&mut file, "clip.mp4", &plan, Some(&mut decoder));
+        assert_eq!(failing(&report), must_fail, "{name}: {}", report.to_text());
+        let tracks = offsets(&report);
+        if name == "good" {
+            assert_eq!(report.verdict, crate::Verdict::Pass, "{}", report.to_text());
         }
-        for id in [
-            "decode.clean",
-            "av.offset",
-            "av.inter_track",
-            "audio.tone_snr",
-            "audio.routing",
-            "audio.cue",
-        ] {
-            assert_eq!(
-                status(&report, id),
-                Status::Pass,
-                "{id}: {}",
-                report.to_text()
+        // Every track still timed beside a cue or noise: a defect may not blind the detector.
+        if name != "swap-game-voice" {
+            assert_eq!(tracks.len(), 4);
+            assert!(
+                tracks.iter().all(|t| t["measured"] == true),
+                "{name}: {tracks:?}"
             );
         }
-        let offsets = offsets(&report);
-        assert_eq!(offsets.len(), 4);
-        for track in &offsets {
-            assert_eq!(track["measured"], true, "{track}");
-            let median = track["median_ms"].as_f64().unwrap();
-            assert!(median.abs() < 1.0, "{track}");
+        // What av.offset reads where every track moves together.
+        let want = match (defect, late) {
+            (_, Some(_)) => continue,
+            (Some(Defect::Av50), None) => 50.0,
+            _ => 0.0,
+        };
+        let measured: Vec<f64> = tracks
+            .iter()
+            .filter(|t| t["measured"] == true)
+            .map(|t| t["median_ms"].as_f64().unwrap())
+            .collect();
+        assert!(!measured.is_empty(), "{name}");
+        for median in measured {
+            assert!((median - want).abs() < 1.0, "{name}: {median} ms");
         }
     }
 }
@@ -1601,11 +1635,9 @@ fn three_khz_markers_keep_their_cycle_through_aac() {
     }
     .render();
     for (channels, kbps) in [(2_u16, "96k"), (2, "160k"), (1, "128k")] {
-        let samples: Vec<f32> = mono
-            .iter()
-            .flat_map(|&v| std::iter::repeat_n(v, usize::from(channels)))
-            .collect();
-        write_wav(&dir.0.join("m.wav"), channels, &samples);
+        let mut wav = Vec::new();
+        crate::wav::write_float(&mut wav, 48_000, channels, &mono).unwrap();
+        std::fs::write(dir.0.join("m.wav"), wav).unwrap();
         let encoded = Command::new(&ffmpeg)
             .current_dir(&dir.0)
             .args([

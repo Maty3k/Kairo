@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! WAV files: `check --cue`'s PCM (docs/research/16-verify-testbed/README.md §6.3 `audio.cue`).
-//! 16-, 24- and 32-bit integer PCM and 32-bit float, plain or WAVE_FORMAT_EXTENSIBLE.
+//! WAV files: `check --cue`'s PCM (docs/research/16-verify-testbed/README.md §6.3 `audio.cue`),
+//! read as 16-, 24- and 32-bit integer PCM or 32-bit float, plain or WAVE_FORMAT_EXTENSIBLE;
+//! and `synth --wav-dir`'s tracks (§7.1), written as 32-bit float.
+
+use std::io::{self, Write};
 
 /// A WAV file's samples.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +102,40 @@ pub fn read(bytes: &[u8]) -> Result<Wav, String> {
     })
 }
 
+/// Writes `mono` as a 32-bit float WAV at `rate`, the same samples on each of `channels`.
+pub fn write_float(out: &mut dyn Write, rate: u32, channels: u16, mono: &[f32]) -> io::Result<()> {
+    let block = 4 * u32::from(channels);
+    let data = u32::try_from(mono.len())
+        .ok()
+        .and_then(|frames| frames.checked_mul(block))
+        .filter(|&bytes| channels > 0 && bytes <= u32::MAX - 36)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too long for a WAV file"))?;
+    let mut header = Vec::with_capacity(44);
+    header.extend(b"RIFF");
+    header.extend((36 + data).to_le_bytes());
+    header.extend(b"WAVEfmt ");
+    header.extend(16_u32.to_le_bytes());
+    // WAVE_FORMAT_IEEE_FLOAT.
+    header.extend(3_u16.to_le_bytes());
+    header.extend(channels.to_le_bytes());
+    header.extend(rate.to_le_bytes());
+    header.extend(rate.saturating_mul(block).to_le_bytes());
+    header.extend((4 * channels).to_le_bytes());
+    header.extend(32_u16.to_le_bytes());
+    header.extend(b"data");
+    header.extend(data.to_le_bytes());
+    out.write_all(&header)?;
+    let mut frame = Vec::with_capacity(block as usize);
+    for &sample in mono {
+        frame.clear();
+        for _ in 0..channels {
+            frame.extend(sample.to_le_bytes());
+        }
+        out.write_all(&frame)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +185,25 @@ mod tests {
         assert_eq!(read(&pcm32).unwrap().samples, [0.5]);
         let float = wav(3, 1, 32, &0.25_f32.to_le_bytes(), true);
         assert_eq!(read(&float).unwrap().samples, [0.25]);
+    }
+
+    #[test]
+    fn writes_what_it_reads() {
+        let mut out = Vec::new();
+        write_float(&mut out, 48_000, 2, &[0.5, -0.25]).unwrap();
+        assert_eq!(out.len(), 44 + 16);
+        assert_eq!(
+            read(&out).unwrap(),
+            Wav {
+                rate: 48_000,
+                channels: 2,
+                samples: vec![0.5, 0.5, -0.25, -0.25]
+            }
+        );
+        let mut mono = Vec::new();
+        write_float(&mut mono, 48_000, 1, &[0.125]).unwrap();
+        assert_eq!(read(&mono).unwrap().samples, [0.125]);
+        assert!(write_float(&mut Vec::new(), 48_000, 0, &[0.0]).is_err());
     }
 
     #[test]

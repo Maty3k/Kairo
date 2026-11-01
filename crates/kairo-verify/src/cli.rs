@@ -8,10 +8,10 @@
 //! doesn't apply to this clip, 2 usage (an output that names no file included), 3 the input can't
 //! be read or rebuilt, 4 the output can't be written (it never replaces an existing file, and an
 //! interrupted run leaves at most `OUT.partial`). For `synth`: 0 written, 2 usage (settings that
-//! can't be rendered, a terminal as stdout, or an expect path that names a folder), 4 the frames
-//! or the expect file couldn't be written (a closed pipe included; it never replaces an existing
-//! expect file, and writes it only once every frame is out). Messages and reports name the file
-//! only.
+//! can't be rendered, a terminal as stdout, or an expect path that names a folder), 4 the frames,
+//! the WAVs or the expect file couldn't be written (a closed pipe included; it never replaces an
+//! existing file, and writes the WAVs and then the expect file only once every frame is out).
+//! Messages and reports name the file only.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -24,7 +24,7 @@ use kairo_core::testsig::Curve;
 use crate::expect::Expect;
 use crate::mutate::{MutateError, Op};
 use crate::profile::{Plan, Profile};
-use crate::synth::{Codec, Defect, Format, HdrSource, Synth};
+use crate::synth::{AudioTrack, Codec, Defect, Format, HdrSource, Synth};
 use crate::{Clip, boxes};
 
 /// The usage text.
@@ -38,10 +38,12 @@ pub const USAGE: &str =
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds 30]
                           [--defect D] [--hdr natural|match --lw NITS --sdr-white NITS]
-                          [--codec nv12|ipcm [--gop N]] --expect FILE    (frames on stdout)
+                          [--codec nv12|ipcm [--gop N]] [--wav-dir DIR] --expect FILE
+                          (frames on stdout; mix, game, mic and voice.wav in DIR)
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
-defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable
+defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable (video);
+         av50 swap-game-voice cue leak noisy (audio, with --wav-dir)
 The cli decoder (--ffmpeg PATH) decodes for the content checks; the linked decoder comes with
 research 16's PR 6.";
 
@@ -89,6 +91,7 @@ enum Command {
     Synth {
         synth: Synth,
         expect: PathBuf,
+        wav_dir: Option<PathBuf>,
     },
     Version,
     Help,
@@ -339,6 +342,7 @@ fn parse_synth(rest: &[OsString]) -> Result<Command, String> {
     let mut ipcm = false;
     let mut gop = None;
     let mut expect = None;
+    let mut wav_dir = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         let flag = word.to_str().unwrap_or_default();
@@ -386,12 +390,7 @@ fn parse_synth(rest: &[OsString]) -> Result<Command, String> {
             },
             "--gop" => gop = Some(number(value("--gop")?, "--gop takes a number of frames")?),
             "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
-            "--wav-dir" => {
-                return Err(
-                    "--wav-dir and the audio tracks come with research 16's PR 5; this build writes video only"
-                        .to_owned(),
-                );
-            }
+            "--wav-dir" => wav_dir = Some(PathBuf::from(value("--wav-dir")?)),
             _ if flag.starts_with('-') && flag.len() > 1 => {
                 let name = OsStr::new(flag.split('=').next().unwrap_or_default());
                 return Err(format!("unknown option {}\n{USAGE}", shown(name)));
@@ -430,7 +429,20 @@ fn parse_synth(rest: &[OsString]) -> Result<Command, String> {
         codec,
     };
     synth.check().map_err(|e| e.to_string())?;
-    Ok(Command::Synth { synth, expect })
+    match (&wav_dir, defect) {
+        (Some(_), _) => synth.check_audio().map_err(|e| e.to_string())?,
+        (None, Some(defect)) if defect.is_audio() => {
+            return Err(format!(
+                "--defect {defect} changes the WAVs, so it needs --wav-dir DIR\n{USAGE}"
+            ));
+        }
+        (None, _) => {}
+    }
+    Ok(Command::Synth {
+        synth,
+        expect,
+        wav_dir,
+    })
 }
 
 /// The file's name for messages and reports, or `None` if it isn't UTF-8.
@@ -674,11 +686,64 @@ fn mutate_file(
     }
 }
 
-/// `synth`: the frames to `out`, then the expect file, which is written under a temporary name
-/// and linked to its own only once every frame is out.
+/// A new file reserved before anything is written: `NAME.partial` is made at once, filled later
+/// and then linked to `NAME`, which fails if something took that name meanwhile, so an
+/// interrupted run never leaves a cut file under it. Dropping it removes the temporary name.
+/// Messages name the file only.
+struct Reserved {
+    path: PathBuf,
+    partial: PathBuf,
+    name: String,
+    file: Option<File>,
+}
+
+impl Reserved {
+    fn new(path: &Path, name: &str) -> Result<Self, String> {
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let file = File::create_new(&partial).map_err(|e| format!("{name}.partial: {e}"))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            partial,
+            name: name.to_owned(),
+            file: Some(file),
+        })
+    }
+
+    /// Fills it through `write` and links it to its own name.
+    fn finish(
+        &mut self,
+        write: impl FnOnce(&mut File) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        let name = self.name.clone();
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| format!("{name}: written already"))?;
+        write(&mut file)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{name}: {e}"))?;
+        drop(file);
+        std::fs::hard_link(&self.partial, &self.path).map_err(|e| format!("{name}: {e}"))
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        // The handle first: Windows can't remove an open file.
+        self.file = None;
+        let _ = std::fs::remove_file(&self.partial);
+    }
+}
+
+/// `synth`: every file it will write reserved first, so a name that is taken or a folder that
+/// can't be written stops it before any frame goes out; then the frames to `out`; then the WAVs
+/// into `wav_dir` and the expect file. If one of those fails, the files this run made go again.
 fn synth_file(
     synth: &Synth,
     expect: &Path,
+    wav_dir: Option<&Path>,
     out: &mut dyn Write,
     err: &mut dyn Write,
     stdout_is_terminal: bool,
@@ -698,11 +763,16 @@ fn synth_file(
         say(err, "the expect file must name a file, with a UTF-8 name");
         return 2;
     };
-    if expect.symlink_metadata().is_ok() {
-        say(
-            err,
-            &format!("{name}: already exists; synth never replaces a file"),
-        );
+    let wavs: Vec<(AudioTrack, PathBuf)> = wav_dir
+        .map(|dir| {
+            AudioTrack::ALL
+                .iter()
+                .map(|&track| (track, dir.join(track.file())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if wav_dir.is_some_and(|dir| !dir.is_dir()) {
+        say(err, "the --wav-dir folder doesn't exist");
         return 4;
     }
     let folder = expect
@@ -713,43 +783,90 @@ fn synth_file(
         say(err, &format!("{name}: its folder doesn't exist"));
         return 4;
     }
-    // The frames first; then the expect file, written under a temporary name and linked to its
-    // own, so an interrupted run leaves nothing behind but, for the moment it takes to write a
-    // few hundred bytes, the temporary file.
+    if let Some(dir) = wav_dir {
+        let same_folder = matches!(
+            (std::fs::canonicalize(folder), std::fs::canonicalize(dir)),
+            (Ok(a), Ok(b)) if a == b
+        );
+        if same_folder && AudioTrack::ALL.iter().any(|t| t.file() == name) {
+            say(
+                err,
+                &format!("{name}: the expect file can't take a WAV's name"),
+            );
+            return 2;
+        }
+    }
+    let names = std::iter::once((name, expect)).chain(
+        wavs.iter()
+            .map(|(track, path)| (track.file(), path.as_path())),
+    );
+    for (name, path) in names {
+        if path.symlink_metadata().is_ok() {
+            say(
+                err,
+                &format!("{name}: already exists; synth never replaces a file"),
+            );
+            return 4;
+        }
+    }
+    // Every name reserved before the frames: a leftover partial file or a folder that can't be
+    // written shows now, not after the encode.
+    let mut reserved = Vec::with_capacity(wavs.len() + 1);
+    for (track, path) in &wavs {
+        match Reserved::new(path, track.file()) {
+            Ok(file) => reserved.push((Some(*track), file)),
+            Err(message) => {
+                say(err, &message);
+                return 4;
+            }
+        }
+    }
+    match Reserved::new(expect, name) {
+        Ok(file) => reserved.push((None, file)),
+        Err(message) => {
+            say(err, &message);
+            return 4;
+        }
+    }
     if let Err(error) = synth.write(out) {
         say(err, &error.to_string());
         return error.exit_code();
     }
-    let mut partial = expect.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    let mut file = match File::create_new(&partial) {
-        Ok(file) => file,
-        Err(error) => {
-            say(err, &format!("{name}.partial: {error}"));
-            return 4;
+    let mut made: Vec<PathBuf> = Vec::new();
+    let mut result = Ok(());
+    for (track, file) in &mut reserved {
+        result = match track {
+            Some(track) => file.finish(|f| synth.write_wav(*track, f)),
+            None => file.finish(|f| {
+                let text = serde_json::to_string_pretty(&synth.expect(wav_dir.is_some()))
+                    .map_err(std::io::Error::other)?;
+                f.write_all(format!("{text}\n").as_bytes())
+            }),
+        };
+        if result.is_err() {
+            break;
         }
-    };
-    let result = serde_json::to_string_pretty(&synth.expect())
-        .map_err(|e| (4, format!("{name}: {e}")))
-        .and_then(|text| {
-            file.write_all(format!("{text}\n").as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|e| (4, format!("{name}: {e}")))
-        });
-    drop(file);
-    let result = result.and_then(|()| {
-        std::fs::hard_link(&partial, expect).map_err(|e| (4, format!("{name}: {e}")))
-    });
-    let _ = std::fs::remove_file(&partial);
+        made.push(file.path.clone());
+    }
     match result {
         Ok(()) => {
-            say(err, &format!("synth: {synth}; the expect file is {name}"));
+            let wavs = if wavs.is_empty() {
+                String::new()
+            } else {
+                "; the WAVs are mix.wav, game.wav, mic.wav and voice.wav".to_owned()
+            };
+            say(
+                err,
+                &format!("synth: {synth}; the expect file is {name}{wavs}"),
+            );
             0
         }
-        Err((code, message)) => {
+        Err(message) => {
+            for path in made {
+                let _ = std::fs::remove_file(path);
+            }
             say(err, &message);
-            code
+            4
         }
     }
 }
@@ -778,9 +895,18 @@ pub fn run_with(
         }
         Ok(Command::Boxes(path)) => show_boxes(&path, out, err),
         Ok(Command::Mutate { op, input, output }) => mutate_file(&op, &input, &output, out, err),
-        Ok(Command::Synth { synth, expect }) => {
-            synth_file(&synth, &expect, out, err, stdout_is_terminal)
-        }
+        Ok(Command::Synth {
+            synth,
+            expect,
+            wav_dir,
+        }) => synth_file(
+            &synth,
+            &expect,
+            wav_dir.as_deref(),
+            out,
+            err,
+            stdout_is_terminal,
+        ),
         Ok(command) => check(command, out, err),
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -906,8 +1032,22 @@ mod tests {
                     codec: Codec::Ipcm { gop: 60 },
                 },
                 expect: PathBuf::from("e.json"),
+                wav_dir: None,
             })
         );
+        assert!(matches!(
+            parse_args(&args(
+                "synth --preset 1080p60 --defect av50 --wav-dir w --expect e.json"
+            )),
+            Ok(Command::Synth {
+                synth: Synth {
+                    defect: Some(Defect::Av50),
+                    ..
+                },
+                wav_dir: Some(_),
+                ..
+            })
+        ));
         assert!(matches!(
             parse_args(&args(
                 "synth --preset 1080p60 --defect drop@930 --hdr natural --lw 1000 --sdr-white 240 --source-hz 360 --expect e.json"
@@ -978,7 +1118,10 @@ mod tests {
             "synth --preset 1080p60 --expect e.json --hdr pq --lw 1000 --sdr-white 240",
             "synth --preset 1080p60 --expect e.json --defect frobnicate",
             "synth --preset 1080p60 --expect e.json --defect judder --source-hz 165",
-            "synth --preset 1080p60 --expect e.json --wav-dir .",
+            "synth --preset 1080p60 --expect e.json --defect av50",
+            "synth --preset 1080p60 --expect e.json --defect cue@3 --wav-dir .",
+            "synth --preset 1080p60 --expect e.json --wav-dir . --seconds 601",
+            "synth --preset 1080p60 --expect e.json --wav-dir",
             "synth --preset 1080p60 --expect e.json --codec h265",
             "synth --preset 1080p60 --expect e.json --seconds 0",
             "synth --preset 1081x1080@60 --expect e.json",
