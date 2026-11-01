@@ -85,7 +85,10 @@ impl Linked {
         });
         let mut options = Dictionary::new();
         options.set("err_detect", "+crccheck+bitstream+buffer");
-        context.decoder().open_with(options).map_err(start)
+        // A context made from parameters knows its codec's ID but holds no codec, and `open_with`
+        // passes none, which avcodec_open2 refuses as an invalid argument: so name it by the ID.
+        let id = context.id();
+        context.decoder().open_as_with(id, options).map_err(start)
     }
 }
 
