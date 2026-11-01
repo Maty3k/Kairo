@@ -5,9 +5,12 @@
 //! It opens a clip only after Kairo's parser has accepted it, as `file:` with
 //! `ignore_editlist=1`, `protocol_whitelist=file` and `format_whitelist=mov,mp4,m4a,3gp,3g2,mj2`,
 //! so linked avformat can't open a URL: only `kairo-net` may open sockets (CLAUDE.md). The
-//! decoder gets `err_detect=+crccheck+bitstream+buffer` and frame threading. A picture FFmpeg
-//! flags as corrupt or with decode errors counts as one error. Pictures arrive in presentation
-//! order, borrowed in place; audio as f32 at the track's own channel count, AAC priming included.
+//! decoder gets `err_detect=+crccheck+bitstream+buffer`, `flags2=+skip_manual` and frame
+//! threading. A picture FFmpeg flags as corrupt or with decode errors counts as one error.
+//! Pictures arrive in presentation order, borrowed in place; audio as f32 at the track's own
+//! channel count, every decoded sample: `skip_manual` keeps libavcodec from trimming the AAC
+//! priming or the short last packet's surplus, which FFmpeg 9.0.2 trims to the track's length
+//! (README §6.3: Kairo's parser does the timing).
 //! It refuses to run unless avutil, avcodec and avformat all report an LGPL licence (README §2
 //! item 18), and the clip's path must be UTF-8, since `ffmpeg-next` would panic on another.
 //! The `kairo-verify` binary keeps FFmpeg's log quiet, so no message names a path (CLAUDE.md).
@@ -85,6 +88,7 @@ impl Linked {
         });
         let mut options = Dictionary::new();
         options.set("err_detect", "+crccheck+bitstream+buffer");
+        options.set("flags2", "+skip_manual");
         // A context made from parameters knows its codec's ID but holds no codec, and `open_with`
         // passes none, which avcodec_open2 refuses as an invalid argument: so name it by the ID.
         let id = context.id();

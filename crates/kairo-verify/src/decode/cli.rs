@@ -6,10 +6,12 @@
 //!
 //! It runs, in the clip's folder so that FFmpeg's messages name the file only:
 //! `ffmpeg -v warning -nostdin -protocol_whitelist file,pipe -err_detect
-//! +crccheck+bitstream+buffer -ignore_editlist 1 -c:v h264 -i file:<file name> -map 0:v:0
+//! +crccheck+bitstream+buffer -flags2 +skip_manual -ignore_editlist 1 -c:v h264
+//! -i file:<file name> -map 0:v:0
 //! -fps_mode passthrough -enc_time_base:v demux -pix_fmt yuv420p -f yuv4mpegpipe -`, and for
 //! audio track N `… -c:a aac -i file:<file name> -map 0:a:N -f f32le -` at the track's own
-//! channel count. YUV4MPEG2 states the picture size in its header, and its frames are packed
+//! channel count, every decoded sample (`skip_manual`, as in the linked decoder). YUV4MPEG2
+//! states the picture size in its header, and its frames are packed
 //! yuv420p. No filter runs: it only decodes. Any line FFmpeg prints counts as a decode error,
 //! warnings included: FFmpeg reports a frame it had to conceal (the flags the linked backend
 //! reads) only as the warning `corrupt decoded frame`. The pipe keeps the clip's time base, so
@@ -94,6 +96,8 @@ impl Cli {
                 "file,pipe",
                 "-err_detect",
                 "+crccheck+bitstream+buffer",
+                "-flags2",
+                "+skip_manual",
                 "-ignore_editlist",
                 "1",
             ])
