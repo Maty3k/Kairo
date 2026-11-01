@@ -974,7 +974,7 @@ fn a_clip_that_shows_the_pattern_is_held_to_every_required_check() {
     assert_eq!(status(&report, "content.barcode"), Status::Pass);
     assert_eq!(status(&report, "content.bars"), Status::Pass);
     assert_eq!(status(&report, "av.offset"), Status::Pass);
-    // source.stability reads the testbed log, which comes with research 16's PR 8.
+    // source.stability needs the testbed's log (--testbed-log), which this check wasn't given.
     assert_eq!(status(&report, "source.stability"), Status::Error);
     assert_eq!(
         report.verdict,
@@ -1694,5 +1694,222 @@ fn three_khz_markers_keep_their_cycle_through_aac() {
         );
         assert!(slips.is_empty(), "{channels} ch {kbps}: {slips:?}");
         assert!(found >= 198, "{channels} ch {kbps}: {found}");
+    }
+}
+
+/// QPC time, in 100 ns, when the testbed showed frame 1,000 in [`testbed_log`].
+const LOG_BASE_HNS: i64 = 100_000_000;
+
+/// A testbed log of frames `first..=last`, drawn at 180 fps on 180 Hz and shown on cadence from
+/// [`LOG_BASE_HNS`] (frame `first` there), except `missed`, never shown and each with an `m`
+/// line; beeps 6 and 7 at their flashes, played `aim` seconds after the flash showed; run `run`.
+fn testbed_log(
+    first: u64,
+    last: u64,
+    missed: &[u64],
+    aim: f64,
+    run: u8,
+) -> kairo_core::testbed_log::TestbedLog {
+    let shown = |n: u64| LOG_BASE_HNS + ((n - first) as f64 * 10_000_000.0 / 180.0).round() as i64;
+    let mut text = format!(
+        "# kairo-testbed 1\nh pattern=1 run={run} mode=borderless pace=vsync fps=180 F=180 size=320x180 refresh_mhz=180000 hdr=0 sdr_white_nits=- max_nits=- start_hns={LOG_BASE_HNS}\n"
+    );
+    for n in first..=last {
+        let t = shown(n);
+        if missed.contains(&n) {
+            text.push_str(&format!("f {n} {t} {} -\nm {n} vblank\n", t - 20_000));
+        } else {
+            text.push_str(&format!("f {n} {t} {} {t}\n", t - 20_000));
+        }
+    }
+    for m in 6..=7_u64 {
+        let n_f = 180 * m;
+        if (first..=last).contains(&n_f) {
+            let t = shown(n_f);
+            let played = t + (aim * 10_000_000.0).round() as i64;
+            text.push_str(&format!("b {m} {n_f} {t} {played}\n"));
+        }
+    }
+    kairo_core::testbed_log::TestbedLog::parse(&text).unwrap()
+}
+
+/// Each `av.offset` track's median, in ms, of the measured tracks.
+fn medians(report: &Report) -> Vec<f64> {
+    offsets(report)
+        .iter()
+        .filter(|t| t["measured"] == true)
+        .map(|t| t["median_ms"].as_f64().unwrap())
+        .collect()
+}
+
+#[test]
+fn with_the_testbed_log_av_is_exact_and_the_source_is_judged() {
+    // The testbed's beeps played 30 ms after their flashes showed, and the capture kept that.
+    let aim = 0.030;
+    let spec = Spec::good();
+    let check = |plan: &Plan| {
+        let bytes = spec.build();
+        let mut decoder = Synthetic::new(
+            Size::new(320, 180).unwrap(),
+            options(),
+            content(),
+            Damage::default(),
+        )
+        .with_audio(audio(&spec, true, aim));
+        check_with(&mut bytes.as_slice(), "clip.mp4", plan, Some(&mut decoder))
+    };
+    let mut plan = plan_for(Profile::Engine, 60, 2, 180);
+    // Without the log the testbed's 30 ms reads as the capture's, and source.stability can't run.
+    let blind = check(&plan);
+    assert!(
+        medians(&blind).iter().all(|m| (m - 30.0).abs() < 1.0),
+        "{:?}",
+        medians(&blind)
+    );
+    assert_eq!(status(&blind, "source.stability"), Status::Error);
+    // With it, A/V is the capture's own: 0. The testbed missed nothing.
+    plan.testbed_log = Some(testbed_log(1_000, 1_400, &[], aim, 5));
+    let exact = check(&plan);
+    let m = medians(&exact);
+    assert_eq!(m.len(), 2, "{}", exact.to_text());
+    assert!(m.iter().all(|m| m.abs() < 1.0), "{m:?}");
+    assert_eq!(
+        status(&exact, "source.stability"),
+        Status::Pass,
+        "{}",
+        exact.to_text()
+    );
+    assert_eq!(status(&exact, "cadence.judder"), Status::Pass);
+    let judder = exact
+        .checks
+        .iter()
+        .find(|f| f.id == "cadence.judder")
+        .unwrap();
+    assert_eq!(judder.value["p99_from"], "the testbed log's display times");
+}
+
+#[test]
+fn steps_at_testbed_misses_are_the_sources_not_the_clips() {
+    // Every 20th output frame repeats the one before it, because the testbed never showed the
+    // two frames after that one, holding it three vblanks, long enough for a 60 fps capture to
+    // show it twice: 12 of 119 steps, far over engine's 0.5%.
+    let content: Vec<u64> = (0..FRAMES)
+        .map(|k| 1_000 + 3 * if k % 20 == 10 { k - 1 } else { k })
+        .collect();
+    let missed: Vec<u64> = (0..FRAMES)
+        .filter(|k| k % 20 == 10)
+        .flat_map(|k| [1_000 + 3 * (k - 1) + 1, 1_000 + 3 * (k - 1) + 2])
+        .collect();
+    let mut plan = plan_for(Profile::Engine, 60, 2, 180);
+    let blind = run_spec(
+        &Spec::good(),
+        content.clone(),
+        Damage::default(),
+        options(),
+        &plan,
+    );
+    assert_eq!(status(&blind, "cadence.drops_dups"), Status::Fail);
+    plan.testbed_log = Some(testbed_log(1_000, 1_400, &missed, 0.0, 5));
+    let report = run_spec(&Spec::good(), content, Damage::default(), options(), &plan);
+    // The clip isn't blamed: its steps at the misses are set aside...
+    assert_eq!(
+        status(&report, "cadence.drops_dups"),
+        Status::Pass,
+        "{}",
+        report.to_text()
+    );
+    let drops = report
+        .checks
+        .iter()
+        .find(|f| f.id == "cadence.drops_dups")
+        .unwrap();
+    assert_eq!(drops.value["source_events"], 12, "{}", drops.detail);
+    // ...and the testbed is: 12 of the clip's testbed frames missed, over 0.1%.
+    let stability = report
+        .checks
+        .iter()
+        .find(|f| f.id == "source.stability")
+        .unwrap();
+    assert_eq!(stability.status, Status::Fail);
+    assert!(
+        stability
+            .detail
+            .starts_with("rerun: the testbed itself missed 12"),
+        "{}",
+        stability.detail
+    );
+}
+
+#[test]
+fn another_runs_log_is_refused() {
+    let mut plan = plan_for(Profile::Engine, 60, 2, 180);
+    plan.testbed_log = Some(testbed_log(5_000, 5_400, &[], 0.0, 9));
+    let report = run_spec(
+        &Spec::good(),
+        content(),
+        Damage::default(),
+        options(),
+        &plan,
+    );
+    let stability = report
+        .checks
+        .iter()
+        .find(|f| f.id == "source.stability")
+        .unwrap();
+    assert_eq!(stability.status, Status::Fail);
+    assert!(
+        stability.detail.contains("another run's log"),
+        "{}",
+        stability.detail
+    );
+    // The barcodes carry run tag 5, the log and the expect file disagree on it.
+    let barcode = report
+        .checks
+        .iter()
+        .find(|f| f.id == "content.barcode")
+        .unwrap();
+    assert_eq!(barcode.status, Status::Fail);
+    assert!(
+        barcode.detail.contains("run tag is 9, the expect file's 5"),
+        "{}",
+        barcode.detail
+    );
+}
+
+#[test]
+fn a_voice_track_is_timed_against_kairo_tones_log() {
+    // The voice beeps at flash + 500 ms in the clip played `early` seconds earlier by
+    // kairo-tone's log: the Voice chat track is that late against QPC, while it agrees with the
+    // Mix. Up to half the 1 s voice period, the log's time is what it's judged by, never the Mix.
+    for early in [0.020, 0.150, 0.300] {
+        let (spec, mut plan) = four_tracks();
+        plan.testbed_log = Some(testbed_log(1_000, 1_400, &[], 0.0, 5));
+        // The clip's clock: frame n at shown_at(n), shown at QPC LOG_BASE + (n − 1000)/180 s.
+        let clock = shown_at(1_000.0) - LOG_BASE_HNS as f64 / 1e7;
+        let voices: String = (6..=7)
+            .enumerate()
+            .map(|(k, m)| {
+                let at = shown_at(180.0 * f64::from(m)) + 0.5 - clock - early;
+                let hns = (at * 1e7).round() as i64;
+                format!("v {k} {hns} {hns}\n")
+            })
+            .collect();
+        plan.voice_log = Some(
+            kairo_core::testbed_log::ToneLog::parse(&format!(
+                "# kairo-tone 1\nh run=5 hz=2000 offset_ms=500 dbfs=-30\n{voices}"
+            ))
+            .unwrap(),
+        );
+        let report = run_audio(&spec, &plan, four_track_audio(&spec));
+        let voice = offsets(&report)
+            .into_iter()
+            .find(|t| t["track"] == "Voice chat" || t["title"] == "Voice chat")
+            .unwrap_or_else(|| panic!("{}", report.to_text()));
+        assert_eq!(
+            voice["via"], "voice beeps, against kairo-tone's log",
+            "{voice}"
+        );
+        let median = voice["median_ms"].as_f64().unwrap();
+        assert!((median - early * 1_000.0).abs() < 1.0, "{early}: {voice}");
     }
 }
