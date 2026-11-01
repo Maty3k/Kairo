@@ -151,13 +151,14 @@ impl Log {
     }
 }
 
-/// What a run holds once it is set up.
+/// What a run holds once it is set up. Fields drop in order: the swap chain (which leaves
+/// exclusive fullscreen) before the device, and both before the window.
 struct Ctx<'a> {
     config: &'a Config,
     log: &'a mut Log,
-    window: Window,
-    gpu: Gpu,
     chain: Chain,
+    gpu: Gpu,
+    window: Window,
     target: &'a DisplayTarget,
     size: Size,
     options: Options,
@@ -247,6 +248,27 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     };
     let window =
         Window::create(frame, left, top, width, height).map_err(|e| Stop(exit::DEVICE, e))?;
+    let (_, _, cw, ch) = window.client_rect();
+    let size = Size::new(cw.max(0) as u32, ch.max(0) as u32)
+        .map_err(|e| Stop(exit::DEVICE, format!("the client area: {e}")))?;
+    let run_tag = config.run_tag.unwrap_or_else(cli::random_run_tag);
+    // The header is known from here, so the setup's events (activate, fse) reach the log even
+    // if frame 0 never comes.
+    log.header = Some(TestbedHeader {
+        pattern: PATTERN_VERSION,
+        run_tag,
+        mode: config.mode,
+        pace: config.pace,
+        fps,
+        nominal_fps: fps,
+        width: size.width(),
+        height: size.height(),
+        refresh_mhz,
+        hdr: hdr.is_some(),
+        sdr_white_nits: hdr.map(|h| h.0),
+        max_nits: hdr.map(|h| h.1),
+        start_hns: 0,
+    });
     let _display = KeepDisplayOn::new();
     let stdin_eof = Arc::new(AtomicBool::new(false));
     if config.stop_on_stdin_eof {
@@ -267,9 +289,6 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     } else {
         window.show(false);
     }
-    let (_, _, cw, ch) = window.client_rect();
-    let size = Size::new(cw.max(0) as u32, ch.max(0) as u32)
-        .map_err(|e| Stop(exit::DEVICE, format!("the client area: {e}")))?;
     let mut chain = gpu
         .swap_chain(
             window.hwnd(),
@@ -285,7 +304,6 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
         log.event("fse", &[("result", result)]);
         entered.map_err(|e| Stop(exit::FOCUS, format!("exclusive fullscreen: {e}")))?;
     }
-    let run_tag = config.run_tag.unwrap_or_else(cli::random_run_tag);
     let options = Options {
         pattern: config.pattern,
         nominal_fps: fps,
@@ -299,27 +317,12 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
             None => Patches::Sdr,
         },
     };
-    log.header = Some(TestbedHeader {
-        pattern: PATTERN_VERSION,
-        run_tag,
-        mode: config.mode,
-        pace: config.pace,
-        fps,
-        nominal_fps: fps,
-        width: size.width(),
-        height: size.height(),
-        refresh_mhz,
-        hdr: hdr.is_some(),
-        sdr_white_nits: hdr.map(|h| h.0),
-        max_nits: hdr.map(|h| h.1),
-        start_hns: 0,
-    });
     let mut ctx = Ctx {
         config,
         log,
-        window,
-        gpu,
         chain,
+        gpu,
+        window,
         target,
         size,
         options,
