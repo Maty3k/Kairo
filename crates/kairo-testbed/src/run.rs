@@ -18,12 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kairo_core::testbed_log::{
-    Event, Miss, Mode, Pace, TESTBED_LOG_HEADER, TestbedHeader, TestbedRecord,
+    BeepRecord, Event, Miss, Mode, Pace, TESTBED_LOG_HEADER, TestbedHeader, TestbedRecord,
 };
-use kairo_core::testsig::{Options, PATTERN_VERSION, Patches, Scene, Size};
+use kairo_core::testsig::{BEEP_PEAK_DBFS, Options, PATTERN_VERSION, Patches, Scene, Size, Tone};
 use kairo_core::timeline::HNS_PER_SECOND;
 use kairo_display::DisplayTarget;
 
+use crate::audio::{Audio, Report};
+use crate::beeps::{Beep, InOrder, LEAD_HNS, Played};
 use crate::cli::{self, Config, Hdr, exit};
 use crate::draw::{self, Format, Plan};
 use crate::gpu::{Chain, Gpu, HdrWatch, Pacing, PresentError, Statistics, VblankClock};
@@ -161,6 +163,18 @@ impl Log {
         self.write(TestbedRecord::Miss(frame, miss).line());
     }
 
+    fn beep(&mut self, played: Played) {
+        self.write(
+            TestbedRecord::Beep(BeepRecord {
+                beep: played.beep.index,
+                flash_frame: played.beep.frame,
+                target_hns: played.beep.target_hns,
+                played_hns: played.played_hns,
+            })
+            .line(),
+        );
+    }
+
     /// The `end` event; if frame 0 never came, the header still opens the log (with the time
     /// now), so the setup events parse. A run that failed before its header was known (before
     /// its window and client size were settled, a `--size` that doesn't fit included) has none
@@ -181,6 +195,15 @@ impl Log {
     }
 }
 
+/// The game beeps (README §4.7): the audio stream, the next flash to aim at, and the beeps sent
+/// but not yet logged.
+struct Beeps {
+    audio: Option<Audio>,
+    /// Beep m is aimed at flash frame N_f = F·m, from m = 1.
+    next: u64,
+    order: InOrder,
+}
+
 /// What a run holds once it is set up. Fields drop in order: the swap chain (which leaves
 /// exclusive fullscreen) before the device, and both before the window.
 struct Ctx<'a> {
@@ -199,6 +222,7 @@ struct Ctx<'a> {
     hdr_watch: Option<HdrWatch>,
     stdin_eof: Arc<AtomicBool>,
     next_check_hns: i64,
+    beeps: Beeps,
 }
 
 /// Sets the run up and runs it.
@@ -386,6 +410,14 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
         hdr_watch,
         stdin_eof,
         next_check_hns: 0,
+        beeps: Beeps {
+            // The stream starts now, so it runs well before the first beep's lead time.
+            audio: config
+                .beep
+                .then(|| Audio::start(Tone::Game.hz(), BEEP_PEAK_DBFS)),
+            next: 1,
+            order: InOrder::default(),
+        },
     };
     match (config.pace, k) {
         (Pace::Vsync, Some(k)) => vsync_loop(&mut ctx, k),
@@ -578,6 +610,71 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// Hands the audio stream each flash's beep once the flash's predicted display time is
+    /// within [`LEAD_HNS`], and logs what the stream reports.
+    fn aim_beeps(&mut self, now: i64, predict: impl Fn(u64) -> Option<i64>) {
+        if let Some(audio) = &self.beeps.audio {
+            let flash_rate = u64::from(self.options.nominal_fps);
+            loop {
+                let flash = self.beeps.next * flash_rate;
+                let Some(target_hns) = predict(flash) else {
+                    break;
+                };
+                if target_hns > now + LEAD_HNS {
+                    break;
+                }
+                let beep = Beep {
+                    index: self.beeps.next,
+                    frame: flash,
+                    target_hns,
+                };
+                audio.beep(beep);
+                self.beeps.order.sent(beep);
+                self.beeps.next += 1;
+            }
+        }
+        let reports = self
+            .beeps
+            .audio
+            .as_ref()
+            .map(Audio::reports)
+            .unwrap_or_default();
+        self.audio_reports(reports);
+    }
+
+    fn audio_reports(&mut self, reports: Vec<Report>) {
+        for report in reports {
+            match report {
+                Report::Played(played) => {
+                    for p in self.beeps.order.settle(played) {
+                        self.log.beep(p);
+                    }
+                }
+                Report::DeviceChanged => self.log.event("audio_device_changed", &[]),
+                Report::Failed(message) => {
+                    // The video carries on without sound (README §4.7).
+                    self.log.event("audio_failed", &[]);
+                    eprintln!("testbed: audio: {message}");
+                    if let Some(audio) = self.beeps.audio.take() {
+                        let rest = audio.stop();
+                        self.audio_reports(rest);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops the stream and logs every beep sent.
+    fn stop_beeps(&mut self) {
+        if let Some(audio) = self.beeps.audio.take() {
+            let rest = audio.stop();
+            self.audio_reports(rest);
+        }
+        for p in self.beeps.order.rest() {
+            self.log.beep(p);
+        }
+    }
+
     fn end_hns(&self, start_hns: i64) -> i64 {
         start_hns.saturating_add(i64::from(self.config.seconds).saturating_mul(HNS_PER_SECOND))
     }
@@ -591,6 +688,7 @@ fn vsync_loop(ctx: &mut Ctx<'_>, k: u32) -> Result<(), Stop> {
     let mut pacer = VsyncPacer::new(k, ctx.period, start, blocking);
     let result = vsync_frames(ctx, &mut pacer);
     ctx.settle(pacer.shown(), Miss::Vblank);
+    ctx.stop_beeps();
     result
 }
 
@@ -649,6 +747,7 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
                 None => {}
             }
         }
+        ctx.aim_beeps(now, |flash| pacer.predict(flash));
         match pacer.next(platform::now_hns()) {
             Step::Warmup => {
                 ctx.chain.draw(&black);
@@ -690,6 +789,7 @@ fn timer_loop(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
     let mut shown = Shown::new(None, ctx.period);
     let result = timer_frames(ctx, &mut pacer, &mut shown);
     ctx.settle(&mut shown, Miss::Slot);
+    ctx.stop_beeps();
     result
 }
 
@@ -713,6 +813,13 @@ fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) ->
         for r in shown.expire(now) {
             ctx.log.frame(r, Miss::Slot);
         }
+        // A frame shows at the first vblank after its slot, plus the display's latency.
+        let (grid, latency) = (shown.grid(), shown.latency_hns());
+        ctx.aim_beeps(now, |flash| {
+            let slot = pacer.slot_time(flash);
+            let vblank = grid.map_or(slot, |g| g.time_of(g.next_after(slot)));
+            Some(vblank.saturating_add(latency))
+        });
         let (frame, target_hns, skipped) = match pacer.next(now) {
             Step::Frame {
                 frame,
