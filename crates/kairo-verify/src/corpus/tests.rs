@@ -269,24 +269,27 @@ fn encoder_sessions_use_research_16s_recipes() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_relative_ffmpeg_is_found_from_the_callers_folder() {
-    let build = |ffmpeg: &'static str| build::Build {
-        encoder: Encoder::Ipcm,
-        ffmpeg: std::path::Path::new(ffmpeg),
-        hw_index: None,
-        hw_device: None,
-        finishing: false,
-        out: std::path::Path::new("corpus"),
+    let program = |ffmpeg: &std::path::Path| {
+        build::Build {
+            encoder: Encoder::Ipcm,
+            ffmpeg,
+            hw_index: None,
+            hw_device: None,
+            finishing: false,
+            out: std::path::Path::new("corpus"),
+        }
+        .program()
     };
     let here = std::env::current_dir().unwrap();
-    assert_eq!(build("bin/ffmpeg").program(), here.join("bin/ffmpeg"));
+    let relative = std::path::Path::new("bin").join("ffmpeg");
+    assert_eq!(program(&relative), here.join(&relative));
     assert_eq!(
-        build("ffmpeg").program(),
+        program(std::path::Path::new("ffmpeg")),
         std::path::PathBuf::from("ffmpeg")
     );
-    assert_eq!(
-        build("/opt/homebrew/bin/ffmpeg").program(),
-        std::path::PathBuf::from("/opt/homebrew/bin/ffmpeg")
-    );
+    // Absolute on this system: a drive letter on Windows, where `/opt/…` is relative.
+    let absolute = here.join("tools").join("ffmpeg");
+    assert_eq!(program(&absolute), absolute);
 }
 
 /// The lines of FFmpeg 8.0.1's verbose log that the checks read, from a VideoToolbox encode
