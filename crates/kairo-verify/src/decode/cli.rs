@@ -13,7 +13,9 @@
 //! yuv420p. No filter runs: it only decodes. Any line FFmpeg prints counts as a decode error,
 //! warnings included: FFmpeg reports a frame it had to conceal (the flags the linked backend
 //! reads) only as the warning `corrupt decoded frame`. The pipe keeps the clip's time base, so
-//! pictures less than a frame apart don't trip FFmpeg's warnings about its own output.
+//! pictures less than a frame apart don't trip FFmpeg's warnings about its own output; that
+//! needs an FFmpeg whose `-enc_time_base` takes `demux` (8.0.1 and the PC's 9.0.2 do, 6.0
+//! doesn't), and one that can't start decoding is an error, never a failed clip.
 //! A relative `--ffmpeg` path is taken from the caller's folder, not the clip's.
 
 use std::ffi::OsString;

@@ -2,6 +2,8 @@
 //! The corpus's recipes, manifest and judging, without FFmpeg; and, opt-in, CI's lossless
 //! corpus built and judged through Homebrew's FFmpeg.
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 
 use super::*;
@@ -153,7 +155,7 @@ fn encoder_sessions_use_research_16s_recipes() {
 
     let amf = Encoder::Amf;
     let line = |encoder: Encoder, video, hw| {
-        encode_args(encoder, video, &encoder.synth(video), hw).join(" ")
+        encode_args(encoder, video, &encoder.synth(video), hw, false).join(" ")
     };
     // README §7.2's PC row, word for word.
     assert_eq!(
@@ -202,6 +204,26 @@ fn encoder_sessions_use_research_16s_recipes() {
          -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
          -an -movflags +faststart -use_editlist 0 v-good.mp4"
     );
+    // Media Foundation: High as its number, since h264_mf has no named profiles, on a hardware
+    // MFT (PR 5c's review).
+    assert_eq!(
+        line(Encoder::Mf, Video::Bframes, None),
+        "-hide_banner -nostdin -loglevel verbose -n \
+         -f rawvideo -pix_fmt nv12 -video_size 1920x1080 -framerate 60 -i pipe:0 \
+         -vf setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv \
+         -pix_fmt nv12 -c:v h264_mf -hw_encoding 1 -b:v 25M -maxrate 40M -g 60 -bf 2 \
+         -profile:v 100 -an -movflags +faststart+negative_cts_offsets -use_editlist 0 \
+         v-bframes.mp4"
+    );
+    // README §7.2's colour fix goes after the encoder's options when asked for.
+    let finished = encode_args(amf, Video::Good, &amf.synth(Video::Good), Some(1), true).join(" ");
+    assert!(
+        finished.contains(&format!(
+            "-async_depth 4 -bsf:v {} -an",
+            build::H264_METADATA
+        )),
+        "{finished}"
+    );
     // Only the four encoders, AAC and stream copies are ever named (CLAUDE.md: no GPL code).
     for encoder in [
         Encoder::Amf,
@@ -214,7 +236,7 @@ fn encoder_sessions_use_research_16s_recipes() {
                 Make::Mux { video, audio } => (video, audio),
                 Make::Mutate(_) => continue,
             };
-            let words = encode_args(encoder, video, &encoder.synth(video), None)
+            let words = encode_args(encoder, video, &encoder.synth(video), None, true)
                 .into_iter()
                 .chain(mux_args(&recipe, video, audio));
             for word in words {
@@ -251,6 +273,8 @@ fn a_relative_ffmpeg_is_found_from_the_callers_folder() {
         encoder: Encoder::Ipcm,
         ffmpeg: std::path::Path::new(ffmpeg),
         hw_index: None,
+        hw_device: None,
+        finishing: false,
         out: std::path::Path::new("corpus"),
     };
     let here = std::env::current_dir().unwrap();
@@ -281,32 +305,55 @@ Output #0, mp4, to 'v.mp4':
 #[cfg(feature = "dev-tools")]
 #[test]
 fn logs_show_the_encoder_and_its_colour() {
-    use super::build::{encode_log_problems, mux_log_problems, version};
+    use super::build::{adapter_device, encode_log_problems, mux_log_problems, version};
 
-    assert!(encode_log_problems(Encoder::VideoToolbox, VT_LOG, None).is_empty());
+    assert!(encode_log_problems(Encoder::VideoToolbox, VT_LOG, None, None).is_empty());
     // An unused option, another encoder, or BT.601 output each stop the build.
     let unused = format!(
         "{VT_LOG}[out#0/mp4 @ 0x1] Codec AVOption usage (x) has not been used for any stream."
     );
     assert_eq!(
-        encode_log_problems(Encoder::VideoToolbox, &unused, None),
+        encode_log_problems(Encoder::VideoToolbox, &unused, None, None),
         ["an option no stream used"]
     );
-    // Another encoder's log: no AMF mapping and neither device line.
-    assert_eq!(encode_log_problems(Encoder::Amf, VT_LOG, None).len(), 3);
+    // Another encoder's log: no AMF mapping, neither device line, no adapter asked for and none
+    // named.
+    assert_eq!(
+        encode_log_problems(Encoder::Amf, VT_LOG, None, None).len(),
+        5
+    );
     let bt601 = VT_LOG.replace("nv12(tv, bt709", "nv12(tv, smpte170m");
     assert_eq!(
-        encode_log_problems(Encoder::VideoToolbox, &bt601, None),
+        encode_log_problems(Encoder::VideoToolbox, &bt601, None, None),
         ["the output's video isn't \"nv12(tv, bt709\""]
     );
-    // AMF's device lines, the adapter included (README §7.2).
-    let amf = VT_LOG.replace("h264_videotoolbox", "h264_amf")
+    // AMF's device lines and the adapter it opened, which must be the one asked for (README
+    // §7.2, PR 5c's review): FFmpeg names the index before looking it up, and with an index that
+    // doesn't exist it falls back to the default adapter without naming a vendor:device.
+    let fallback = VT_LOG.replace("h264_videotoolbox", "h264_amf")
         + "[AVHWDeviceContext @ 0x1] Selecting d3d11va adapter 1\n\
            [h264_amf @ 0x2] Using device kd (type d3d11va) with h264_amf encoder.\n\
            [AVHWDeviceContext @ 0x3] AMF via D3D11.\n";
-    assert!(encode_log_problems(Encoder::Amf, &amf, Some(1)).is_empty());
     assert_eq!(
-        encode_log_problems(Encoder::Amf, &amf, Some(0)),
+        encode_log_problems(Encoder::Amf, &fallback, Some(1), None),
+        [
+            "no \"Using device vvvv:dddd\": the adapter wasn't found, and FFmpeg fell back to the default one"
+        ]
+    );
+    let amf = fallback.replace(
+        "Selecting d3d11va adapter 1\n",
+        "Selecting d3d11va adapter 1\n[AVHWDeviceContext @ 0x1] Using device 1002:7550 (AMD Radeon).\n",
+    );
+    assert_eq!(adapter_device(&amf).as_deref(), Some("1002:7550"));
+    assert_eq!(adapter_device(&fallback), None);
+    assert!(encode_log_problems(Encoder::Amf, &amf, Some(1), None).is_empty());
+    assert!(encode_log_problems(Encoder::Amf, &amf, Some(1), Some("1002:7550")).is_empty());
+    assert_eq!(
+        encode_log_problems(Encoder::Amf, &amf, Some(1), Some("1002:13c0")),
+        ["the adapter is 1002:7550, not 1002:13c0"]
+    );
+    assert_eq!(
+        encode_log_problems(Encoder::Amf, &amf, Some(0), None),
         ["no \"Selecting d3d11va adapter 0\""]
     );
     // CI's stream copy.
@@ -314,7 +361,7 @@ fn logs_show_the_encoder_and_its_colour() {
 Output #0, mp4, to 'v-good.mp4':
   Stream #0:0: Video: h264 (High), 1 reference frame (avc1 / 0x31637661), yuv420p(tv, bt709, progressive, left), 480x270
 ";
-    assert!(encode_log_problems(Encoder::Ipcm, copy, None).is_empty());
+    assert!(encode_log_problems(Encoder::Ipcm, copy, None, None).is_empty());
     // A mux copies the video and encodes four tracks with FFmpeg's own AAC.
     let mux = "  Stream #0:0 -> #0:0 (copy)
   Stream #1:0 -> #0:1 (pcm_f32le (native) -> aac (native))
@@ -496,6 +543,7 @@ fn the_pc_calibrates_and_manifests_round_trip() {
             },
         )]
         .into(),
+        adapter: None,
         clips: recipes(Encoder::Ipcm)
             .iter()
             .map(|r| r.entry(Encoder::Ipcm))
@@ -530,6 +578,8 @@ fn the_ci_corpus_builds_and_behaves() {
         encoder: Encoder::Ipcm,
         ffmpeg: &ffmpeg,
         hw_index: None,
+        hw_device: None,
+        finishing: false,
         out: &dir,
     };
     let mut lines = Vec::new();
@@ -555,9 +605,165 @@ fn the_ci_corpus_builds_and_behaves() {
         decoder: &decoder,
     };
     let report = check.run(&mut |line| lines.push(line.to_owned())).unwrap();
-    assert!(report.pass, "{}", report.to_text());
+    assert!(report.pass && report.complete, "{}", report.to_text());
     assert!(dir.join(REPORT).exists());
     // A second build can't reuse the folder.
     assert_eq!(build.run(&mut |_| {}).map_err(|e| e.code), Err(2));
+    // Two bad clips swapped: each is refused as not the clip the build made, and the earlier
+    // judgement is gone (PR 5c's review).
+    let (drop1, dup1) = (dir.join("drop1.mp4"), dir.join("dup1.mp4"));
+    std::fs::rename(&drop1, dir.join("x.mp4")).unwrap();
+    std::fs::rename(&dup1, &drop1).unwrap();
+    std::fs::rename(dir.join("x.mp4"), &dup1).unwrap();
+    let refused = check.run(&mut |_| {}).map_err(|e| (e.code, e.message));
+    assert!(
+        matches!(&refused, Err((3, m)) if m.contains("drop1.mp4 isn't the clip corpus build made")),
+        "{refused:?}"
+    );
+    assert!(!dir.join(REPORT).exists());
+    // A clip and its manifest entry left out: refused too.
+    std::fs::rename(&drop1, dir.join("x.mp4")).unwrap();
+    std::fs::rename(&dup1, &drop1).unwrap();
+    std::fs::rename(dir.join("x.mp4"), &dup1).unwrap();
+    let mut short = manifest.clone();
+    short.clips.retain(|e| e.file != "judder.mp4");
+    std::fs::write(dir.join(MANIFEST), serde_json::to_string(&short).unwrap()).unwrap();
+    let refused = check.run(&mut |_| {}).map_err(|e| (e.code, e.message));
+    assert!(
+        matches!(&refused, Err((3, m)) if m.contains("judder.mp4: missing from the manifest")),
+        "{refused:?}"
+    );
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_manifest_must_hold_this_builds_recipes() {
+    // PR 5c's review: the judge took every rule from the manifest, so a corpus with a clip left
+    // out, added or loosened passed.
+    let manifest = |encoder: Encoder| Manifest {
+        kairo_corpus: VERSION,
+        pattern: 1,
+        encoder: encoder.to_string(),
+        ffmpeg: "8.0.1".to_owned(),
+        finishing: Vec::new(),
+        adapter: None,
+        calibration: BTreeMap::new(),
+        clips: recipes(encoder).iter().map(|r| r.entry(encoder)).collect(),
+        missing: Vec::new(),
+    };
+    let good = manifest(Encoder::Ipcm);
+    let (encoder, entries) = expected(&good).unwrap();
+    assert_eq!(encoder, Encoder::Ipcm);
+    assert_eq!(entries.len(), recipes(Encoder::Ipcm).len());
+    let refused = |change: &dyn Fn(&mut Manifest), says: &str| {
+        let mut m = manifest(Encoder::Ipcm);
+        change(&mut m);
+        let error = expected(&m).unwrap_err();
+        assert!(error.contains(says), "{error}");
+    };
+    refused(
+        &|m| m.clips.clear(),
+        "good-1080p60.mp4: missing from the manifest",
+    );
+    refused(
+        &|m| m.clips.retain(|e| e.file != "judder.mp4"),
+        "judder.mp4: missing from the manifest",
+    );
+    refused(
+        &|m| m.clips[3].must_fail.clear(),
+        "drop1.mp4: its manifest entry isn't this build's recipe",
+    );
+    refused(
+        &|m| m.clips[6].av_offset_ms = None,
+        "av50.mp4: its manifest entry isn't this build's recipe",
+    );
+    refused(
+        &|m| m.clips[0].hold_ticks = None,
+        "isn't this build's recipe",
+    );
+    refused(
+        &|m| m.clips.push(m.clips[1].clone()),
+        "good-1440p60.mp4: listed twice",
+    );
+    refused(
+        &|m| {
+            let mut extra = m.clips[1].clone();
+            extra.file = "extra.mp4".to_owned();
+            m.clips.push(extra);
+        },
+        "extra.mp4: not a clip of this corpus",
+    );
+    refused(&|m| m.pattern = 2, "pattern 2");
+    refused(&|m| m.encoder = "libx264".to_owned(), "an unknown encoder");
+    // Only the PC's bframes may be missing; then the Mac's clip stands in, by its rules.
+    let mut pc = manifest(Encoder::Amf);
+    pc.clips.retain(|e| e.file != "bframes.mp4");
+    pc.missing.push(Missing {
+        file: "bframes.mp4".to_owned(),
+        why: "no B-frames".to_owned(),
+    });
+    let (_, entries) = expected(&pc).unwrap();
+    let bframes = entries.iter().find(|e| e.file == "bframes.mp4").unwrap();
+    assert_eq!(bframes.encoder.as_deref(), Some("h264_videotoolbox"));
+    let mut mac = manifest(Encoder::VideoToolbox);
+    mac.clips.retain(|e| e.file != "bframes.mp4");
+    mac.missing = pc.missing.clone();
+    assert!(expected(&mac).unwrap_err().contains("bframes.mp4: missing"));
+    // An entry the PC's Media Foundation made is its own, and only bframes may be.
+    let mut mf = manifest(Encoder::Amf);
+    for e in &mut mf.clips {
+        if e.file == "bframes.mp4" {
+            e.encoder = Some("h264_mf".to_owned());
+        }
+    }
+    assert!(expected(&mf).is_ok());
+    mf.clips[0].encoder = Some("h264_mf".to_owned());
+    assert!(
+        expected(&mf)
+            .unwrap_err()
+            .contains("made by another encoder")
+    );
+}
+
+#[test]
+fn hashes_and_drop_counts_tell_clips_apart() {
+    // FNV-1a 64's own test vectors.
+    assert_eq!(fnv1a64(&mut &b""[..]).unwrap(), "cbf29ce484222325");
+    assert_eq!(fnv1a64(&mut &b"a"[..]).unwrap(), "af63dc4c8601ec8c");
+    assert_eq!(fnv1a64(&mut &b"foobar"[..]).unwrap(), "85944171f73967e8");
+    // drop1 must count one skip and no repeat; a duplicated frame in its place doesn't pass.
+    let entry = |name: &str| {
+        recipes(Encoder::VideoToolbox)
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap()
+            .entry(Encoder::VideoToolbox)
+    };
+    let counted = |skipped: u64, repeats: u64| {
+        let mut checks = findings(328, &[0.0], &["cadence.drops_dups"]);
+        if let Some(f) = checks.iter_mut().find(|f| f.id == "cadence.drops_dups") {
+            f.value = json!({"skipped": skipped, "repeats": repeats});
+        }
+        checks
+    };
+    let drop1 = entry("drop1");
+    assert!(
+        judge(&drop1, Verdict::Fail, &counted(1, 0))
+            .problems
+            .is_empty()
+    );
+    assert_eq!(
+        judge(&drop1, Verdict::Fail, &counted(0, 1)).problems,
+        ["cadence.drops_dups counts Some(0) skipped and Some(1) repeated; want 1 and 0"]
+    );
+    let dup1 = entry("dup1");
+    assert!(
+        judge(&dup1, Verdict::Fail, &counted(0, 1))
+            .problems
+            .is_empty()
+    );
+    assert_eq!(
+        judge(&dup1, Verdict::Fail, &counted(2, 1)).problems.len(),
+        1
+    );
 }

@@ -1,25 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `corpus check` (docs/research/16-verify-testbed/README.md §7.4): every clip of a corpus
-//! checked with `--profile test` and its expect file, then judged against the manifest.
+//! checked with `--profile test` and its expect file, then judged.
 //!
-//! The good clips go first. A PC corpus (AMF or Media Foundation) sets its line-error limit
-//! from them, max(4, 2 × their worst line error), and judges the bad clips with it; the Mac and
-//! CI corpora keep 4 codes. Each clip's report goes next to it as `<clip>.report.json`, and the
-//! judgement into `corpus-report.json`, with a summary that fits one screen.
+//! The rules come from this build's recipes, not the manifest: the manifest must list every
+//! recipe's clip once, with the recipe's rules, and each clip must still have the size and hash
+//! the build recorded, so a clip left out, loosened, swapped or edited is refused (exit 3). The
+//! good clips go first. A PC corpus (AMF or Media Foundation) sets its line-error limit from
+//! them, max(4, 2 × their worst line error), and checks them again under it if it moved; the
+//! Mac and CI corpora keep 4 codes. A PC corpus whose `bframes` no encoder could make is
+//! incomplete until the Mac's clip is copied in, and then that clip is judged by the Mac's
+//! rules. Earlier reports are removed first; each clip's report goes next to it as
+//! `<clip>.report.json`, and the judgement into `corpus-report.json` once every clip is done.
 
 use std::fmt;
 use std::fs::{self, File};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Instant;
 
 use serde::Serialize;
 
 use super::{
-    CALIBRATED, Encoder, Entry, Judged, LINES_FLOOR_CODES, MANIFEST, Manifest, Missing, REPORT,
-    VERSION, calibrated_limit, judge,
+    Entry, Judged, LINES_FLOOR_CODES, MANIFEST, Manifest, Missing, REPORT, VERSION,
+    calibrated_limit, expected, fnv1a64, judge,
 };
 use crate::Report;
-use crate::decode::Decoder;
+use crate::decode::{DecodeError, Decoder};
 use crate::expect::Expect;
 use crate::profile::{Plan, Profile};
 
@@ -35,6 +41,13 @@ pub struct CheckError {
 impl CheckError {
     fn evaluate(message: String) -> Self {
         Self { code: 3, message }
+    }
+
+    fn write(name: &str, error: impl fmt::Display) -> Self {
+        Self {
+            code: 4,
+            message: format!("{name}: {error}"),
+        }
     }
 }
 
@@ -62,6 +75,8 @@ pub struct Lines {
 pub struct CorpusReport {
     /// The format version: [`VERSION`].
     pub kairo_corpus_report: u32,
+    /// The kairo-verify that judged it.
+    pub tool: &'static str,
     /// The manifest's encoder.
     pub encoder: String,
     /// The FFmpeg that built the corpus.
@@ -70,11 +85,14 @@ pub struct CorpusReport {
     pub decoder: &'static str,
     /// `content.bars_lines`' limit.
     pub lines: Lines,
-    /// Whether every clip behaved.
+    /// Whether every clip of the corpus is there: false while the PC's `bframes` waits for the
+    /// Mac's clip.
+    pub complete: bool,
+    /// Whether every clip is there and behaves.
     pub pass: bool,
-    /// Each clip, in the manifest's order.
+    /// Each clip judged, in the recipes' order.
     pub clips: Vec<Judged>,
-    /// The clips the encoder couldn't make.
+    /// The clips the encoder couldn't make that aren't there yet.
     pub missing: Vec<Missing>,
 }
 
@@ -91,36 +109,63 @@ fn line_error(report: &Report) -> Option<f64> {
     report
         .checks
         .iter()
-        .find(|f| f.id == CALIBRATED)?
+        .find(|f| f.id == super::CALIBRATED)?
         .value
         .get("max_codes")?
         .as_f64()
 }
 
+/// Removes `name` from `dir` if it is there.
+fn remove(dir: &Path, name: &str) -> Result<(), CheckError> {
+    match fs::remove_file(dir.join(name)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(CheckError::write(name, e)),
+        _ => Ok(()),
+    }
+}
+
 impl Check<'_> {
     /// Checks and judges every clip, telling `say` each step.
     pub fn run(&self, say: &mut dyn FnMut(&str)) -> Result<CorpusReport, CheckError> {
+        // An earlier judgement goes first, so a run that stops leaves none behind.
+        remove(self.dir, REPORT)?;
         let manifest = self.manifest()?;
-        let encoder: Encoder = manifest
-            .encoder
-            .parse()
-            .map_err(|_| CheckError::evaluate(format!("{MANIFEST}: an unknown encoder")))?;
-        let calibration = manifest.calibration.get(CALIBRATED);
-        let calibrate = calibration.is_some_and(|c| c.limit_codes.is_none());
-        let mut limit = calibration.and_then(|c| c.limit_codes);
+        let (encoder, entries) =
+            expected(&manifest).map_err(|e| CheckError::evaluate(format!("{MANIFEST}: {e}")))?;
+        for entry in &entries {
+            remove(self.dir, &entry.report_file())?;
+        }
+        // A clip a PC encoder couldn't make counts once the Mac's is copied in.
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for entry in entries {
+            let listed = manifest.clips.iter().any(|e| e.file == entry.file);
+            if listed || self.dir.join(&entry.file).exists() {
+                present.push((entry, !listed));
+            } else if let Some(m) = manifest.missing.iter().find(|m| m.file == entry.file) {
+                missing.push(m.clone());
+            }
+        }
         say(&format!(
             "corpus check: {} clips from {encoder}, FFmpeg {}",
-            manifest.clips.len(),
+            present.len(),
             manifest.ffmpeg
         ));
-        let good: Vec<&Entry> = manifest.clips.iter().filter(|e| e.is_good()).collect();
-        let bad: Vec<&Entry> = manifest.clips.iter().filter(|e| !e.is_good()).collect();
+        for (entry, copied) in &present {
+            if !copied {
+                self.verify(entry)?;
+            }
+        }
+        self.decoder_starts(&present)?;
+        let good: Vec<&Entry> = present
+            .iter()
+            .filter(|(e, _)| e.is_good())
+            .map(|(e, _)| e)
+            .collect();
         let mut reports: Vec<(String, Report)> = Vec::new();
         for entry in &good {
-            reports.push((entry.file.clone(), self.check_clip(entry, limit, say)?));
+            reports.push((entry.file.clone(), self.check_clip(entry, None, say)?));
         }
-        let mut worst_good = None;
-        if calibrate {
+        let (limit, lines) = if encoder.calibrates() {
             let worst = reports
                 .iter()
                 .filter_map(|(_, r)| line_error(r))
@@ -129,53 +174,71 @@ impl Check<'_> {
             say(&format!(
                 "  line errors: worst good clip {worst:.2} codes, so the limit is {calibrated:.2}"
             ));
-            worst_good = Some(worst);
-            limit = Some(calibrated);
-            // A good clip over 4 codes failed under them; it is judged again under the new limit.
-            if worst > LINES_FLOOR_CODES {
+            if calibrated != LINES_FLOOR_CODES {
+                // The good clips are judged, and reported, under the limit the bad ones get.
                 reports.clear();
                 for entry in &good {
-                    reports.push((entry.file.clone(), self.check_clip(entry, limit, say)?));
+                    reports.push((
+                        entry.file.clone(),
+                        self.check_clip(entry, Some(calibrated), say)?,
+                    ));
                 }
             }
-        }
-        for entry in &bad {
+            (
+                Some(calibrated).filter(|&l| l != LINES_FLOOR_CODES),
+                Lines {
+                    limit_codes: calibrated,
+                    source: "max(4, 2 × the worst good clip), the PC's calibration (README §7.4)"
+                        .to_owned(),
+                    worst_good_codes: Some(worst),
+                },
+            )
+        } else {
+            (
+                None,
+                Lines {
+                    limit_codes: LINES_FLOOR_CODES,
+                    source: "fixed: the Mac and CI corpora keep 4 codes (README §7.4)".to_owned(),
+                    worst_good_codes: None,
+                },
+            )
+        };
+        for (entry, _) in present.iter().filter(|(e, _)| !e.is_good()) {
             reports.push((entry.file.clone(), self.check_clip(entry, limit, say)?));
         }
         let decoder = reports.first().map_or("none", |(_, r)| r.decoder.kind);
-        let clips: Vec<Judged> = manifest
-            .clips
+        let clips: Vec<Judged> = present
             .iter()
-            .filter_map(|entry| {
+            .filter_map(|(entry, copied)| {
                 let (_, report) = reports.iter().find(|(file, _)| *file == entry.file)?;
-                Some(judge(entry, report.verdict, &report.checks))
+                Some(Judged {
+                    copied_in: *copied,
+                    ..judge(entry, report.verdict, &report.checks)
+                })
             })
             .collect();
+        let complete = missing.is_empty();
         let report = CorpusReport {
             kairo_corpus_report: VERSION,
+            tool: concat!("kairo-verify ", env!("CARGO_PKG_VERSION")),
             encoder: manifest.encoder.clone(),
             ffmpeg: manifest.ffmpeg.clone(),
             decoder,
-            lines: Lines {
-                limit_codes: limit.unwrap_or(LINES_FLOOR_CODES),
-                source: calibration.map_or_else(
-                    || "README §2 item 14 (proposed)".to_owned(),
-                    |c| c.source.clone(),
-                ),
-                worst_good_codes: worst_good,
-            },
-            pass: clips.iter().all(|c| c.problems.is_empty()),
+            lines,
+            complete,
+            pass: complete && clips.iter().all(|c| c.problems.is_empty()),
             clips,
-            missing: manifest.missing.clone(),
+            missing,
         };
-        let text = serde_json::to_string_pretty(&report).map_err(|e| CheckError {
-            code: 4,
-            message: format!("{REPORT}: {e}"),
-        })?;
-        fs::write(self.dir.join(REPORT), format!("{text}\n")).map_err(|e| CheckError {
-            code: 4,
-            message: format!("{REPORT}: {e}"),
-        })?;
+        // Written under a temporary name and moved into place: there is a judgement only once
+        // every clip is judged.
+        let text =
+            serde_json::to_string_pretty(&report).map_err(|e| CheckError::write(REPORT, e))?;
+        let partial = format!("{REPORT}.partial");
+        fs::write(self.dir.join(&partial), format!("{text}\n"))
+            .map_err(|e| CheckError::write(&partial, e))?;
+        fs::rename(self.dir.join(&partial), self.dir.join(REPORT))
+            .map_err(|e| CheckError::write(REPORT, e))?;
         Ok(report)
     }
 
@@ -194,20 +257,52 @@ impl Check<'_> {
                 manifest.kairo_corpus
             )));
         }
-        // Clips are named by the manifest; a name that leaves the folder is refused.
-        for entry in &manifest.clips {
-            let plain = Path::new(&entry.file).file_name().and_then(|n| n.to_str());
-            if plain != Some(entry.file.as_str()) || !entry.file.ends_with(".mp4") {
-                return Err(CheckError::evaluate(format!(
-                    "{MANIFEST}: a clip that isn't a .mp4 in the corpus folder"
-                )));
-            }
-        }
         Ok(manifest)
     }
 
-    /// One clip checked with `--profile test`, its expect file and the line-error `limit`; its
-    /// report written next to it.
+    /// Refuses a clip whose size or hash isn't what the build recorded.
+    fn verify(&self, entry: &Entry) -> Result<(), CheckError> {
+        let file = &entry.file;
+        let (Some(bytes), Some(hash)) = (entry.bytes, entry.fnv1a64.as_deref()) else {
+            return Err(CheckError::evaluate(format!(
+                "{MANIFEST}: {file} has no size and hash; rebuild the corpus"
+            )));
+        };
+        let mut clip = File::open(self.dir.join(file))
+            .map_err(|e| CheckError::evaluate(format!("{file}: {e}")))?;
+        let size = clip
+            .metadata()
+            .map_err(|e| CheckError::evaluate(format!("{file}: {e}")))?
+            .len();
+        let found = fnv1a64(&mut clip).map_err(|e| CheckError::evaluate(format!("{file}: {e}")))?;
+        if size != bytes || found != hash {
+            return Err(CheckError::evaluate(format!(
+                "{file} isn't the clip corpus build made: changed, swapped or copied over since"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses to judge with a decoder that can't decode the first good clip's first picture:
+    /// a missing or unsuitable FFmpeg isn't a corpus that misbehaves.
+    fn decoder_starts(&self, present: &[(Entry, bool)]) -> Result<(), CheckError> {
+        let Some((first, _)) = present.iter().find(|(e, _)| e.is_good()) else {
+            return Err(CheckError::evaluate(format!(
+                "{MANIFEST}: no good clip to judge the others by"
+            )));
+        };
+        let mut decoder = (self.decoder)(&self.dir.join(&first.file));
+        match decoder.video(&mut |_, _| ControlFlow::Break(())) {
+            Err(error @ DecodeError::Start(_)) => Err(CheckError::evaluate(format!(
+                "the decoder didn't start on {}: {error}",
+                first.file
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// One clip checked with `--profile test`, its expect file and the line-error `limit`
+    /// (`None`: the proposed 4 codes); its report written next to it.
     fn check_clip(
         &self,
         entry: &Entry,
@@ -229,10 +324,8 @@ impl Check<'_> {
         let mut decoder = (self.decoder)(&path);
         let report = crate::check_with(&mut file, &entry.file, &plan, Some(decoder.as_mut()));
         let name = entry.report_file();
-        fs::write(self.dir.join(&name), report.to_json() + "\n").map_err(|e| CheckError {
-            code: 4,
-            message: format!("{name}: {e}"),
-        })?;
+        fs::write(self.dir.join(&name), report.to_json() + "\n")
+            .map_err(|e| CheckError::write(&name, e))?;
         say(&format!(
             "  {} {} in {:.1} s",
             entry.file,
@@ -262,7 +355,8 @@ impl CorpusReport {
             } else {
                 format!("fail: {}", clip.failed.join(", "))
             };
-            out += &format!("  {mark} {:width$}  {failed}", clip.file);
+            let copied = if clip.copied_in { " (copied in)" } else { "" };
+            out += &format!("  {mark} {:width$}  {failed}{copied}", clip.file);
             if !clip.problems.is_empty() {
                 out += &format!("  <- {}", clip.problems.join("; "));
             }
@@ -278,8 +372,14 @@ impl CorpusReport {
         let bad = self.clips.iter().filter(|c| !c.problems.is_empty()).count();
         out += &if self.pass {
             format!("PASS: all {} clips behave\n", self.clips.len())
-        } else {
+        } else if bad > 0 {
             format!("FAIL: {bad} of {} clips misbehave\n", self.clips.len())
+        } else {
+            format!(
+                "INCOMPLETE: {} clips behave, {} missing\n",
+                self.clips.len(),
+                self.missing.len()
+            )
         };
         out
     }

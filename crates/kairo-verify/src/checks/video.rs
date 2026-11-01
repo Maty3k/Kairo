@@ -474,6 +474,7 @@ pub(crate) fn no_reorder(ctx: &Ctx<'_>) -> Outcome {
     outcome.require(reorder.unwrap_or(0) == 0, || {
         format!("max_num_reorder_frames {}", reorder.unwrap_or(0))
     });
+    outcome.value = json!({"ctts_nonzero": nonzero, "max_num_reorder_frames": reorder});
     let Some(scan) = scan_or_fail(ctx, &mut outcome) else {
         return outcome;
     };
@@ -507,6 +508,8 @@ pub(crate) fn no_reorder(ctx: &Ctx<'_>) -> Outcome {
             regression.unwrap_or(0)
         )
     });
+    outcome.value = json!({"ctts_nonzero": nonzero, "max_num_reorder_frames": reorder,
+                           "b_samples": b.len(), "poc_regression_at": regression});
     let poc_type = ctx.sps.as_ref().map(|s| s.poc_type);
     if poc_type == Some(1) {
         outcome.detail = "no reordering (POC type 1 not followed)".to_owned();

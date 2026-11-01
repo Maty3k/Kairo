@@ -65,8 +65,11 @@ pub struct Manifest {
     pub encoder: String,
     /// The FFmpeg that built it, from the first line of `ffmpeg -version`.
     pub ffmpeg: String,
-    /// Steps applied to every clip after its encode, such as a bitstream filter; none so far.
+    /// Steps applied to every encode, such as README §7.2's `h264_metadata` colour fix.
     pub finishing: Vec<String>,
+    /// AMF's adapter: the index asked for and the vendor:device FFmpeg reported using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<Adapter>,
     /// Per check, a limit the corpus sets for itself.
     pub calibration: BTreeMap<String, Calibration>,
     /// The clips, in the order they are judged.
@@ -74,6 +77,16 @@ pub struct Manifest {
     /// Clips this encoder couldn't make, and why.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<Missing>,
+}
+
+/// The adapter an AMF corpus was encoded on (README §7.2): never assumed, always read back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Adapter {
+    /// The DXGI index the builder asked for (`--hw-index`).
+    pub index: u32,
+    /// The vendor:device FFmpeg's log names, e.g. `1002:7550`.
+    pub device: String,
 }
 
 /// A limit a corpus sets for itself.
@@ -112,9 +125,20 @@ pub struct Entry {
     /// What `av.offset` must read on every track it measures, ± [`AV_TOLERANCE_MS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub av_offset_ms: Option<f64>,
+    /// What `cadence.drops_dups` must count: [skipped, repeated] testbed frames (`drop1` and
+    /// `dup1`), so the two can't stand in for each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skips_repeats: Option<[u64; 2]>,
     /// The encoder that made it, where it isn't the corpus's (`bframes` on `h264_mf`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder: Option<String>,
+    /// The clip's size, as built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Its FNV-1a 64 hash, as built, in hex: a clip edited, swapped or copied over since is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fnv1a64: Option<String>,
 }
 
 impl Entry {
@@ -438,9 +462,117 @@ impl Recipe {
                 }
             )
             .then_some(50.0),
+            skips_repeats: match self.make {
+                Make::Mux {
+                    video: Video::Defect(Defect::Drop(_)),
+                    ..
+                } => Some([1, 0]),
+                Make::Mux {
+                    video: Video::Defect(Defect::Dup(_)),
+                    ..
+                } => Some([0, 1]),
+                _ => None,
+            },
             encoder: None,
+            bytes: None,
+            fnv1a64: None,
         }
     }
+
+    /// Whether it is the B-frames clip, which the PC may fill from the Mac's corpus.
+    pub fn is_bframes(&self) -> bool {
+        matches!(
+            self.make,
+            Make::Mux {
+                video: Video::Bframes,
+                ..
+            }
+        )
+    }
+}
+
+/// The FNV-1a 64 hash of what `reader` holds, in hex.
+pub fn fnv1a64(reader: &mut dyn std::io::Read) -> std::io::Result<String> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let n = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        for &byte in &buffer[..n] {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+/// The clips `manifest` must hold for its encoder, each with its recipe's entry: every recipe
+/// exactly once, nothing else, and each entry's rules as this build's recipe gives them, so a
+/// corpus with a clip left out, added or loosened, or built by another version, isn't judged as
+/// complete. Only `bframes` on the PC may be missing instead. A manifest entry's `encoder` and
+/// its size and hash are taken from it; everything else from the recipe.
+pub fn expected(manifest: &Manifest) -> Result<(Encoder, Vec<Entry>), String> {
+    let encoder: Encoder = manifest
+        .encoder
+        .parse()
+        .map_err(|_| "an unknown encoder".to_owned())?;
+    if manifest.pattern != 1 {
+        return Err(format!(
+            "pattern {}; this build makes pattern 1",
+            manifest.pattern
+        ));
+    }
+    let wanted = recipes(encoder);
+    for entry in &manifest.clips {
+        if !wanted.iter().any(|r| r.file() == entry.file) {
+            return Err(format!("{}: not a clip of this corpus", entry.file));
+        }
+    }
+    let mut out = Vec::new();
+    for recipe in &wanted {
+        let file = recipe.file();
+        let listed: Vec<&Entry> = manifest.clips.iter().filter(|e| e.file == file).collect();
+        let missing = manifest.missing.iter().any(|m| m.file == file);
+        let mut want = recipe.entry(encoder);
+        match listed.as_slice() {
+            [] if missing && recipe.is_bframes() && encoder.calibrates() => {
+                // The Mac's VideoToolbox clip stands in (README §7.3).
+                want.encoder = Some(Encoder::VideoToolbox.to_string());
+                want.may_fail = recipes(Encoder::VideoToolbox)
+                    .iter()
+                    .find(|r| r.is_bframes())
+                    .map(|r| r.entry(Encoder::VideoToolbox).may_fail)
+                    .unwrap_or_default();
+            }
+            [] => return Err(format!("{file}: missing from the manifest")),
+            [entry] => {
+                let mut rules = (*entry).clone();
+                rules.encoder = want.encoder.clone();
+                rules.bytes = None;
+                rules.fnv1a64 = None;
+                if rules != want {
+                    return Err(format!(
+                        "{file}: its manifest entry isn't this build's recipe; rebuild the corpus"
+                    ));
+                }
+                let made_by_mf = entry.encoder.as_deref() == Some("h264_mf")
+                    && recipe.is_bframes()
+                    && encoder == Encoder::Amf;
+                if entry.encoder.is_some() && !made_by_mf {
+                    return Err(format!("{file}: made by another encoder"));
+                }
+                want.encoder = entry.encoder.clone();
+                want.bytes = entry.bytes;
+                want.fnv1a64 = entry.fnv1a64.clone();
+            }
+            _ => return Err(format!("{file}: listed twice")),
+        }
+        out.push(want);
+    }
+    Ok((encoder, out))
 }
 
 /// Every clip `encoder`'s corpus holds, good ones first: README §7.1's good clips, §7.3's gate
@@ -523,12 +655,16 @@ pub struct Judged {
     pub failed: Vec<&'static str>,
     /// What breaks §7.4's rules; empty when the clip behaves.
     pub problems: Vec<String>,
+    /// Whether it was copied in from another corpus (the PC's `bframes` from the Mac's).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub copied_in: bool,
 }
 
 /// Judges one clip's findings against its entry (README §7.4): a good clip passes; a bad clip
 /// fails every `must_fail` check and nothing outside `must_fail ∪ may_fail`; no check is left
 /// unable to run; the first frame is held [`HOLD_TICKS`] at [`TIMESCALE`]; and `av50` reads
-/// +50 ± 1 ms on every track it measures.
+/// +50 ± 1 ms on every track it measures; and `drop1` and `dup1` count exactly their one skip or
+/// repeat.
 pub fn judge(entry: &Entry, verdict: Verdict, checks: &[Finding]) -> Judged {
     let failed: Vec<&'static str> = checks
         .iter()
@@ -591,11 +727,26 @@ pub fn judge(entry: &Entry, verdict: Verdict, checks: &[Finding]) -> Judged {
             }
         }
     }
+    if let Some([skips, repeats]) = entry.skips_repeats {
+        let counts = value("cadence.drops_dups").map(|v| {
+            (
+                v.get("skipped").and_then(Value::as_u64),
+                v.get("repeats").and_then(Value::as_u64),
+            )
+        });
+        if counts != Some((Some(skips), Some(repeats))) {
+            let (got_skips, got_repeats) = counts.unwrap_or_default();
+            problems.push(format!(
+                "cadence.drops_dups counts {got_skips:?} skipped and {got_repeats:?} repeated; want {skips} and {repeats}"
+            ));
+        }
+    }
     Judged {
         file: entry.file.clone(),
         verdict,
         failed,
         problems,
+        copied_in: false,
     }
 }
 

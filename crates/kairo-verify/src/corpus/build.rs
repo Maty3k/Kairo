@@ -9,9 +9,12 @@
 //! names relative to it, so its logs, in `logs/`, name no other folder (CLAUDE.md). Hardware
 //! encoder sessions run one at a time, at least 1.5 s apart (M1:94). An FFmpeg run fails the
 //! build if it exits with an error or leaves an option unused, or if its log lacks the encoder,
-//! the BT.709 limited output or, for AMF, the d3d11va device lines. `bframes` falls back from AMF
-//! to Media Foundation, and is listed as missing if neither makes B-frames. The video-only files
-//! and the WAVs go at the end, and `manifest.json` is written last.
+//! the BT.709 limited output or, for AMF, the adapter it was given (never assumed: the log must
+//! name the vendor:device FFmpeg opened, and it goes in the manifest). `bframes` falls back from
+//! AMF to Media Foundation, and if neither makes B-frames it is listed as missing, its expect file
+//! written for the Mac's clip to be copied in. FFmpeg is checked before the folder is made; the
+//! video-only files and WAVs go at the end, or when a step fails; `manifest.json`, with every
+//! clip's size and hash, is written last.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,11 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use super::{
-    CALIBRATED, Calibration, Encoder, GOOD, LINES_FLOOR_CODES, MANIFEST, Make, Manifest, Missing,
-    Recipe, VERSION, Video, recipes,
+    Adapter, CALIBRATED, Calibration, Encoder, GOOD, LINES_FLOOR_CODES, MANIFEST, Make, Manifest,
+    Missing, Recipe, VERSION, Video, fnv1a64, recipes,
 };
-use crate::checks::Status;
 use crate::profile::{Plan, Profile};
 use crate::synth::{AudioTrack, Defect, Synth};
 
@@ -38,6 +42,11 @@ const SETPARAMS: [&str; 2] = [
     "-vf",
     "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
 ];
+
+/// README §7.2's colour fix for an encoder whose VUI lacks BT.709 limited (`--finishing
+/// h264_metadata`): an LGPL bitstream filter, applied to every encode and recorded in the
+/// manifest's `finishing`.
+pub const H264_METADATA: &str = "h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1";
 
 /// What FFmpeg prints for an option no stream used (EXP-8: a warning, exit 0).
 const UNUSED: &str = "has not been used for any stream";
@@ -79,8 +88,12 @@ pub struct Build<'a> {
     pub encoder: Encoder,
     /// The FFmpeg to spawn.
     pub ffmpeg: &'a Path,
-    /// AMF's adapter: `-init_hw_device d3d11va=kd:N`.
+    /// AMF's adapter: `-init_hw_device d3d11va=kd:N`. Required for AMF.
     pub hw_index: Option<u32>,
+    /// The vendor:device AMF's log must name, as the harness resolves it from the LUID.
+    pub hw_device: Option<&'a str>,
+    /// Whether to apply [`H264_METADATA`] to every encode.
+    pub finishing: bool,
     /// The corpus folder, which must not exist yet.
     pub out: &'a Path,
 }
@@ -92,6 +105,7 @@ pub fn encode_args(
     video: Video,
     synth: &Synth,
     hw_index: Option<u32>,
+    finishing: bool,
 ) -> Vec<String> {
     let level = if encoder == Encoder::Amf {
         "debug"
@@ -190,6 +204,9 @@ pub fn encode_args(
             );
         }
         Encoder::Mf => {
+            // h264_mf has no named profiles, so High is its number, 100; without it, Media
+            // Foundation encodes Baseline, which can't carry B-frames. `-hw_encoding 1` takes
+            // the first hardware MFT, whose adapter FFmpeg doesn't name [Unverified on the PC].
             push(&mut args, &SETPARAMS);
             push(
                 &mut args,
@@ -198,6 +215,8 @@ pub fn encode_args(
                     "nv12",
                     "-c:v",
                     "h264_mf",
+                    "-hw_encoding",
+                    "1",
                     "-b:v",
                     rate,
                     "-maxrate",
@@ -207,7 +226,7 @@ pub fn encode_args(
                     "-bf",
                     bf,
                     "-profile:v",
-                    "high",
+                    "100",
                 ],
             );
         }
@@ -246,6 +265,9 @@ pub fn encode_args(
                 "tv",
             ],
         ),
+    }
+    if finishing {
+        push(&mut args, &["-bsf:v", H264_METADATA]);
     }
     push(
         &mut args,
@@ -326,10 +348,31 @@ pub fn mux_args(recipe: &Recipe, video: Video, audio: Option<Defect>) -> Vec<Str
     args
 }
 
+/// The vendor:device of the d3d11va adapter FFmpeg opened, from its `Using device vvvv:dddd (…)`
+/// line (hwcontext_d3d11va.c), lowercase. The encoder's own `Using device kd (type d3d11va)`
+/// line doesn't match: only four hex digits, a colon and four more do.
+pub fn adapter_device(log: &str) -> Option<String> {
+    log.match_indices("Using device ").find_map(|(at, word)| {
+        let rest = log.get(at + word.len()..)?;
+        let pair = rest.get(..9)?;
+        let hex = |s: &str| s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit());
+        let (vendor, device) = pair.split_once(':')?;
+        (hex(vendor) && hex(device) && rest.get(9..11) == Some(" ("))
+            .then(|| pair.to_ascii_lowercase())
+    })
+}
+
 /// What's wrong with an encoder session's log (README §7.2): an option no stream used, no
-/// mapping to the encoder, an output that isn't BT.709 limited, and for AMF the device lines and
-/// the adapter.
-pub fn encode_log_problems(encoder: Encoder, log: &str, hw_index: Option<u32>) -> Vec<String> {
+/// mapping to the encoder, an output that isn't BT.709 limited, and for AMF the device lines, the
+/// adapter asked for and the vendor:device FFmpeg opened, which must be `hw_device` when given.
+/// FFmpeg names the index before it looks the adapter up, and falls back to the default one
+/// without naming a vendor:device if the index doesn't exist.
+pub fn encode_log_problems(
+    encoder: Encoder,
+    log: &str,
+    hw_index: Option<u32>,
+    hw_device: Option<&str>,
+) -> Vec<String> {
     let mut problems = Vec::new();
     if log.contains(UNUSED) {
         problems.push("an option no stream used".to_owned());
@@ -357,17 +400,29 @@ pub fn encode_log_problems(encoder: Encoder, log: &str, hw_index: Option<u32>) -
         problems.push(format!("the output's video isn't \"{pixels}\""));
     }
     if encoder == Encoder::Amf {
-        let mut lines = vec![
-            "Using device kd (type d3d11va) with h264_amf encoder.".to_owned(),
-            "AMF via D3D11.".to_owned(),
-        ];
-        if let Some(n) = hw_index {
-            lines.push(format!("Selecting d3d11va adapter {n}"));
-        }
-        for line in lines {
-            if !log.contains(&line) {
+        for line in [
+            "Using device kd (type d3d11va) with h264_amf encoder.",
+            "AMF via D3D11.",
+        ] {
+            if !log.contains(line) {
                 problems.push(format!("no \"{line}\""));
             }
+        }
+        match hw_index {
+            Some(n) if !log.contains(&format!("Selecting d3d11va adapter {n}")) => {
+                problems.push(format!("no \"Selecting d3d11va adapter {n}\""));
+            }
+            Some(_) => {}
+            None => problems.push("no adapter asked for (--hw-index)".to_owned()),
+        }
+        match (adapter_device(log), hw_device) {
+            (None, _) => problems.push(
+                "no \"Using device vvvv:dddd\": the adapter wasn't found, and FFmpeg fell back to the default one".to_owned(),
+            ),
+            (Some(found), Some(want)) if !found.eq_ignore_ascii_case(want) => {
+                problems.push(format!("the adapter is {found}, not {want}"));
+            }
+            _ => {}
         }
     }
     problems
@@ -403,6 +458,26 @@ pub fn version(first_line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether a video-only file's pictures are reordered: `video.no_reorder`'s count of non-zero
+/// `ctts` entries or B-slice samples, not just its verdict, which a VUI field alone can fail.
+fn holds_b_frames(report: &crate::Report) -> bool {
+    let value = report
+        .checks
+        .iter()
+        .find(|f| f.id == "video.no_reorder")
+        .map(|f| &f.value);
+    let count = |key: &str| value.and_then(|v| v.get(key)).and_then(Value::as_u64);
+    count("ctts_nonzero").unwrap_or(0) > 0 || count("b_samples").unwrap_or(0) > 0
+}
+
+/// What a build has made so far that goes if a step fails: the intermediates and the output of
+/// the step under way. Clips already finished, their expect files and the logs stay.
+#[derive(Default)]
+struct Made {
+    intermediates: Vec<String>,
+    current: Option<String>,
+}
+
 impl Build<'_> {
     /// The FFmpeg to spawn: a relative path with a folder in it is taken from the caller's
     /// folder, not the corpus folder FFmpeg runs in; a bare name is looked up on the `PATH`.
@@ -422,13 +497,55 @@ impl Build<'_> {
                 message: "the --out folder exists already; corpus build makes a new one".to_owned(),
             });
         }
+        let parent = self
+            .out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if !parent.is_dir() {
+            return Err(BuildError::write(
+                "the --out folder",
+                "the folder it goes in doesn't exist",
+            ));
+        }
+        if self.encoder == Encoder::Amf && self.hw_index.is_none() {
+            return Err(BuildError {
+                code: 2,
+                message: "h264_amf needs --hw-index N: the adapter is chosen, never assumed"
+                    .to_owned(),
+            });
+        }
+        // FFmpeg, and the filter `--finishing` names, before anything is made.
+        let ffmpeg = self.ffmpeg_version()?;
+        if self.finishing {
+            self.has_h264_metadata()?;
+        }
         fs::create_dir(self.out).map_err(|e| BuildError::write("the --out folder", e))?;
         fs::create_dir(self.out.join("logs")).map_err(|e| BuildError::write("logs", e))?;
-        let ffmpeg = self.ffmpeg_version()?;
         say(&format!(
             "corpus build: {} with FFmpeg {ffmpeg}",
             self.encoder
         ));
+        let mut made = Made::default();
+        let result = self.make(ffmpeg, &mut made, say);
+        // The intermediates go either way; on a failure, so does the step's own output.
+        let leftovers = made
+            .intermediates
+            .iter()
+            .chain(made.current.iter().filter(|_| result.is_err()));
+        for name in leftovers {
+            let _ = fs::remove_file(self.out.join(name));
+        }
+        result
+    }
+
+    /// Every clip, its expect file and the manifest.
+    fn make(
+        &self,
+        ffmpeg: String,
+        made: &mut Made,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<Manifest, BuildError> {
         let started = Instant::now();
         let recipes = recipes(self.encoder);
         let mut last_session: Option<Instant> = None;
@@ -443,7 +560,9 @@ impl Build<'_> {
         }
         let mut made_by: BTreeMap<String, Encoder> = BTreeMap::new();
         let mut missing: Vec<Missing> = Vec::new();
+        let mut adapter = None;
         for &video in &videos {
+            made.intermediates.push(video.file());
             if video == Video::Bframes {
                 match self.bframes(&mut last_session, say)? {
                     Ok(encoder) => {
@@ -460,7 +579,8 @@ impl Build<'_> {
                 }
                 continue;
             }
-            self.encode(video, self.encoder, &mut last_session, say)?;
+            let device = self.encode(video, self.encoder, &mut last_session, say)?;
+            adapter = adapter.or(device);
         }
         // Each set of WAVs once.
         let mut audios: Vec<Option<Defect>> = Vec::new();
@@ -472,20 +592,25 @@ impl Build<'_> {
             }
         }
         for &audio in &audios {
+            for track in AudioTrack::ALL {
+                made.intermediates.push(wav_name(audio, track));
+            }
             self.write_wavs(audio)?;
         }
         let mut entries = Vec::new();
         for recipe in &recipes {
+            // A clip no encoder could make still gets its expect file, for the Mac's clip.
+            self.write_expect(recipe)?;
+            let skipped = recipe.is_bframes() && !made_by.contains_key(&Video::Bframes.name());
+            if skipped {
+                continue;
+            }
+            made.current = Some(recipe.file());
             match &recipe.make {
-                Make::Mux { video, audio } => {
-                    if *video == Video::Bframes && !made_by.contains_key(&video.name()) {
-                        continue;
-                    }
-                    self.mux(recipe, *video, *audio, say)?;
-                }
+                Make::Mux { video, audio } => self.mux(recipe, *video, *audio, say)?,
                 Make::Mutate(op) => self.mutate(recipe, op, say)?,
             }
-            self.write_expect(recipe)?;
+            made.current = None;
             let mut entry = recipe.entry(self.encoder);
             if let Make::Mux { video, .. } = recipe.make
                 && let Some(&encoder) = made_by.get(&video.name())
@@ -493,21 +618,24 @@ impl Build<'_> {
             {
                 entry.encoder = Some(encoder.to_string());
             }
+            let mut clip = File::open(self.out.join(recipe.file()))
+                .map_err(|e| BuildError::step(format!("{}: {e}", recipe.file())))?;
+            let bytes = clip
+                .metadata()
+                .map_err(|e| BuildError::step(format!("{}: {e}", recipe.file())))?
+                .len();
+            entry.bytes = Some(bytes);
+            entry.fnv1a64 = Some(
+                fnv1a64(&mut clip)
+                    .map_err(|e| BuildError::step(format!("{}: {e}", recipe.file())))?,
+            );
             entries.push(entry);
-        }
-        // The intermediates go; the clips, expect files and logs stay.
-        for &video in &videos {
-            let _ = fs::remove_file(self.out.join(video.file()));
-        }
-        for &audio in &audios {
-            for track in AudioTrack::ALL {
-                let _ = fs::remove_file(self.out.join(wav_name(audio, track)));
-            }
         }
         let calibration = if self.encoder.calibrates() {
             Calibration {
                 limit_codes: None,
-                source: "max(4, 2 x worst good clip), set by corpus check (README §7.4)".to_owned(),
+                source: "max(4, 2 x worst good clip), set by corpus check into corpus-report.json (README §7.4)"
+                    .to_owned(),
             }
         } else {
             Calibration {
@@ -520,7 +648,15 @@ impl Build<'_> {
             pattern: 1,
             encoder: self.encoder.to_string(),
             ffmpeg,
-            finishing: Vec::new(),
+            finishing: if self.finishing {
+                vec![format!("-bsf:v {H264_METADATA}")]
+            } else {
+                Vec::new()
+            },
+            adapter: self
+                .hw_index
+                .zip(adapter)
+                .map(|(index, device)| Adapter { index, device }),
             calibration: [(CALIBRATED.to_owned(), calibration)].into(),
             clips: entries,
             missing,
@@ -553,6 +689,24 @@ impl Build<'_> {
             .ok_or_else(|| BuildError::step("FFmpeg's -version gave no version".to_owned()))
     }
 
+    /// Refuses `--finishing` with an FFmpeg that lacks the `h264_metadata` filter.
+    fn has_h264_metadata(&self) -> Result<(), BuildError> {
+        let output = Command::new(self.program())
+            .args(["-hide_banner", "-h", "bsf=h264_metadata"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| BuildError::step(format!("FFmpeg didn't start: {e}")))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && text.contains("h264_metadata") {
+            Ok(())
+        } else {
+            Err(BuildError::step(
+                "this FFmpeg has no h264_metadata filter for --finishing".to_owned(),
+            ))
+        }
+    }
+
     /// Waits until a hardware encoder's last session ended at least [`SPACING`] ago.
     fn space(&self, last_session: &Option<Instant>) {
         if let Some(last) = last_session.filter(|_| self.encoder.is_hardware()) {
@@ -563,14 +717,15 @@ impl Build<'_> {
         }
     }
 
-    /// One encoder session: `video`'s frames from `synth` into FFmpeg with `encoder`.
+    /// One encoder session: `video`'s frames from `synth` into FFmpeg with `encoder`. Returns
+    /// the vendor:device an AMF session opened.
     fn encode(
         &self,
         video: Video,
         encoder: Encoder,
         last_session: &mut Option<Instant>,
         say: &mut dyn FnMut(&str),
-    ) -> Result<(), BuildError> {
+    ) -> Result<Option<String>, BuildError> {
         let synth = self.encoder.synth(video);
         let log_name = format!("logs/{}-{encoder}.log", video.name());
         let log = File::create_new(self.out.join(&log_name))
@@ -579,7 +734,13 @@ impl Build<'_> {
         let started = Instant::now();
         let mut child = Command::new(self.program())
             .current_dir(self.out)
-            .args(encode_args(encoder, video, &synth, self.hw_index))
+            .args(encode_args(
+                encoder,
+                video,
+                &synth,
+                self.hw_index,
+                self.finishing,
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(log)
@@ -604,7 +765,7 @@ impl Build<'_> {
         let text = fs::read(self.out.join(&log_name))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .map_err(|e| BuildError::step(format!("{log_name}: {e}")))?;
-        let problems = encode_log_problems(encoder, &text, self.hw_index);
+        let problems = encode_log_problems(encoder, &text, self.hw_index, self.hw_device);
         if !problems.is_empty() {
             return Err(BuildError::step(format!(
                 "{}: {}; see {log_name}",
@@ -618,7 +779,9 @@ impl Build<'_> {
             synth.frames(),
             started.elapsed().as_secs_f64()
         ));
-        Ok(())
+        Ok((encoder == Encoder::Amf)
+            .then(|| adapter_device(&text))
+            .flatten())
     }
 
     /// The `bframes` video: AMF, then Media Foundation on the PC, each kept only if it holds
@@ -636,8 +799,8 @@ impl Build<'_> {
         for encoder in chain {
             let file = self.out.join(Video::Bframes.file());
             match self.encode(Video::Bframes, encoder, last_session, say) {
-                Ok(()) if self.reorders(&file)? => return Ok(Ok(encoder)),
-                Ok(()) => why.push(format!("{encoder} made no B-frames")),
+                Ok(_) if self.reorders(&file)? => return Ok(Ok(encoder)),
+                Ok(_) => why.push(format!("{encoder} made no B-frames")),
                 Err(error) if error.code == 3 => why.push(error.message),
                 Err(error) => return Err(error),
             }
@@ -646,23 +809,21 @@ impl Build<'_> {
         let fallback = if self.encoder == Encoder::VideoToolbox {
             ""
         } else {
-            "; copy the Mac's VideoToolbox clip in (README §7.3)"
+            "; copy the Mac's VideoToolbox bframes.mp4 in (README §7.3)"
         };
         Ok(Err(format!("{}{fallback}", why.join("; "))))
     }
 
-    /// Whether a video-only file reorders its pictures: `video.no_reorder` fails on it.
+    /// Whether a video-only file holds B-frames.
     fn reorders(&self, path: &Path) -> Result<bool, BuildError> {
         let name = Video::Bframes.file();
         let mut file = File::open(path).map_err(|e| BuildError::step(format!("{name}: {e}")))?;
         let expect = self.encoder.synth(Video::Good).expect(false);
         let plan = Plan::new(Profile::Test, false, Some(expect))
             .map_err(|e| BuildError::step(format!("{name}: {e}")))?;
-        let report = crate::check_with(&mut file, &name, &plan, None);
-        Ok(report
-            .checks
-            .iter()
-            .any(|f| f.id == "video.no_reorder" && f.status == Status::Fail))
+        Ok(holds_b_frames(&crate::check_with(
+            &mut file, &name, &plan, None,
+        )))
     }
 
     /// The four WAVs of `audio`: the good clip's tracks with this audio defect, if any.

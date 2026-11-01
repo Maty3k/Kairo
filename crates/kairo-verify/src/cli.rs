@@ -46,7 +46,9 @@ pub const USAGE: &str =
                           [--codec nv12|ipcm [--gop N]] [--wav-dir DIR] --expect FILE
                           (frames on stdout; mix, game, mic and voice.wav in DIR)
        kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm
-                                 --ffmpeg PATH [--hw-index N] --out DIR
+                                 --ffmpeg PATH [--hw-index N [--hw-device VVVV:DDDD]]
+                                 [--finishing h264_metadata] --out DIR
+                          (h264_amf needs --hw-index)
        kairo-verify corpus check DIR --ffmpeg PATH
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
@@ -105,6 +107,8 @@ enum Command {
         encoder: Encoder,
         ffmpeg: PathBuf,
         hw_index: Option<u32>,
+        hw_device: Option<String>,
+        finishing: bool,
         out: PathBuf,
     },
     CorpusCheck {
@@ -474,6 +478,7 @@ fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
         return Err(usage());
     };
     let (mut encoder, mut ffmpeg, mut hw_index, mut out, mut dir) = (None, None, None, None, None);
+    let (mut hw_device, mut finishing) = (None, false);
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         let flag = word.to_str().unwrap_or_default();
@@ -501,6 +506,24 @@ fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
                 )?);
             }
             "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--hw-device" => {
+                let pair = value("--hw-device")?.to_str().unwrap_or_default();
+                let hex = |s: &str| s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit());
+                match pair.split_once(':') {
+                    Some((vendor, device)) if hex(vendor) && hex(device) => {
+                        hw_device = Some(pair.to_ascii_lowercase());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "--hw-device takes the adapter's vendor:device, four hex digits each\n{USAGE}"
+                        ));
+                    }
+                }
+            }
+            "--finishing" => match value("--finishing")?.to_str() {
+                Some("h264_metadata") => finishing = true,
+                _ => return Err(format!("--finishing takes h264_metadata\n{USAGE}")),
+            },
             "--ffprobe" => {
                 return Err(
                     "--ffprobe, the PC's cross-check of the parser, comes with research 16's PR 9"
@@ -527,18 +550,29 @@ fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
             let ffmpeg =
                 ffmpeg.ok_or_else(|| format!("corpus build needs --ffmpeg PATH\n{USAGE}"))?;
             let out = out.ok_or_else(|| format!("corpus build needs --out DIR\n{USAGE}"))?;
-            if hw_index.is_some() && encoder != Encoder::Amf {
-                return Err(format!("--hw-index goes with --encoder h264_amf\n{USAGE}"));
+            if (hw_index.is_some() || hw_device.is_some()) != (encoder == Encoder::Amf)
+                || hw_device.is_some() && hw_index.is_none()
+            {
+                return Err(format!(
+                    "--encoder h264_amf needs --hw-index N (and may add --hw-device), which no other encoder takes: the adapter is chosen, never assumed\n{USAGE}"
+                ));
             }
             Ok(Command::CorpusBuild {
                 encoder,
                 ffmpeg,
                 hw_index,
+                hw_device,
+                finishing,
                 out,
             })
         }
         Some("check") => {
-            if encoder.is_some() || hw_index.is_some() || out.is_some() {
+            if encoder.is_some()
+                || hw_index.is_some()
+                || out.is_some()
+                || hw_device.is_some()
+                || finishing
+            {
                 return Err(format!(
                     "corpus check takes the corpus folder and --ffmpeg PATH\n{USAGE}"
                 ));
@@ -556,21 +590,27 @@ fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
     }
 }
 
+/// `corpus build`'s settings from the command line.
+#[cfg(feature = "dev-tools")]
+struct CorpusBuild<'a> {
+    encoder: Encoder,
+    ffmpeg: &'a Path,
+    hw_index: Option<u32>,
+    hw_device: Option<&'a str>,
+    finishing: bool,
+    folder: &'a Path,
+}
+
 /// `corpus build`: the clips, telling `out` each step.
 #[cfg(feature = "dev-tools")]
-fn corpus_build(
-    encoder: Encoder,
-    ffmpeg: &Path,
-    hw_index: Option<u32>,
-    folder: &Path,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> u8 {
+fn corpus_build(settings: CorpusBuild<'_>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let build = crate::corpus::build::Build {
-        encoder,
-        ffmpeg,
-        hw_index,
-        out: folder,
+        encoder: settings.encoder,
+        ffmpeg: settings.ffmpeg,
+        hw_index: settings.hw_index,
+        hw_device: settings.hw_device,
+        finishing: settings.finishing,
+        out: settings.folder,
     };
     match build.run(&mut |line| {
         let _ = writeln!(out, "{line}");
@@ -1087,8 +1127,21 @@ pub fn run_with(
             encoder,
             ffmpeg,
             hw_index,
+            hw_device,
+            finishing,
             out: folder,
-        }) => corpus_build(encoder, &ffmpeg, hw_index, &folder, out, err),
+        }) => corpus_build(
+            CorpusBuild {
+                encoder,
+                ffmpeg: &ffmpeg,
+                hw_index,
+                hw_device: hw_device.as_deref(),
+                finishing,
+                folder: &folder,
+            },
+            out,
+            err,
+        ),
         #[cfg(feature = "dev-tools")]
         Ok(Command::CorpusCheck { dir, ffmpeg }) => corpus_check(&dir, &ffmpeg, out, err),
         Ok(command) => check(command, out, err),
@@ -1227,6 +1280,21 @@ mod tests {
                 encoder: Encoder::Amf,
                 ffmpeg: PathBuf::from("f"),
                 hw_index: Some(1),
+                hw_device: None,
+                finishing: false,
+                out: PathBuf::from("c"),
+            })
+        );
+        assert_eq!(
+            parse_args(&args(
+                "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
+            )),
+            Ok(Command::CorpusBuild {
+                encoder: Encoder::Amf,
+                ffmpeg: PathBuf::from("f"),
+                hw_index: Some(0),
+                hw_device: Some("1002:7550".to_owned()),
+                finishing: true,
                 out: PathBuf::from("c"),
             })
         );
@@ -1335,6 +1403,11 @@ mod tests {
             "corpus build --encoder ipcm --out c",
             "corpus build --encoder ipcm --ffmpeg f --out c d",
             "corpus build --encoder h264_videotoolbox --ffmpeg f --hw-index 1 --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --hw-device 1002:7550 --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --hw-device 1002 --out c",
+            "corpus build --encoder ipcm --ffmpeg f --finishing x --out c",
+            "corpus check c --ffmpeg f --finishing h264_metadata",
             "corpus check c",
             "corpus check --ffmpeg f",
             "corpus check c --ffmpeg f --encoder ipcm",

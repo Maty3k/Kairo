@@ -459,8 +459,9 @@ kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds
       [--hdr natural|match --lw NITS --sdr-white NITS] [--codec nv12|ipcm [--gop N]] [--wav-dir DIR] --expect FILE
       (frames on stdout; without --wav-dir the expect file lists no tracks, for video-only clips)
 kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr|set-default TRACK|perturb-stts S D  IN OUT
-kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm --ffmpeg PATH [--hw-index N] --out DIR
-kairo-verify corpus check DIR [--ffprobe PATH]
+kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm --ffmpeg PATH
+      [--hw-index N [--hw-device VVVV:DDDD]] [--finishing h264_metadata] --out DIR    (h264_amf needs --hw-index)
+kairo-verify corpus check DIR --ffmpeg PATH    (the linked decoder comes with PR 6; --ffprobe with PR 9)
 kairo-verify boxes <clip.mp4>      (box tree; file name and `ilst` keys only; replaces prototypes/scripts/mp4boxes.py)
 ```
 
@@ -680,6 +681,7 @@ ffmpeg -hide_banner -nostdin -loglevel verbose -y -i v-good-1080p60.mp4
 |---|---|---|
 | **PC** (AMF, NV12 in system memory on the LUID device; CL:31) | `-f rawvideo -pix_fmt nv12 -video_size 1920x1080 -framerate 60 -i pipe:0` | `SETPARAMS -pix_fmt nv12 -c:v h264_amf -usage transcoding -quality balanced -rc vbr_peak -b:v 25M -maxrate 40M -bufsize 40M -g 60 -vbaq 1 -preanalysis 0 -high_motion_quality_boost_enable 0 -preencode 0 -bf 0 -max_b_frames 0 -frame_skipping 0 -filler_data 0 -coder cabac -profile:v high -header_spacing 60 -async_depth 4` (PLAN:166, CB:483–488, R13:802) |
 | **Mac** (stand-in) | as PC | `SETPARAMS -c:v h264_videotoolbox -b:v 25M -maxrate 40M -g 60 -bf 0 -profile:v high` |
+| **PC fallback** (`h264_mf`, for `bframes`) | as PC | `SETPARAMS -pix_fmt nv12 -c:v h264_mf -hw_encoding 1 -b:v 25M -maxrate 40M -g 60 -bf 2 -profile:v 100`. `h264_mf` has no named profiles, so High is its number (PR 5's review: `high` stops FFmpeg before the encode); without it Media Foundation encodes Baseline, which can't carry B-frames. The hardware MFT's adapter isn't named [Unverified on the PC] |
 | **CI** (lossless, `--codec ipcm`) | `-f h264 -r 60 -i pipe:0`. `-r` as an input option makes the CLI count frames. With only the raw demuxer's `-framerate 60` (its default is 25 fps), FFmpeg 8.0.1's CLI times the packets in whole microseconds, so 96 of 240 samples last 20,001 ticks of 1.2 MHz and `video.cfr` fails; with `-r 60` every sample lasts 256 ticks at T = 15,360 [Mac] | `-c:v copy -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv`. A stream copy can't filter, but colour options on a copy do write `colr` [Mac] |
 
 - **The I_PCM writer** (about 300 lines on top of the parser tests' bit writer) produces 480×270 (coded 480×272 with SPS cropping), 60 fps, 4 s clips.
@@ -691,10 +693,10 @@ ffmpeg -hide_banner -nostdin -loglevel verbose -y -i v-good-1080p60.mp4
 - **The resulting file** (P8, as in Kairo's saves): video sample 1 lasts 584 ticks (256 + 328), so E = 328, an audio lead of 1,024. No `elst`. A/V exact [Mac]. `corpus check` asserts E = 328 at T = 15,360 for every clip except `bframes`.
 - **Spacing and log checks.** On the PC the builder runs one encode at a time, ≥1.5 s apart (M1:94). An encode fails on `has not been used for any stream`, and unless its log shows:
   - `Using device kd (type d3d11va) with h264_amf encoder.` (ffmpeg_enc.c `hw_device_setup_for_encode`) and `AMF via D3D11.` (hwcontext_amf.c:760);
-  - `Selecting d3d11va adapter` / `Using device vvvv:dddd` matching the LUID's adapter (hwcontext_d3d11va.c:660, :673);
+  - `Selecting d3d11va adapter N` and `Using device vvvv:dddd (…)` (hwcontext_d3d11va.c:660, :673). FFmpeg prints the first before it looks the index up, and without the second it fell back to the default adapter, so both are required, `--hw-index` is required with `h264_amf`, `--hw-device` (from the harness's LUID lookup, §8.3) names the pair the log must show, and the manifest records the index and pair it got (PR 5's review);
   - the mapping line `-> h264 (h264_amf)` and, under `Output #0`, a video stream line containing `nv12(tv, bt709` (line shapes checked on 8.0.1 [Mac]).
 - **B-frame warnings.** `h264_amf` runs its B-frame capability block whenever `-bf` or `-max_b_frames` is set, 0 included, and warns on a GPU without H.264 B-frames or when `GetCaps` fails (amfenc_h264.c:476–526). Those warnings are fatal only for the `bframes` clip, where they trigger the `h264_mf` fallback; for `bf=0` encodes C7 on the output decides.
-- **AMF's VUI colour [Unverified].** `colr` 1/1/1/0 is certain: movenc writes it from the stream's colour fields (movenc.c:2944–2952), which the CLI copies from the `setparams` frames (ffmpeg_enc.c:265–270). The VUI is the unknown, since `h264_amf` only passes the properties on (amfenc_h264.c:277–296). If the PC corpus fails C4's colour rule, the builder adds the LGPL bitstream filter `-bsf:v h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1` (after checking `ffmpeg -h bsf=h264_metadata`), records it in the manifest's `finishing`, adds it to the §8.4 capture command, and notes for M3 that the engine needs the same fix.
+- **AMF's VUI colour [Unverified].** `colr` 1/1/1/0 is certain: movenc writes it from the stream's colour fields (movenc.c:2944–2952), which the CLI copies from the `setparams` frames (ffmpeg_enc.c:265–270). The VUI is the unknown, since `h264_amf` only passes the properties on (amfenc_h264.c:277–296). If the PC corpus fails C4's colour rule, it is rebuilt with `corpus build --finishing h264_metadata`: the builder adds the LGPL bitstream filter `-bsf:v h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1` (after checking `ffmpeg -h bsf=h264_metadata`), records it in the manifest's `finishing`, adds it to the §8.4 capture command, and notes for M3 that the engine needs the same fix.
 
 ### 7.3 Bad clips: one defect each (M1:26, M1:188)
 
@@ -745,7 +747,8 @@ Structure checks without a real-file extra are covered by the in-code builder (�
   - every bad clip fails all of its `must_fail` checks;
   - no clip fails anything outside `must_fail ∪ may_fail`;
   - every clip except `bframes` has E = 328, and `av50` measures +50 ± 1 ms.
-- **PC calibration** (risk 10). The builder checks the good clips first, sets the PC corpus's line-error limit to max(4, 2 × their worst line error), records it in `calibration`, and only then judges the bad clips. The Mac and CI corpora keep 4 codes.
+- **PC calibration** (risk 10). `corpus check` checks the good clips first, sets the PC corpus's line-error limit to max(4, 2 × their worst line error), checks them again under it if it moved, and only then judges the bad clips; the limit goes into `corpus-report.json`'s `lines`, while the manifest's `calibration` keeps `null` for a PC corpus. The Mac and CI corpora keep 4 codes.
+- **What is judged** (PR 5's review). The rules come from the build's recipes, not the manifest: the manifest must list every recipe's clip once with the recipe's rules, and each clip must have the size and FNV-1a hash the build recorded, so a clip left out, loosened, swapped or edited is refused (exit 3). `drop1` must count one skip and `dup1` one repeat. A PC corpus whose `bframes` no encoder could make is incomplete (exit 1) until the Mac's clip is copied in, which is then judged by the Mac's rules.
 - **Gate-1 evidence**, one line each in the gate report (M1:209):
   1. **Mac corpus** (VideoToolbox): formal (M1:119).
   2. **PC corpus** (`h264_amf`): run in the first attended AMF session (M1:130). It also gives the AMF SPS fields, which the bit writer rebuilds as a parser test vector so no PC bytes are committed (M1:74, M1:195), plus the clean AMF PSNR floor and line error.
