@@ -3,8 +3,9 @@
 //! architecture.md §2.3).
 //!
 //! A [`Decoder`] hands each picture to a callback as borrowed 8-bit 4:2:0 planes, so nothing is
-//! copied per frame. Timing never comes from a decoder: the checks take every picture's time
-//! from Kairo's own sample tables, and `decode.clean` compares the counts. The backends:
+//! copied per frame, and each audio track as f32 chunks at its own channel count. Timing never
+//! comes from a decoder: the checks take every picture's and sample's time from Kairo's own
+//! sample tables, and `decode.clean` compares the counts. The backends:
 //! [`synthetic::Synthetic`] renders pattern v1 straight from `kairo_core::testsig` (tests and
 //! `synth`); [`cli::Cli`] (feature `dev-tools`) spawns an FFmpeg it is given and reads raw
 //! frames from its pipe; the linked backend comes with research 16's PR 6.
@@ -220,6 +221,22 @@ pub trait Decoder {
         &mut self,
         each: &mut dyn FnMut(usize, &Planes<'_>) -> ControlFlow<()>,
     ) -> Result<DecodeStats, DecodeError>;
+
+    /// Decodes audio track `track` (the clip's audio tracks counted from 0 in file order, as
+    /// FFmpeg's `0:a:N`), handing its samples to `each` in chunks: f32, interleaved at
+    /// `channels`, from the first decoded sample, AAC priming included. `each` may stop it. The
+    /// stats count sample frames. A decoder without audio says so.
+    fn audio(
+        &mut self,
+        track: usize,
+        channels: usize,
+        each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
+    ) -> Result<DecodeStats, DecodeError> {
+        let _ = (track, channels, each);
+        Err(DecodeError::Unsupported(
+            "this decoder has no audio".to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]

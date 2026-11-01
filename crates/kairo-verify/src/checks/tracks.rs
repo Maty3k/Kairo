@@ -79,6 +79,12 @@ pub(crate) fn start_alignment(ctx: &Ctx<'_>) -> Outcome {
     outcome
 }
 
+/// A track's title: its `udta/name`, else its `hdlr` name.
+pub(crate) fn title(track: &Track) -> Option<&str> {
+    let (hdlr, udta) = titles(track);
+    udta.or(hdlr)
+}
+
 /// The title of a track, as `hdlr` and `udta/name` give it.
 fn titles(track: &Track) -> (Option<&str>, Option<&str>) {
     (

@@ -7,8 +7,9 @@
 //! It runs, in the clip's folder so that FFmpeg's messages name the file only:
 //! `ffmpeg -v warning -nostdin -protocol_whitelist file,pipe -err_detect
 //! +crccheck+bitstream+buffer -ignore_editlist 1 -c:v h264 -i file:<file name> -map 0:v:0
-//! -fps_mode passthrough -pix_fmt yuv420p -f yuv4mpegpipe -`. YUV4MPEG2 states the picture size
-//! in its header, and its frames are packed yuv420p. No filter runs: it only decodes. Any line
+//! -fps_mode passthrough -pix_fmt yuv420p -f yuv4mpegpipe -`, and for audio track N `… -c:a aac
+//! -i file:<file name> -map 0:a:N -f f32le -` at the track's own channel count. YUV4MPEG2 states
+//! the picture size in its header, and its frames are packed yuv420p. No filter runs: it only decodes. Any line
 //! FFmpeg prints counts as a decode error, warnings included: FFmpeg reports a frame it had to
 //! conceal (the flags the linked backend reads) only as the warning `corrupt decoded frame`.
 //! A relative `--ffmpeg` path is taken from the caller's folder, not the clip's.
@@ -26,6 +27,9 @@ const MAX_LINE: u64 = 1_024;
 
 /// The largest picture accepted: 16,384 px a side, as pattern v1 allows.
 const MAX_SIDE: usize = 16_384;
+
+/// Sample frames handed over at a time.
+const AUDIO_CHUNK: usize = 4_096;
 
 /// The YUV4MPEG2 chroma tags of 8-bit 4:2:0.
 const CHROMA_420: [&str; 4] = ["420", "420jpeg", "420mpeg2", "420paldv"];
@@ -249,6 +253,62 @@ impl Decoder for Cli {
             read_y4m(reader, each)
         })
     }
+
+    fn audio(
+        &mut self,
+        track: usize,
+        channels: usize,
+        each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
+    ) -> Result<DecodeStats, DecodeError> {
+        let map = format!("0:a:{track}");
+        let output = ["-map", map.as_str(), "-f", "f32le", "-"];
+        self.run(["-c:a", "aac"], &output, &mut |reader| {
+            read_f32(reader, channels, each)
+        })
+    }
+}
+
+/// Hands little-endian f32 samples, interleaved at `channels`, to `each` in chunks of whole
+/// frames; returns the frames read and whether `each` stopped early.
+fn read_f32(
+    reader: &mut impl Read,
+    channels: usize,
+    each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
+) -> Result<(usize, bool), DecodeError> {
+    let frame = 4 * channels.max(1);
+    let mut bytes = vec![0_u8; AUDIO_CHUNK * frame];
+    let mut samples = Vec::with_capacity(AUDIO_CHUNK * channels.max(1));
+    let (mut filled, mut frames) = (0, 0);
+    loop {
+        let n = match reader.read(&mut bytes[filled..]) {
+            Ok(n) => n,
+            // A signal during the read: read again, as read_exact does for the pictures.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(DecodeError::Read(e.to_string())),
+        };
+        filled += n;
+        let whole = filled / frame * frame;
+        if whole > 0 && (n == 0 || filled == bytes.len()) {
+            samples.clear();
+            let (words, _) = bytes[..whole].as_chunks::<4>();
+            samples.extend(words.iter().map(|&w| f32::from_le_bytes(w)));
+            frames += whole / frame;
+            bytes.copy_within(whole..filled, 0);
+            filled -= whole;
+            if each(&samples).is_break() {
+                return Ok((frames, true));
+            }
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    if filled > 0 {
+        return Err(DecodeError::Read(
+            "the audio ends in the middle of a sample frame".to_owned(),
+        ));
+    }
+    Ok((frames, false))
 }
 
 /// Reads one line, up to and without its newline, or `None` at the end of the stream.
@@ -487,9 +547,45 @@ while true; do printf 'FRAME\n\020\020\020\020\020\020\020\020\200\200\200\200' 
     }
 
     #[test]
+    fn reads_raw_f32_audio_in_whole_frames() {
+        // 10,000 stereo frames: L = i, R = -i.
+        let bytes: Vec<u8> = (0..10_000)
+            .flat_map(|i| [i as f32, -(i as f32)])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let mut seen = Vec::new();
+        let mut chunks = 0;
+        let (frames, stopped) = read_f32(&mut &bytes[..], 2, &mut |chunk| {
+            chunks += 1;
+            seen.extend_from_slice(chunk);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((frames, stopped, chunks), (10_000, false, 3));
+        assert_eq!(seen.len(), 20_000);
+        assert_eq!((seen[9_998], seen[9_999]), (4_999.0, -4_999.0));
+        // The callback may stop it; a cut frame is an error; nothing is no frames.
+        let (frames, stopped) =
+            read_f32(&mut &bytes[..], 2, &mut |_| ControlFlow::Break(())).unwrap();
+        assert_eq!((frames, stopped), (4_096, true));
+        assert!(
+            read_f32(&mut &bytes[..bytes.len() - 2], 2, &mut |_| {
+                ControlFlow::Continue(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            read_f32(&mut &b""[..], 1, &mut |_| ControlFlow::Continue(())).unwrap(),
+            (0, false)
+        );
+    }
+
+    #[test]
     fn a_missing_ffmpeg_fails_to_start() {
         let mut cli = Cli::new("/nonexistent/ffmpeg", "clip.mp4");
         let result = cli.video(&mut |_, _| ControlFlow::Continue(()));
+        assert!(matches!(result, Err(DecodeError::Start(_))), "{result:?}");
+        let result = cli.audio(0, 2, &mut |_| ControlFlow::Continue(()));
         assert!(matches!(result, Err(DecodeError::Start(_))), "{result:?}");
     }
 }

@@ -4,6 +4,7 @@
 //! the profile's [`Mode`] then decides whether the clip fails. `container.structure` gates the
 //! rest: when it fails, they report `skip`.
 
+mod audio;
 mod container;
 mod content;
 mod export;
@@ -26,6 +27,23 @@ use crate::report::{Summary, Verdict};
 pub(crate) use container::structure_problems;
 pub use content::Decoded;
 pub(crate) use content::decode;
+
+/// Each audio track's channel count, as its sample entry gives it (at least 1), and its packet
+/// count, in file order.
+pub(crate) fn audio_tracks(clip: &Clip) -> Vec<(usize, usize)> {
+    clip.movie
+        .iter()
+        .flat_map(|m| &m.tracks)
+        .filter(|t| t.handler().is_some_and(|h| h.0 == *b"soun"))
+        .map(|t| {
+            let channels = match t.entries.first() {
+                Some(SampleEntry::Audio { channels, .. }) => usize::from(*channels).max(1),
+                _ => 1,
+            };
+            (channels, t.sizes.len())
+        })
+        .collect()
+}
 
 /// How many violations a finding lists; the count covers the rest.
 pub const MAX_EVENTS: usize = 100;

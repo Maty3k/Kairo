@@ -187,6 +187,30 @@ pub const COLOUR_MATRIX_MARGIN_DB: f64 = 6.0;
 pub const BARS_LINES_MAX_CODES: f64 = 4.0;
 /// `content.levels` and `hdr.curve_levels`: ±2 codes (SP3, PLAN:430).
 pub const LEVELS_TOLERANCE: f64 = 2.0;
+/// `av.offset`: every beep within this many ms of its picture (PLAN:351).
+pub const AV_MAX_MS: f64 = 40.0;
+/// `av.offset_tight`: the median and the worst beep, in ms (M3 task 9, CB:1193).
+pub const AV_TIGHT_MS: (f64, f64) = (10.0, 21.3);
+/// `av.inter_track`: one beep on two tracks at most this many ms apart, proposed (README §6.3).
+pub const AV_INTER_TRACK_MS: f64 = 0.5;
+/// `audio.tone_snr`: a beep's power over its residual, proposed (signals.md §3.5).
+pub const TONE_SNR_MIN_DB: f64 = 35.0;
+/// `audio.tone_snr`: a beep's frequency within this many Hz of its tone's.
+pub const TONE_HZ_TOLERANCE: f64 = 1.0;
+/// `audio.routing`: present at this level or more in this share of the windows, absent at this
+/// level or less in every one; a leak between, all proposed (README §2 item 16).
+pub const ROUTING_PRESENT_DB: f64 = -60.0;
+pub const ROUTING_PRESENT_SHARE: f64 = 0.9;
+pub const ROUTING_ABSENT_DB: f64 = -70.0;
+/// `audio.cue`: present at this NCC and level or more, possible from the second NCC,
+/// proposed (README §6.3).
+pub const CUE_PRESENT_NCC: f64 = 0.5;
+pub const CUE_POSSIBLE_NCC: f64 = 0.2;
+pub const CUE_MIN_DB: f64 = -70.0;
+/// How much of each audio track is decoded and judged, in seconds: 10 minutes of (L+R)/2 is
+/// 115 MB a track, about 0.6 GB for a clip with five, held while its audio is judged; longer
+/// clips are judged on their start (M13's hour-long files need streaming).
+pub const AUDIO_MAX_SECONDS: u64 = 600;
 /// The AAC lead the cut gives a clip, in samples: one priming packet plus up to one more
 /// (PLAN:179, cookbook P8, core/cut.rs).
 pub const LEAD_SAMPLES: (u64, u64) = (1024, 2047);
@@ -384,6 +408,12 @@ pub struct Plan {
     pub content: Content,
     /// The expect file, if one was given.
     pub expect: Option<Expect>,
+    /// `--av-tight`: `av.offset_tight` is required, not a warning.
+    pub av_tight: bool,
+    /// `--voice-included`: an export's single track should carry the voice tone.
+    pub voice_included: bool,
+    /// `--cue`: Kairo's cue at 48 kHz, (L+R)/2; testsig's placeholder when `None`.
+    pub cue: Option<Vec<f32>>,
 }
 
 /// Why a profile, gate and expect file don't fit together.
@@ -441,6 +471,9 @@ impl Plan {
             length: Length::Any,
             content,
             expect: None,
+            av_tight: false,
+            voice_included: false,
+            cue: None,
         };
         match (profile, expect.as_ref()) {
             (Profile::Test, Some(e)) => {
@@ -501,6 +534,10 @@ impl Plan {
 
     /// How a content check counts, `--gate m3` included.
     pub fn content_mode(&self, id: &str) -> Mode {
+        // --av-tight makes M3 task 9's pair a requirement, under --gate m3 too (README §6.5).
+        if id == "av.offset_tight" && self.av_tight && self.profile == Profile::Engine {
+            return Mode::Required;
+        }
         let mode = content_mode(self.profile, id, self.expect.as_ref());
         if self.gate_m3 && mode == Mode::Required && !GATE_M3_CHECKS.contains(&id) {
             Mode::Warning

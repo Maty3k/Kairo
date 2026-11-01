@@ -31,6 +31,7 @@ use crate::{Clip, boxes};
 #[cfg(feature = "dev-tools")]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
+                    [--cue FILE.wav] [--av-tight] [--voice-included]
                     [--decoder none|cli] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
@@ -41,8 +42,8 @@ pub const USAGE: &str =
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
 defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable
-The cli decoder (--ffmpeg PATH) decodes for the content checks; the audio checks and the linked
-decoder come with research 16's next PRs.";
+The cli decoder (--ffmpeg PATH) decodes for the content checks; the linked decoder comes with
+research 16's PR 6.";
 
 /// The usage text.
 #[cfg(not(feature = "dev-tools"))]
@@ -75,6 +76,9 @@ enum Command {
         ffmpeg: Option<PathBuf>,
         json: Option<Output>,
         summary: Option<Output>,
+        cue: Option<PathBuf>,
+        av_tight: bool,
+        voice_included: bool,
     },
     Boxes(PathBuf),
     Mutate {
@@ -114,23 +118,14 @@ fn safe_word(word: &str) -> bool {
 }
 
 /// Options README §6.1 documents that this build doesn't take yet, with what brings them.
-const LATER_OPTIONS: [(&str, &str); 5] = [
+const LATER_OPTIONS: [(&str, &str); 2] = [
     (
         "--testbed-log",
-        "source.stability and the testbed log (research 16's PR 8)",
+        "source.stability and the testbed and tone logs (research 16's PR 8)",
     ),
     (
         "--voice-log",
-        "the audio and A/V checks (research 16's PR 5)",
-    ),
-    ("--cue", "the audio and A/V checks (research 16's PR 5)"),
-    (
-        "--av-tight",
-        "the audio and A/V checks (research 16's PR 5)",
-    ),
-    (
-        "--voice-included",
-        "the audio and A/V checks (research 16's PR 5)",
+        "source.stability and the testbed and tone logs (research 16's PR 8)",
     ),
 ];
 
@@ -162,6 +157,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut chosen: Option<bool> = None;
     let mut json = None;
     let mut summary = None;
+    let mut cue = None;
+    let mut av_tight = false;
+    let mut voice_included = false;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         let flag = word.to_str().unwrap_or_default();
@@ -200,6 +198,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
                 ffmpeg = Some(PathBuf::from(value("--ffmpeg")?));
             }
             "--json" => json = Some(output(value("--json")?)),
+            "--cue" => cue = Some(PathBuf::from(value("--cue")?)),
+            "--av-tight" => av_tight = true,
+            "--voice-included" => voice_included = true,
             "--summary" => summary = Some(output(value("--summary")?)),
             _ if let Some((_, with)) = LATER_OPTIONS.iter().find(|(f, _)| *f == flag) => {
                 return Err(format!(
@@ -225,6 +226,17 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         return Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}"));
     }
     let profile = profile.ok_or_else(|| format!("check needs --profile\n{USAGE}"))?;
+    // Flags that would do nothing under this profile are refused, not ignored.
+    if av_tight && profile != Profile::Engine {
+        return Err(format!(
+            "--av-tight goes with --profile engine (M3 task 9)\n{USAGE}"
+        ));
+    }
+    if voice_included && !profile.is_share_export() {
+        return Err(format!(
+            "--voice-included goes with a share export's profile: share, discord, whatsapp or reels\n{USAGE}"
+        ));
+    }
     if json == Some(Output::Stdout) && summary == Some(Output::Stdout) {
         return Err("--json - and --summary - can't both use stdout".to_owned());
     }
@@ -236,6 +248,9 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         ffmpeg: ffmpeg.filter(|_| cli_decoder),
         json,
         summary,
+        cue,
+        av_tight,
+        voice_included,
     })
 }
 
@@ -443,6 +458,9 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         ffmpeg,
         json,
         summary,
+        cue,
+        av_tight,
+        voice_included,
     } = command
     else {
         return 4;
@@ -467,13 +485,25 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             }
         },
     };
-    let plan = match Plan::new(profile, gate_m3, expect) {
+    let mut plan = match Plan::new(profile, gate_m3, expect) {
         Ok(plan) => plan,
         Err(error) => {
             say(err, &error.to_string());
             return 2;
         }
     };
+    plan.av_tight = av_tight;
+    plan.voice_included = voice_included;
+    if let Some(path) = cue {
+        let name = file_name(&path).unwrap_or("the cue file");
+        match read_cue(&path) {
+            Ok(samples) => plan.cue = Some(samples),
+            Err(error) => {
+                say(err, &format!("{name}: {error}"));
+                return 2;
+            }
+        }
+    }
     let mut decoder = make_decoder(ffmpeg, &clip);
     let report = match File::open(&clip) {
         Ok(mut file) => crate::check_with(
@@ -503,6 +533,24 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         }
     }
     report.verdict.exit_code()
+}
+
+/// `--cue`'s PCM as (L+R)/2: a 48 kHz WAV of at most 5 s.
+fn read_cue(path: &Path) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let wav = crate::wav::read(&bytes)?;
+    if wav.rate != 48_000 || !(1..=2).contains(&wav.channels) {
+        return Err(format!(
+            "{} Hz, {} channels; the cue must be 48 kHz mono or stereo",
+            wav.rate, wav.channels
+        ));
+    }
+    let mut mono = Vec::new();
+    crate::analyze::audio::downmix(&wav.samples, usize::from(wav.channels), &mut mono);
+    if mono.is_empty() || mono.len() > 5 * 48_000 {
+        return Err("the cue must last between one sample and 5 s".to_owned());
+    }
+    Ok(mono)
 }
 
 /// The decoder `--ffmpeg` asks for.
@@ -769,8 +817,27 @@ mod tests {
                 ffmpeg: None,
                 json: Some(Output::Stdout),
                 summary: Some(Output::File(PathBuf::from("s.txt"))),
+                cue: None,
+                av_tight: false,
+                voice_included: false,
             })
         );
+        assert!(matches!(
+            parse_args(&args("check a.mp4 --profile engine --cue c.wav --av-tight")),
+            Ok(Command::Check {
+                cue: Some(_),
+                av_tight: true,
+                voice_included: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_args(&args("check a.mp4 --profile discord --voice-included")),
+            Ok(Command::Check {
+                voice_included: true,
+                ..
+            })
+        ));
         let mutate = |line: &str, op: Op| {
             assert_eq!(
                 parse_args(&args(line)),
@@ -882,6 +949,8 @@ mod tests {
             "check a.mp4 b.mp4 --profile engine",
             "check a.mp4 --profile engine --frobnicate",
             "check a.mp4 --profile",
+            "check a.mp4 --profile test --av-tight",
+            "check a.mp4 --profile engine --voice-included",
             "boxes",
             "boxes a b",
             "mutate",

@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The content checks this build runs on decoded pictures (docs/research/16-verify-testbed/
-//! README.md §6.3, §6.5): `decode.clean` for the video, `content.barcode`,
-//! `cadence.drops_dups`, `cadence.judder`, `content.flash`, `content.bars`,
-//! `content.colour_matrix`, `content.bars_lines`, `content.levels` and `hdr.curve_levels`. Audio
-//! comes with research 16's next PR; until then a profile that needs it ends in `error`.
+//! The content checks on decoded pictures and audio (docs/research/16-verify-testbed/README.md
+//! §6.3, §6.5): `decode.clean`, `content.barcode`, `cadence.drops_dups`, `cadence.judder`,
+//! `content.flash`, `content.bars`, `content.colour_matrix`, `content.bars_lines`,
+//! `content.levels`, `hdr.curve_levels`, and the audio checks of [`super::audio`].
+//! `source.stability`, which reads the testbed log, comes with research 16's PR 8.
 //!
-//! Every picture's time comes from Kairo's sample tables, never from the decoder.
+//! Every picture's and sample's time comes from Kairo's sample tables, never from the decoder.
 
 use std::ops::ControlFlow;
 
 use serde_json::json;
 
-use super::{Ctx, Finding, Outcome, Status, skipped, weigh};
+use super::{Ctx, Finding, Outcome, Status, audio, skipped, weigh};
 use crate::analyze::bars::{self, BandSums, Bands, FrameBars};
 use crate::analyze::cadence::{self, Counts, Event};
 use crate::analyze::flash::{self, Flashes};
@@ -42,6 +42,19 @@ pub struct Decoded {
     bands: Option<Bands>,
     /// Each picture's whole patches, measured when its barcode read.
     patches: Vec<Vec<Patch>>,
+    /// Each audio track as decoded, in file order.
+    pub audio: Vec<DecodedAudio>,
+}
+
+/// One audio track as decoded.
+#[derive(Debug, Clone)]
+pub struct DecodedAudio {
+    /// Its (L+R)/2 at 48 kHz, at most [`profile::AUDIO_MAX_SECONDS`].
+    pub samples: Vec<f32>,
+    /// How its decode went, in sample frames.
+    pub stats: Result<DecodeStats, DecodeError>,
+    /// Whether it was cut at [`profile::AUDIO_MAX_SECONDS`].
+    pub truncated: bool,
 }
 
 /// How many unreadable pictures' band sums may wait for the barcode line. A picture is scored as
@@ -50,7 +63,7 @@ pub struct Decoded {
 const PENDING_MAX: usize = 120;
 
 /// The checks this build runs.
-pub(crate) const RUNS: [&str; 10] = [
+pub(crate) const RUNS: [&str; 16] = [
     "decode.clean",
     "content.barcode",
     "cadence.drops_dups",
@@ -61,6 +74,22 @@ pub(crate) const RUNS: [&str; 10] = [
     "content.bars_lines",
     "content.levels",
     "hdr.curve_levels",
+    "av.offset",
+    "av.offset_tight",
+    "av.inter_track",
+    "audio.tone_snr",
+    "audio.routing",
+    "audio.cue",
+];
+
+/// The audio checks.
+const AUDIO_CHECKS: [&str; 6] = [
+    "av.offset",
+    "av.offset_tight",
+    "av.inter_track",
+    "audio.tone_snr",
+    "audio.routing",
+    "audio.cue",
 ];
 
 /// What the readings add up to.
@@ -86,6 +115,8 @@ struct Analysis {
     p99_step_error_hns: Option<f64>,
     /// Each picture's bars, the unreadable ones scored against their likely frame numbers.
     bars: Vec<Option<FrameBars>>,
+    /// Each picture's presentation time, in media ticks.
+    pts: Vec<i64>,
 }
 
 /// How far the line's testbed rate may exceed the expect file's `source_hz`: a timer-paced
@@ -112,8 +143,25 @@ fn expected_patches(plan: &Plan) -> Expected {
 }
 
 /// Runs `decoder` over the clip's video: each picture's barcodes and flash, and, once its frame
-/// number is known, its bars and patches. Nothing but these numbers is kept (README §6.7).
-pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan) -> Decoded {
+/// number is known, its bars and patches. Nothing but these numbers is kept (README §6.7). Then
+/// each audio track, `audio` giving their channel and packet counts in file order: its (L+R)/2,
+/// up to [`profile::AUDIO_MAX_SECONDS`].
+pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan, audio: &[(usize, usize)]) -> Decoded {
+    decode_capped(
+        decoder,
+        plan,
+        audio,
+        (profile::AUDIO_MAX_SECONDS * 48_000) as usize,
+    )
+}
+
+/// [`decode`], keeping at most `cap` sample frames of each audio track.
+fn decode_capped(
+    decoder: &mut dyn Decoder,
+    plan: &Plan,
+    audio: &[(usize, usize)],
+    cap: usize,
+) -> Decoded {
     let expected = expected_patches(plan);
     let mut decoded = Decoded {
         kind: decoder.kind(),
@@ -125,6 +173,7 @@ pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan) -> Decoded {
         pending_dropped: 0,
         bands: None,
         patches: Vec::new(),
+        audio: Vec::new(),
     };
     let mut geometry: Option<(usize, usize, Option<Geometry>)> = None;
     let mut previous: Option<i64> = None;
@@ -195,6 +244,26 @@ pub(crate) fn decode(decoder: &mut dyn Decoder, plan: &Plan) -> Decoded {
         ControlFlow::Continue(())
     });
     decoded.stats = stats;
+    for (track, &(channels, packets)) in audio.iter().enumerate() {
+        // AAC gives 1,024 sample frames a packet: room for exactly those, so a 10-minute track
+        // holds 115 MB, not the 134 MB a doubling vector would reach.
+        let mut samples = Vec::with_capacity(cap.min(packets.saturating_mul(1_024)));
+        let mut truncated = false;
+        let stats = decoder.audio(track, channels, &mut |chunk| {
+            analyze::audio::downmix(chunk, channels, &mut samples);
+            if samples.len() >= cap {
+                samples.truncate(cap);
+                truncated = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        decoded.audio.push(DecodedAudio {
+            samples,
+            stats,
+            truncated,
+        });
+    }
     decoded
 }
 
@@ -335,6 +404,7 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         numbers,
         line,
         bars: frame_bars,
+        pts,
         source_fps,
         too_fast,
         refresh,
@@ -383,6 +453,14 @@ pub(crate) fn findings(
         .take(profile::PATTERN_PROBE_FRAMES)
         .any(|r| r.code.is_some());
     let analysis = analyse(ctx, decoded);
+    // The audio checks judge every track or none: one that didn't decode would read as silence
+    // and fail routes it never got to show (README §6.6: a decoder that can't, exit 3).
+    let audio_failed = decoded.audio.iter().enumerate().find_map(|(i, a)| {
+        let error = a.stats.as_ref().err()?;
+        Some(format!("audio track {} didn't decode: {error}", i + 1))
+    });
+    // The audio analysis, made when the first audio check runs: `Some(None)` without audio.
+    let mut sound: Option<Option<audio::Audio<'_>>> = None;
     let mut out = Vec::with_capacity(profile::CONTENT_CHECKS.len());
     for id in profile::CONTENT_CHECKS {
         let mode = plan.content_mode(id);
@@ -417,7 +495,7 @@ pub(crate) fn findings(
             continue;
         }
         if id == "decode.clean" {
-            out.push(weigh(id, decode_clean(ctx, &decoded.stats), mode));
+            out.push(weigh(id, decode_clean(ctx, decoded), mode));
             continue;
         }
         if started.is_none() {
@@ -440,23 +518,106 @@ pub(crate) fn findings(
             continue;
         }
         let hdr = plan.expect.as_ref().is_some_and(|e| e.hdr.is_some());
-        let outcome = match id {
-            "content.barcode" => barcode(plan, &decoded.readings),
-            "cadence.drops_dups" => drops_dups(plan, &analysis),
-            "cadence.judder" => judder(plan, &analysis),
-            "content.flash" => flash(&analysis),
-            "content.bars" => bars_psnr(plan, decoded, &analysis),
-            "content.colour_matrix" => colour_matrix(decoded, &analysis),
-            "content.bars_lines" => bars_lines(decoded, &analysis),
-            "content.levels" if hdr => {
-                Outcome::skip("the patches are HDR: hdr.curve_levels judges them")
-            }
-            "content.levels" | "hdr.curve_levels" => patch_levels(decoded, hdr),
-            _ => Outcome::skip("unknown check"),
+        if let Some(why) = audio_failed.as_ref().filter(|_| AUDIO_CHECKS.contains(&id)) {
+            out.push(weigh(id, Outcome::cannot(why.clone()), mode));
+            continue;
+        }
+        if AUDIO_CHECKS.contains(&id) && sound.is_none() {
+            sound = Some(audio_analysis(ctx, plan, decoded, &analysis));
+        }
+        let outcome = match (id, sound.as_ref()) {
+            (_, Some(None)) if AUDIO_CHECKS.contains(&id) => Outcome::skip("no audio track"),
+            ("av.offset", Some(Some(a))) => audio::av_offset(a),
+            ("av.offset_tight", Some(Some(a))) => audio::av_offset_tight(a),
+            ("av.inter_track", Some(Some(a))) => audio::av_inter_track(a),
+            ("audio.tone_snr", Some(Some(a))) => audio::tone_snr(a, plan),
+            ("audio.routing", Some(Some(a))) => audio::routing(a),
+            ("audio.cue", Some(Some(a))) => audio::cue(a),
+            _ => video_check(id, plan, decoded, &analysis, hdr),
         };
         out.push(weigh(id, outcome, mode));
     }
     out
+}
+
+/// A video content check.
+fn video_check(
+    id: &str,
+    plan: &Plan,
+    decoded: &Decoded,
+    analysis: &Analysis,
+    hdr: bool,
+) -> Outcome {
+    match id {
+        "content.barcode" => barcode(plan, &decoded.readings),
+        "cadence.drops_dups" => drops_dups(plan, analysis),
+        "cadence.judder" => judder(plan, analysis),
+        "content.flash" => flash(analysis),
+        "content.bars" => bars_psnr(plan, decoded, analysis),
+        "content.colour_matrix" => colour_matrix(decoded, analysis),
+        "content.bars_lines" => bars_lines(decoded, analysis),
+        "content.levels" if hdr => {
+            Outcome::skip("the patches are HDR: hdr.curve_levels judges them")
+        }
+        "content.levels" | "hdr.curve_levels" => patch_levels(decoded, hdr),
+        _ => Outcome::skip("unknown check"),
+    }
+}
+
+/// The audio tracks with what each should carry, measured against the flashes; `None` for a
+/// clip without audio.
+fn audio_analysis<'d>(
+    ctx: &Ctx<'_>,
+    plan: &Plan,
+    decoded: &'d Decoded,
+    analysis: &Analysis,
+) -> Option<audio::Audio<'d>> {
+    let titles: Vec<String> = ctx
+        .audio()
+        .map(|(_, t)| super::tracks::title(t).unwrap_or_default().to_owned())
+        .collect();
+    if titles.is_empty() {
+        return None;
+    }
+    let has_voice = titles.iter().any(|t| t == "Voice chat");
+    let tracks = titles
+        .into_iter()
+        .enumerate()
+        .map(|(i, title)| audio::Track {
+            expected: audio::Expected::of(plan, i, &title, has_voice),
+            title,
+            samples: decoded
+                .audio
+                .get(i)
+                .map_or(&[][..], |a| a.samples.as_slice()),
+            truncated: decoded.audio.get(i).is_some_and(|a| a.truncated),
+        })
+        .collect();
+    let flash_fps = analysis
+        .flashes
+        .as_ref()
+        .map(|(f, _)| *f)
+        .or(analysis.source_fps);
+    let game = match (&analysis.line, flash_fps) {
+        (Ok(line), Some(f)) => Ok(audio::game_expected(
+            line,
+            &analysis.numbers,
+            &analysis.pts,
+            ctx.timing.timescale,
+            f,
+        )),
+        (Err(reason), _) => Err(format!("no barcode line to time the flashes: {reason}")),
+        (Ok(_), None) => Err("no testbed rate to time the flashes".to_owned()),
+    };
+    let placeholder;
+    let cue = match plan.cue.as_deref() {
+        Some(cue) => cue,
+        None => {
+            placeholder = kairo_core::testsig::cue_placeholder(48_000).unwrap_or_default();
+            &placeholder
+        }
+    };
+    Some(audio::Audio::new(tracks, game, cue))
 }
 
 /// A content check this build can't run yet: an error when it is required and the clip must
@@ -474,42 +635,95 @@ fn not_yet(id: &'static str, mode: Mode, plan: &Plan, shows_pattern: bool) -> Fi
     }
 }
 
-fn decode_clean(ctx: &Ctx<'_>, stats: &Result<DecodeStats, DecodeError>) -> Outcome {
+fn decode_clean(ctx: &Ctx<'_>, decoded: &Decoded) -> Outcome {
     let samples = ctx.samples.len();
+    // A decoder that couldn't start, or can't decode the audio, says nothing about the clip
+    // (README §6.6: exit 3).
+    if let Err(error @ DecodeError::Start(_)) = &decoded.stats {
+        return Outcome {
+            value: json!({"samples": samples}),
+            ..Outcome::cannot(error.to_string())
+        };
+    }
     let mut outcome = Outcome {
-        limit: json!({"errors": 0, "frames": "one per video sample", "audio": "comes with research 16's PR 5", "source": "R09:981"}),
+        limit: json!({"errors": 0, "frames": "one per video sample",
+                      "audio": "1,024 per AAC packet; the last packet's surplus is reported",
+                      "source": "R09:981, README §6.3"}),
         ..Outcome::default()
     };
-    match stats {
-        // The tool couldn't run, which says nothing about the clip (README §6.6: exit 3).
-        Err(error @ DecodeError::Start(_)) => {
-            return Outcome {
-                value: json!({"samples": samples}),
-                ..Outcome::cannot(error.to_string())
-            };
+    let mut audio = Vec::new();
+    // Tracks this decoder can't decode: the clip can't be judged on them, but failures found
+    // elsewhere still fail it.
+    let mut cannot = Vec::new();
+    for (i, ((_, track), decoded)) in ctx.audio().zip(&decoded.audio).enumerate() {
+        let n = i + 1;
+        let packets = track.sizes.len() as u64;
+        let ticks: u64 = track
+            .stts
+            .iter()
+            .map(|&(count, delta)| u64::from(count) * u64::from(delta))
+            .sum();
+        match &decoded.stats {
+            Err(error @ (DecodeError::Start(_) | DecodeError::Unsupported(_))) => {
+                cannot.push(format!("audio track {n}: {error}"));
+            }
+            Err(error) => outcome.fails.push(format!("audio track {n}: {error}")),
+            Ok(stats) => {
+                let want = 1_024 * packets;
+                let got = stats.frames as u64;
+                outcome.require(stats.errors == 0, || {
+                    format!(
+                        "audio track {n}: {} decode errors; the last: {}",
+                        stats.errors,
+                        stats.last_error.as_deref().unwrap_or("?")
+                    )
+                });
+                if !decoded.truncated {
+                    outcome.require(got == want, || {
+                        format!("audio track {n}: {got} samples decoded from {packets} packets")
+                    });
+                }
+                audio.push(json!({"track": n, "samples": got, "packets": packets,
+                                  "surplus": want.saturating_sub(ticks), "truncated": decoded.truncated}));
+            }
         }
+    }
+    match &decoded.stats {
         Err(error) => {
-            outcome.value = json!({"samples": samples});
-            outcome.fails.push(error.to_string());
+            outcome.value = json!({"samples": samples, "audio": audio});
+            outcome.fails.insert(0, error.to_string());
         }
         Ok(stats) => {
-            outcome.value =
-                json!({"frames": stats.frames, "samples": samples, "errors": stats.errors});
-            outcome.require(stats.errors == 0, || {
-                format!(
+            outcome.value = json!({"frames": stats.frames, "samples": samples,
+                                   "errors": stats.errors, "audio": audio});
+            // The pictures' problems first: they name the clip's defect.
+            let mut video = Vec::new();
+            if stats.errors != 0 {
+                video.push(format!(
                     "{} decode errors; the last: {}",
                     stats.errors,
                     stats.last_error.as_deref().unwrap_or("?")
-                )
-            });
-            outcome.require(stats.frames == samples, || {
-                format!(
+                ));
+            }
+            if stats.frames != samples {
+                video.push(format!(
                     "{} pictures decoded from {samples} video samples",
                     stats.frames
-                )
-            });
-            outcome.detail = format!("video: {} of {samples} pictures, no errors", stats.frames);
+                ));
+            }
+            outcome.fails.splice(0..0, video);
+            outcome.detail = format!(
+                "video: {} of {samples} pictures, audio: {} tracks, no errors",
+                stats.frames,
+                audio.len()
+            );
         }
+    }
+    if outcome.fails.is_empty() && !cannot.is_empty() {
+        return Outcome {
+            value: outcome.value,
+            ..Outcome::cannot(cannot.join("; "))
+        };
     }
     outcome
 }
@@ -1008,6 +1222,57 @@ mod tests {
     use crate::expect::Expect;
     use kairo_core::testsig::Barcode;
 
+    /// A decoder with no pictures and `chunks` chunks of 1,024 stereo sample frames per track.
+    struct Chunks(usize);
+
+    impl Decoder for Chunks {
+        fn kind(&self) -> &'static str {
+            "synthetic"
+        }
+
+        fn video(
+            &mut self,
+            _: &mut dyn FnMut(usize, &crate::decode::Planes<'_>) -> ControlFlow<()>,
+        ) -> Result<DecodeStats, DecodeError> {
+            Ok(DecodeStats::default())
+        }
+
+        fn audio(
+            &mut self,
+            _: usize,
+            channels: usize,
+            each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
+        ) -> Result<DecodeStats, DecodeError> {
+            let chunk = vec![0.25_f32; 1_024 * channels];
+            let mut stats = DecodeStats::default();
+            for _ in 0..self.0 {
+                stats.frames += 1_024;
+                if each(&chunk).is_break() {
+                    break;
+                }
+            }
+            Ok(stats)
+        }
+    }
+
+    #[test]
+    fn audio_fills_its_packets_room_and_stops_at_the_cap() {
+        // Review F8: room for exactly 1,024 frames a packet, so no doubling past the cap.
+        let decoded = decode_capped(&mut Chunks(3), &plan(Profile::Test), &[(2, 3)], 10_000);
+        let track = &decoded.audio[0];
+        assert_eq!((track.samples.len(), track.truncated), (3_072, false));
+        assert!(
+            track.samples.capacity() < 4_096,
+            "{}",
+            track.samples.capacity()
+        );
+        assert!(track.samples.iter().all(|&v| v == 0.25));
+        // Cut at the cap: kept up to it and marked, so the checks judge the start only.
+        let decoded = decode_capped(&mut Chunks(8), &plan(Profile::Test), &[(1, 8)], 5_000);
+        let track = &decoded.audio[0];
+        assert_eq!((track.samples.len(), track.truncated), (5_000, true));
+    }
+
     fn plan(profile: Profile) -> Plan {
         let text = r#"{"kairo_expect":1,"pattern":1,"fps":60,"source_hz":180,"seconds":20,
             "tracks":[]}"#;
@@ -1033,6 +1298,7 @@ mod tests {
             flashes: None,
             p99_step_error_hns: None,
             bars: Vec::new(),
+            pts: Vec::new(),
         }
     }
 
