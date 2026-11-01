@@ -25,7 +25,8 @@ use crate::profile::{self, Content, Mode, Plan, Profile};
 pub struct Decoded {
     /// `synthetic`, `cli` or `linked`.
     pub kind: &'static str,
-    /// A spawned decoder's licence, when it says.
+    /// The decoder's FFmpeg licence, when it says: a spawned FFmpeg's, reported only, or the
+    /// linked one's, which `build.lgpl` reads from [`crate::decode::linked_ffmpeg`] instead.
     pub licence: Option<&'static str>,
     /// The decode's outcome.
     pub stats: Result<DecodeStats, DecodeError>,
@@ -474,30 +475,13 @@ pub(crate) fn findings(
             continue;
         }
         if id == "build.lgpl" {
-            // A linked FFmpeg must be LGPL; a spawned one's licence binds nothing (README §2
-            // item 18) and is only reported.
-            let linked = decoded.kind == "linked";
-            let lgpl = decoded.licence.is_some_and(|l| l.starts_with("LGPL"));
-            let detail = match decoded.licence {
-                Some(licence) if linked && lgpl => format!("linked and LGPL ({licence})"),
-                Some(licence) if linked => format!("linked, but {licence}, not LGPL"),
-                Some(licence) => format!(
-                    "spawned, not linked: the {} decoder ({licence})",
-                    decoded.kind
-                ),
-                None => format!("nothing linked: the {} decoder", decoded.kind),
-            };
-            out.push(Finding {
-                status: if linked && !lgpl {
-                    Status::Fail
-                } else {
-                    Status::Pass
-                },
-                detail,
-                value: json!({"linked": linked, "decoder": decoded.kind, "licence": decoded.licence}),
-                limit: json!({"licence": "LGPL", "source": "CLAUDE.md, M1:12"}),
-                ..skipped(id, required, String::new())
-            });
+            let linked = crate::decode::linked_ffmpeg();
+            out.push(super::lgpl_finding(
+                required,
+                linked.as_ref(),
+                Some(decoded.kind),
+                decoded.licence,
+            ));
             continue;
         }
         if !RUNS.contains(&id) {

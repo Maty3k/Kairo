@@ -15,12 +15,12 @@
 
 1. `deny.toml` adds WTFPL as a **per-crate exception** for `ffmpeg-next` and `ffmpeg-sys-next` only. WTFPL stays off the general allow-list, so no other crate gains it.
 2. Both crates are used with default features off: `ffmpeg-next` with `codec` and `format`, `ffmpeg-sys-next` with `avcodec` and `avformat`, plus avutil, which both always bring. Defaults would add avdevice, avfilter, swresample and swscale through feature unification. The engine adds `swresample` when it needs it, in M3.
-3. The FFmpeg DLLs remain LGPL and aren't crates, so cargo-deny can't see them. At run time, `kairo-verify`'s linked decoder refuses to decode unless avutil, avcodec and avformat all report an LGPL licence, and `build.lgpl` fails a clip checked with a non-LGPL linked FFmpeg.
-4. `deny.toml` bans `sysinfo`. A later need to list processes uses Kairo's own `platform` code (Toolhelp snapshots matched by image name, house rule 3), not a crate.
+3. The FFmpeg DLLs remain LGPL and aren't crates, so cargo-deny can't see them. At run time, `kairo-verify` on Windows, which imports avutil, avcodec and avformat whichever decoder runs, refuses to check anything (exit 3) unless all three report an LGPL licence; its linked decoder refuses on its own too. Every report names the libraries' versions and a SHA-256 of their build configuration, and `build.lgpl` records them.
+4. `deny.toml` bans `sysinfo`, the common process-listing crate. Neither cargo-deny nor CI's API scan can tell another such crate by what it does, so any other is refused in review. A later need to list processes uses Kairo's own `platform` code (Toolhelp snapshots matched by image name, house rule 3), not a crate.
 
 ## Consequences
 
 - cargo-deny passes with the FFmpeg crates in the graph, and a new WTFPL dependency still fails it.
-- The licence guard covers what cargo-deny can't: a GPL FFmpeg build swapped in by mistake (Homebrew's, for one) can't be linked unnoticed.
+- The licence guard covers what cargo-deny can't. A GPL or non-free FFmpeg (BtbN's gpl zip, say) in `FFMPEG_DIR` or beside the binary still links and loads, but `kairo-verify` then checks nothing, so the swap can't go unnoticed. The Mac's Homebrew FFmpeg is GPL too; it is only ever spawned, never linked.
 - `ffmpeg-next` calls itself "in maintenance mode" (ADR-0001's consequences). Its `from_path` unwraps on a non-UTF-8 path, so `kairo-verify` refuses one first. Its safe accessors panic on a plane index out of range, so the decoder checks first.
 - A process-listing need costs a small `platform` module instead of a dependency.

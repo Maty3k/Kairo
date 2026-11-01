@@ -61,6 +61,10 @@ pub struct FileInfo {
 pub struct Decoder {
     /// `linked`, `cli`, `synthetic` or `none`.
     pub kind: &'static str,
+    /// The FFmpeg linked into this process (Windows), whichever decoder ran: `libs`,
+    /// `config_sha256` and `license` (README §6.6).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg: Option<crate::decode::LinkedFfmpeg>,
 }
 
 /// One line per part of the clip.

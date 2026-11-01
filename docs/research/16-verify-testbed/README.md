@@ -461,7 +461,7 @@ kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds
 kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr|set-default TRACK|perturb-stts S D  IN OUT
 kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm --ffmpeg PATH
       [--hw-index N [--hw-device VVVV:DDDD]] [--finishing h264_metadata] --out DIR    (h264_amf needs --hw-index)
-kairo-verify corpus check DIR --ffmpeg PATH    (the linked decoder comes with PR 6; --ffprobe with PR 9)
+kairo-verify corpus check DIR [--ffmpeg PATH]    (on Windows without --ffmpeg, the linked decoder; --ffprobe with PR 9)
 kairo-verify boxes <clip.mp4>      (box tree; file name and `ilst` keys only; replaces prototypes/scripts/mp4boxes.py)
 ```
 
@@ -540,7 +540,7 @@ kairo-verify boxes <clip.mp4>      (box tree; file name and `ilst` keys only; re
 | `audio.tone_snr` | per beep: least-squares sinusoid fit over [onset + 10, onset + 90] ms with the frequency refined; SNR = tone power / residual; the frequency from an FFT peak with parabolic interpolation. Mix uses a joint fit where windows overlap |
 | `audio.routing` | the narrowband level (single-bin Hann DFT, 80 ms) of each tone in each track's windows against the expected matrix (present / absent / any); thresholds as in §2 item 16 |
 | `audio.cue` | an FFT matched filter against the cue's PCM (`--cue`, or the embedded placeholder until M4 embeds the real asset with `include_bytes!`). NCC ≥0.5 [proposed] and ≥−70 dBFS: present; 0.2–0.5: warning; windows under −90 dBFS RMS count as silence. Expected absent everywhere (PLAN:213). The cue must keep its energy ≥200 Hz from 1, 2 and 3 kHz (requirement for M4) |
-| `build.lgpl` | Linked backend: avutil, avcodec and avformat `license()` all contain "LGPL" (else exit 3 before analysis); the report gives their numeric versions and a SHA-256 of `configuration()`, since ffmpeg-next exposes no safe `av_version_info()` and `kairo-verify` forbids unsafe. With nothing linked (CLI or synthetic backend) it passes, and the report notes "spawned, not linked: <licence>" |
+| `build.lgpl` | The FFmpeg linked into the process (Windows, whichever decoder runs, since the binary imports it): avutil, avcodec and avformat `license()` all start with "LGPL" (else exit 3 before analysis); the report gives their numeric versions and a SHA-256 of avutil's `configuration()`, since ffmpeg-next exposes no safe `av_version_info()` and `kairo-verify` forbids unsafe. With nothing linked (CLI or synthetic backend) it passes, and the report notes "spawned, not linked: <licence>" |
 
 ### 6.4 Routing matrices
 

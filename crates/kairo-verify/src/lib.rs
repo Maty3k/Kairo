@@ -51,6 +51,7 @@ pub mod mutate;
 pub mod profile;
 pub mod report;
 pub mod scan;
+pub mod sha256;
 pub mod synth;
 #[cfg(test)]
 mod testkit;
@@ -171,11 +172,20 @@ pub fn check_with(
             name: name.to_owned(),
             bytes: 0,
         },
-        decoder: report::Decoder { kind: "none" },
+        decoder: report::Decoder {
+            kind: "none",
+            ffmpeg: decode::linked_ffmpeg(),
+        },
         summary: report::Summary::default(),
         checks: Vec::new(),
         timings_ms: report::Timings::default(),
     };
+    // A non-LGPL FFmpeg linked into this process stops the check before analysis (README §2
+    // item 18, §6.6: exit 3), whichever decoder was asked for.
+    if let Some(refusal) = report.decoder.ffmpeg.as_ref().and_then(checks::not_lgpl) {
+        report.error = Some(refusal);
+        return report;
+    }
     let clip = match Clip::read(source) {
         Ok(clip) => clip,
         Err(error) => {

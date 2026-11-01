@@ -122,7 +122,7 @@ jobs:
           FFMPEG_SHA: ${{ steps.ffmpeg.outputs.sha }}
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
-          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
           if ($hash -ne $env:FFMPEG_SHA) { Write-Host "::error::The FFmpeg zip's SHA-256 is $hash, not the pin's"; exit 1 }
           $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-extract'

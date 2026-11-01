@@ -147,10 +147,12 @@ fn decoder_choice(chosen: Option<&str>, ffmpeg: Option<PathBuf>) -> Result<Decod
         }
         (Some("cli"), Some(program)) | (None, Some(program)) => Ok(DecoderChoice::Cli(program)),
         (Some("cli"), None) => Err(format!("--decoder cli needs --ffmpeg PATH\n{USAGE}")),
-        (Some("linked"), _) if !cfg!(windows) => Err(
+        (Some("linked"), _) if !cfg!(windows) => Err(if cfg!(feature = "dev-tools") {
             "the linked decoder is Windows-only, where Kairo ships FFmpeg; use --decoder cli --ffmpeg PATH"
-                .to_owned(),
-        ),
+        } else {
+            "the linked decoder is Windows-only, where Kairo ships FFmpeg; elsewhere this build checks structure only"
+        }
+        .to_owned()),
         (Some("linked"), _) => Ok(DecoderChoice::Linked),
         (Some(_), _) => Err(format!("--decoder takes linked, cli or none\n{USAGE}")),
         (None, None) => Ok(DEFAULT_DECODER),
@@ -1312,58 +1314,70 @@ mod tests {
                 wav_dir: None,
             })
         );
-        assert_eq!(
-            parse_args(&args(
-                "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c"
-            )),
-            Ok(Command::CorpusBuild {
-                encoder: Encoder::Amf,
-                ffmpeg: PathBuf::from("f"),
-                hw_index: Some(1),
-                hw_device: None,
-                finishing: false,
-                out: PathBuf::from("c"),
-            })
-        );
-        assert_eq!(
-            parse_args(&args(
-                "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
-            )),
-            Ok(Command::CorpusBuild {
-                encoder: Encoder::Amf,
-                ffmpeg: PathBuf::from("f"),
-                hw_index: Some(0),
-                hw_device: Some("1002:7550".to_owned()),
-                finishing: true,
-                out: PathBuf::from("c"),
-            })
-        );
-        assert_eq!(
-            parse_args(&args("corpus check c --ffmpeg f")),
-            Ok(Command::CorpusCheck {
-                dir: PathBuf::from("c"),
-                decoder: DecoderChoice::Cli(PathBuf::from("f")),
-            })
-        );
-        // --ffmpeg alone means the cli decoder; --decoder wins over it.
-        for (line, want) in [
-            (
+        // Corpus work and the cli decoder spawn FFmpeg: only a dev-tools build has them.
+        if !cfg!(feature = "dev-tools") {
+            for line in [
+                "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c",
+                "corpus check c --ffmpeg f",
                 "check a.mp4 --profile engine --ffmpeg f",
-                DecoderChoice::Cli(PathBuf::from("f")),
-            ),
-            (
-                "check a.mp4 --profile engine --decoder none --ffmpeg f",
-                DecoderChoice::None,
-            ),
-            (
-                "check a.mp4 --profile engine --ffmpeg f --decoder none",
-                DecoderChoice::None,
-            ),
-        ] {
-            assert!(
-                matches!(parse_args(&args(line)), Ok(Command::Check { ref decoder, .. }) if *decoder == want),
-                "{line}"
+                "check a.mp4 --profile engine --decoder cli",
+            ] {
+                assert!(parse_args(&args(line)).is_err(), "{line}");
+            }
+        } else {
+            assert_eq!(
+                parse_args(&args(
+                    "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c"
+                )),
+                Ok(Command::CorpusBuild {
+                    encoder: Encoder::Amf,
+                    ffmpeg: PathBuf::from("f"),
+                    hw_index: Some(1),
+                    hw_device: None,
+                    finishing: false,
+                    out: PathBuf::from("c"),
+                })
             );
+            assert_eq!(
+                parse_args(&args(
+                    "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
+                )),
+                Ok(Command::CorpusBuild {
+                    encoder: Encoder::Amf,
+                    ffmpeg: PathBuf::from("f"),
+                    hw_index: Some(0),
+                    hw_device: Some("1002:7550".to_owned()),
+                    finishing: true,
+                    out: PathBuf::from("c"),
+                })
+            );
+            assert_eq!(
+                parse_args(&args("corpus check c --ffmpeg f")),
+                Ok(Command::CorpusCheck {
+                    dir: PathBuf::from("c"),
+                    decoder: DecoderChoice::Cli(PathBuf::from("f")),
+                })
+            );
+            // --ffmpeg alone means the cli decoder; --decoder wins over it.
+            for (line, want) in [
+                (
+                    "check a.mp4 --profile engine --ffmpeg f",
+                    DecoderChoice::Cli(PathBuf::from("f")),
+                ),
+                (
+                    "check a.mp4 --profile engine --decoder none --ffmpeg f",
+                    DecoderChoice::None,
+                ),
+                (
+                    "check a.mp4 --profile engine --ffmpeg f --decoder none",
+                    DecoderChoice::None,
+                ),
+            ] {
+                assert!(
+                    matches!(parse_args(&args(line)), Ok(Command::Check { ref decoder, .. }) if *decoder == want),
+                    "{line}"
+                );
+            }
         }
         let linked = parse_args(&args("check a.mp4 --profile engine --decoder linked"));
         assert_eq!(
@@ -1373,8 +1387,8 @@ mod tests {
         );
         assert_eq!(
             parse_args(&args("corpus check c")).is_ok(),
-            cfg!(windows),
-            "corpus check needs --ffmpeg off Windows"
+            cfg!(all(windows, feature = "dev-tools")),
+            "corpus check needs --ffmpeg off Windows, and dev-tools everywhere"
         );
         assert!(matches!(
             parse_args(&args(

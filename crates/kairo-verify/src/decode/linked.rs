@@ -40,6 +40,22 @@ pub fn not_lgpl() -> Option<&'static str> {
     licences().into_iter().find(|l| !l.starts_with("LGPL"))
 }
 
+/// The linked FFmpeg, for the report and `build.lgpl`: its libraries' versions, a SHA-256 of
+/// its build configuration (ffmpeg-next has no safe `av_version_info()`) and its licence.
+pub fn build() -> super::LinkedFfmpeg {
+    let refused = not_lgpl();
+    super::LinkedFfmpeg {
+        libs: super::Libs {
+            avutil: super::version_text(ffmpeg::util::version()),
+            avcodec: super::version_text(ffmpeg::codec::version()),
+            avformat: super::version_text(ffmpeg::format::version()),
+        },
+        config_sha256: crate::sha256::hex(ffmpeg::util::configuration().as_bytes()),
+        license: refused.unwrap_or(licences()[1]),
+        lgpl: refused.is_none(),
+    }
+}
+
 /// FFmpeg's error, as a message for a report: its code's text only, never a path.
 fn text(error: Error) -> String {
     error.to_string()
@@ -112,6 +128,11 @@ fn note(stats: &mut DecodeStats, what: String) {
     stats.last_error = Some(what);
 }
 
+/// Errors in a row after which a drain stops asking: frame threading returns a worker's error
+/// once and keeps the other workers' pictures, so a drain goes on past an error, but a decoder
+/// that only ever fails mustn't hold it forever.
+const ERRORS_IN_A_ROW: u32 = 64;
+
 /// A picture's planes, borrowed: 8-bit 4:2:0 only (`yuv420p`, or `yuvj420p` for full range).
 fn planes(picture: &frame::Video) -> Result<Planes<'_>, DecodeError> {
     if !matches!(picture.format(), Pixel::YUV420P | Pixel::YUVJ420P)
@@ -137,9 +158,11 @@ fn pictures(
     stats: &mut DecodeStats,
     each: &mut dyn FnMut(usize, &Planes<'_>) -> ControlFlow<()>,
 ) -> Result<Next, DecodeError> {
+    let mut failures = 0;
     loop {
         match decoder.receive_frame(picture) {
             Ok(()) => {
+                failures = 0;
                 if picture.is_corrupt() || picture.has_decode_errors() {
                     note(stats, "a picture decoded with errors".to_owned());
                 }
@@ -155,7 +178,10 @@ fn pictures(
             }
             Err(e) => {
                 note(stats, text(e));
-                return Ok(Next::More);
+                failures += 1;
+                if failures == ERRORS_IN_A_ROW {
+                    return Ok(Next::More);
+                }
             }
         }
     }
@@ -209,9 +235,11 @@ fn sounds(
     stats: &mut DecodeStats,
     each: &mut dyn FnMut(&[f32]) -> ControlFlow<()>,
 ) -> Result<Next, DecodeError> {
+    let mut failures = 0;
     loop {
         match decoder.receive_frame(sound) {
             Ok(()) => {
+                failures = 0;
                 if sound.is_corrupt() || sound.has_decode_errors() {
                     note(stats, "audio decoded with errors".to_owned());
                 }
@@ -228,7 +256,10 @@ fn sounds(
             }
             Err(e) => {
                 note(stats, text(e));
-                return Ok(Next::More);
+                failures += 1;
+                if failures == ERRORS_IN_A_ROW {
+                    return Ok(Next::More);
+                }
             }
         }
     }
@@ -350,5 +381,29 @@ impl Decoder for Linked {
             )?;
         }
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pinned_ffmpeg_is_lgpl_and_names_its_build() {
+        // CI links the pinned LGPL build (README §3.4), as the PC does.
+        assert_eq!(not_lgpl(), None, "{:?}", licences());
+        let ffmpeg = build();
+        assert!(ffmpeg.lgpl);
+        assert!(ffmpeg.license.starts_with("LGPL"));
+        for version in [
+            &ffmpeg.libs.avutil,
+            &ffmpeg.libs.avcodec,
+            &ffmpeg.libs.avformat,
+        ] {
+            let parts: Vec<&str> = version.split('.').collect();
+            assert_eq!(parts.len(), 3, "{version}");
+            assert!(parts.iter().all(|p| p.parse::<u32>().is_ok()), "{version}");
+        }
+        assert_eq!(ffmpeg.config_sha256.len(), 64);
     }
 }
