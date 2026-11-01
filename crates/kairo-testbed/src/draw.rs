@@ -26,8 +26,8 @@ use std::fmt;
 use kairo_core::testsig::{self, Fill, Scene};
 
 /// The rows of the row texture: the most band runs one frame can have, with room to spare
-/// (bars and ramp up to 2 each where the motion pattern wraps them, the load texture's 12 block
-/// rows plus 2 split ones).
+/// (bars and ramp up to 2 each where the motion pattern wraps them, the load band's 12 block
+/// rows plus the one split at the wrap).
 pub const ROW_TEXTURE_ROWS: u32 = 32;
 
 /// The swap chain's pixel format.

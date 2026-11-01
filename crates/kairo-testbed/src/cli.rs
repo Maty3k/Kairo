@@ -17,7 +17,7 @@ pub const USAGE: &str =
 default screen. --size is for windowed mode (default 1280x720), and the window, frame
 included, must fit on the monitor. --fps defaults to the monitor's rounded refresh rate. --seconds defaults to 60. Exclusive mode needs focus, so it
 implies --activate, which waits until the foreground lock time-out has passed since the last
-input. The log and the ready file must not exist yet.
+input. The log and the ready file must not exist yet; the ready file's folder must be on NTFS.
 Exit codes: 0 ok, 2 usage, 3 monitor not found or rate refused, 4 device or swap chain,
 5 focus or exclusive fullscreen not obtained.";
 

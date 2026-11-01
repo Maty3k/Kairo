@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! D3D11 and DXGI for the testbed (docs/research/16-verify-testbed/README.md §4.1–4.4, §4.8,
 //! §4.9): the device on the adapter that drives the monitor, chosen by LUID; a flip-discard swap
-//! chain with two buffers and a frame latency of 1, with a frame-latency waitable object except
-//! in exclusive fullscreen, where D3D11 doesn't support one; exclusive fullscreen on the
-//! monitor's own output, and the `ResizeBuffers` that losing it needs; the HDR colour space and a
+//! chain paced one of three ways ([`Pacing`]); exclusive fullscreen on the monitor's own output,
+//! and the `ResizeBuffers` that losing it needs; the HDR colour space and a
 //! watch on the monitor's HDR state; frame statistics; the monitor's own vblank clock, for swap
 //! chains without statistics; and the renderer, which carries out a [`draw::Plan`] with
 //! `ClearRenderTargetView`, `ClearView`, `UpdateSubresource` and `CopySubresourceRegion` only.
@@ -113,19 +112,18 @@ impl Gpu {
         read_hdr(self.output.as_ref()?)
     }
 
-    /// A swap chain for window `hwnd`'s client area of `width` × `height` in `format`, with a
-    /// frame-latency waitable object when `waitable` (vsync pacing in a window). Without one the
-    /// device's frame latency is set to 1 instead, and `Present` blocks.
+    /// A swap chain for window `hwnd`'s client area of `width` × `height` in `format`, paced as
+    /// `pacing` says.
     pub fn swap_chain(
         &self,
         hwnd: isize,
         width: u32,
         height: u32,
         format: Format,
-        waitable: bool,
+        pacing: Pacing,
     ) -> Result<Chain, String> {
         let dxgi_format = dxgi_format(format);
-        let flags = if waitable {
+        let flags = if pacing == Pacing::Waitable {
             DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
         } else {
             0
@@ -139,7 +137,7 @@ impl Gpu {
                 Quality: 0,
             },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
+            BufferCount: if pacing == Pacing::Timer { 3 } else { 2 },
             Scaling: DXGI_SCALING_NONE,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -153,23 +151,29 @@ impl Gpu {
                 .CreateSwapChainForHwnd(&self.device, window, &desc, None, None)
         }
         .map_err(|e| format!("swap chain: {e}"))?;
-        // SAFETY: this factory made the swap chain for this live window; the call only stops
-        // DXGI from acting on Alt+Enter, so the mode never changes behind the run's back.
+        // SAFETY: this factory made the swap chain for this live window. NO_ALT_ENTER stops only
+        // Alt+Enter; DXGI still leaves fullscreen when the window loses focus (leave_if_lost).
         let _ = unsafe {
             self.factory
                 .MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER)
         };
         let mut waitable_handle = None;
-        if waitable {
-            let swap2: IDXGISwapChain2 = swap.cast().map_err(|e| format!("swap chain 2: {e}"))?;
-            // SAFETY: the swap chain was made with the waitable flag.
-            unsafe { swap2.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
-            // SAFETY: as above; the handle is ours to close (Drop).
-            waitable_handle = Some(unsafe { swap2.GetFrameLatencyWaitableObject() });
-        } else {
-            let device: IDXGIDevice1 = self.device.cast().map_err(|e| format!("device: {e}"))?;
-            // SAFETY: our own device.
-            unsafe { device.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
+        match pacing {
+            Pacing::Waitable => {
+                let swap2: IDXGISwapChain2 =
+                    swap.cast().map_err(|e| format!("swap chain 2: {e}"))?;
+                // SAFETY: the swap chain was made with the waitable flag.
+                unsafe { swap2.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
+                // SAFETY: as above; the handle is ours to close (Drop).
+                waitable_handle = Some(unsafe { swap2.GetFrameLatencyWaitableObject() });
+            }
+            Pacing::Blocking => {
+                let device: IDXGIDevice1 =
+                    self.device.cast().map_err(|e| format!("device: {e}"))?;
+                // SAFETY: our own device.
+                unsafe { device.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
+            }
+            Pacing::Timer => {}
         }
         if let Format::Fp16 { .. } = format {
             let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swap chain 3: {e}"))?;
@@ -437,6 +441,19 @@ fn copy_texture(
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
         .map_err(|e| format!("texture: {e}"))?;
     texture.ok_or_else(|| "texture: none".to_owned())
+}
+
+/// How a swap chain is paced (README §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pacing {
+    /// Vsync in a window: two buffers and a frame-latency waitable object at latency 1.
+    Waitable,
+    /// Vsync in exclusive fullscreen, where D3D11 has no waitable object: two buffers, the
+    /// device's frame latency at 1, and a `Present` that blocks until there is room.
+    Blocking,
+    /// Timer pacing: three buffers and the default latency, so `Present(0, 0)` never waits for a
+    /// vblank, and the display shows the newest frame at each.
+    Timer,
 }
 
 /// What `GetFrameStatistics` said.

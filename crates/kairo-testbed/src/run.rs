@@ -26,7 +26,7 @@ use kairo_display::DisplayTarget;
 
 use crate::cli::{self, Config, Hdr, exit};
 use crate::draw::{self, Format, Plan};
-use crate::gpu::{Chain, Gpu, HdrWatch, PresentError, Statistics, VblankClock};
+use crate::gpu::{Chain, Gpu, HdrWatch, Pacing, PresentError, Statistics, VblankClock};
 use crate::pace::{self, Period, Resolved, Shown, Step, TimerPacer, VsyncPacer};
 use crate::platform::{self, Frame, KeepDisplayOn, Timer, Window};
 use crate::ready::Ready;
@@ -162,8 +162,9 @@ impl Log {
     }
 
     /// The `end` event; if frame 0 never came, the header still opens the log (with the time
-    /// now), so the setup events parse. A run that failed before its window existed has no
-    /// header to write, so its empty log is removed.
+    /// now), so the setup events parse. A run that failed before its header was known (before
+    /// its window and client size were settled, a `--size` that doesn't fit included) has none
+    /// to write, so its empty log is removed.
     fn finish(&mut self) {
         if self.header.is_none() {
             if let (Some(file), Some(path)) = (self.file.take(), &self.path) {
@@ -245,6 +246,12 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     }
     let gpu =
         Gpu::on_adapter(target.adapter_luid, target.hmonitor).map_err(|e| Stop(exit::DEVICE, e))?;
+    // The watch's factory is made before the HDR state is read, so a toggle from here on makes
+    // it stale.
+    let hdr_watch = match config.hdr {
+        Hdr::Auto => HdrWatch::new(target.adapter_luid, target.hmonitor),
+        Hdr::Off => None,
+    };
     let hdr = match config.hdr {
         Hdr::Off => None,
         Hdr::Auto => gpu.output_hdr().filter(|o| o.pq).map(|o| {
@@ -335,11 +342,14 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     } else {
         window.show(false);
     }
-    // D3D11 has no frame-latency waitable object in exclusive fullscreen: there the blocking
-    // Present paces the loop.
-    let waitable = config.pace == Pace::Vsync && config.mode != Mode::Exclusive;
+    let pacing = match (config.pace, config.mode) {
+        (Pace::Timer, _) => Pacing::Timer,
+        // D3D11 has no frame-latency waitable object in exclusive fullscreen.
+        (Pace::Vsync, Mode::Exclusive) => Pacing::Blocking,
+        (Pace::Vsync, _) => Pacing::Waitable,
+    };
     let mut chain = gpu
-        .swap_chain(window.hwnd(), size.width(), size.height(), format, waitable)
+        .swap_chain(window.hwnd(), size.width(), size.height(), format, pacing)
         .map_err(|e| Stop(exit::DEVICE, e))?;
     if config.mode == Mode::Exclusive {
         let entered = chain.enter_fullscreen();
@@ -359,10 +369,6 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
             },
             None => Patches::Sdr,
         },
-    };
-    let hdr_watch = match config.hdr {
-        Hdr::Auto => HdrWatch::new(target.adapter_luid, target.hmonitor),
-        Hdr::Off => None,
     };
     let mut ctx = Ctx {
         config,
@@ -580,7 +586,9 @@ impl Ctx<'_> {
 /// Vsync pacing (README §4.3): wait for the swap chain, read its statistics, draw, present with
 /// interval k (the warm-up's black frames with 1).
 fn vsync_loop(ctx: &mut Ctx<'_>, k: u32) -> Result<(), Stop> {
-    let mut pacer = VsyncPacer::new(k, ctx.period, pace::next_whole_second(platform::now_hns()));
+    let start = pace::next_whole_second(platform::now_hns());
+    let blocking = ctx.config.mode == Mode::Exclusive;
+    let mut pacer = VsyncPacer::new(k, ctx.period, start, blocking);
     let result = vsync_frames(ctx, &mut pacer);
     ctx.settle(pacer.shown(), Miss::Vblank);
     result
@@ -618,9 +626,9 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
             continue;
         }
         ctx.fullscreen_lost()?;
+        // The clock, once started, lives until the loop ends: stopping it waits for a vblank.
         if ctx.statistics(pacer.shown(), Miss::Vblank) {
             statistics = true;
-            clock = None;
         }
         let now = platform::now_hns();
         for r in pacer.shown().expire(now) {
@@ -645,6 +653,7 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
             Step::Warmup => {
                 ctx.chain.draw(&black);
                 ctx.present(1)?;
+                pacer.warmup_presented(platform::now_hns());
             }
             Step::Lost => return Err(lost_clock()),
             Step::Frame {
