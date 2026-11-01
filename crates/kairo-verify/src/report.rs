@@ -25,6 +25,17 @@ pub enum Verdict {
     Error,
 }
 
+impl std::fmt::Display for Verdict {
+    /// `pass`, `fail` or `error`, as in the JSON.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+            Verdict::Error => "error",
+        })
+    }
+}
+
 impl Verdict {
     /// `kairo-verify check`'s exit code: 0 pass, 1 fail, 3 cannot evaluate.
     pub fn exit_code(self) -> u8 {

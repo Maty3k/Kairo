@@ -11,6 +11,10 @@
 //! can't be rendered, a terminal as stdout, or an expect path that names a folder), 4 the frames,
 //! the WAVs or the expect file couldn't be written (a closed pipe included; it never replaces an
 //! existing file, and writes the WAVs and then the expect file only once every frame is out).
+//! For `corpus build`: 0 built, 2 usage (an `--out` folder that exists included), 3 a step
+//! failed (FFmpeg, or what its log shows), 4 a file couldn't be written. For `corpus check`: 0
+//! every clip behaves, 1 one doesn't, 2 usage, 3 the corpus can't be judged (no manifest, a
+//! missing clip or expect file, an FFmpeg that won't start), 4 a report couldn't be written.
 //! Messages and reports name the file only.
 
 use std::ffi::{OsStr, OsString};
@@ -21,6 +25,7 @@ use std::str::FromStr;
 
 use kairo_core::testsig::Curve;
 
+use crate::corpus::Encoder;
 use crate::expect::Expect;
 use crate::mutate::{MutateError, Op};
 use crate::profile::{Plan, Profile};
@@ -40,6 +45,11 @@ pub const USAGE: &str =
                           [--defect D] [--hdr natural|match --lw NITS --sdr-white NITS]
                           [--codec nv12|ipcm [--gop N]] [--wav-dir DIR] --expect FILE
                           (frames on stdout; mix, game, mic and voice.wav in DIR)
+       kairo-verify corpus build --encoder h264_amf|h264_mf|h264_videotoolbox|ipcm
+                                 --ffmpeg PATH [--hw-index N [--hw-device VVVV:DDDD]]
+                                 [--finishing h264_metadata] --out DIR
+                          (h264_amf needs --hw-index)
+       kairo-verify corpus check DIR --ffmpeg PATH
        kairo-verify --version | --help
 profiles: test capture smoke engine share discord whatsapp reels original
 defects: drop[@K] dup[@K] judder corrupt-bars bars-sparse unreadable (video);
@@ -92,6 +102,18 @@ enum Command {
         synth: Synth,
         expect: PathBuf,
         wav_dir: Option<PathBuf>,
+    },
+    CorpusBuild {
+        encoder: Encoder,
+        ffmpeg: PathBuf,
+        hw_index: Option<u32>,
+        hw_device: Option<String>,
+        finishing: bool,
+        out: PathBuf,
+    },
+    CorpusCheck {
+        dir: PathBuf,
+        ffmpeg: PathBuf,
     },
     Version,
     Help,
@@ -148,6 +170,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         }
         Some("mutate") => return parse_mutate(rest),
         Some("synth") => return parse_synth(rest),
+        Some("corpus") => return parse_corpus(rest),
         Some("check") => {}
         _ => return Err(format!("unknown command {}\n{USAGE}", shown(verb))),
     }
@@ -443,6 +466,198 @@ fn parse_synth(rest: &[OsString]) -> Result<Command, String> {
         expect,
         wav_dir,
     })
+}
+
+/// `corpus build …` and `corpus check DIR …` (README §6.1).
+fn parse_corpus(rest: &[OsString]) -> Result<Command, String> {
+    if !cfg!(feature = "dev-tools") {
+        return Err("corpus spawns FFmpeg, which only a dev-tools build does".to_owned());
+    }
+    let usage = || format!("corpus takes build or check\n{USAGE}");
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(usage());
+    };
+    let (mut encoder, mut ffmpeg, mut hw_index, mut out, mut dir) = (None, None, None, None, None);
+    let (mut hw_device, mut finishing) = (None, false);
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let flag = word.to_str().unwrap_or_default();
+        let mut value = |name: &str| {
+            words
+                .next()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
+        };
+        match flag {
+            "--encoder" => {
+                let name = value("--encoder")?;
+                encoder = Some(
+                    name.to_str()
+                        .unwrap_or_default()
+                        .parse::<Encoder>()
+                        .map_err(|e| format!("{e}\n{USAGE}"))?,
+                );
+            }
+            "--ffmpeg" => ffmpeg = Some(PathBuf::from(value("--ffmpeg")?)),
+            "--hw-index" => {
+                hw_index = Some(number(
+                    value("--hw-index")?,
+                    "--hw-index takes an adapter's number",
+                )?);
+            }
+            "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--hw-device" => {
+                let pair = value("--hw-device")?.to_str().unwrap_or_default();
+                let hex = |s: &str| s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit());
+                match pair.split_once(':') {
+                    Some((vendor, device)) if hex(vendor) && hex(device) => {
+                        hw_device = Some(pair.to_ascii_lowercase());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "--hw-device takes the adapter's vendor:device, four hex digits each\n{USAGE}"
+                        ));
+                    }
+                }
+            }
+            "--finishing" => match value("--finishing")?.to_str() {
+                Some("h264_metadata") => finishing = true,
+                _ => return Err(format!("--finishing takes h264_metadata\n{USAGE}")),
+            },
+            "--ffprobe" => {
+                return Err(
+                    "--ffprobe, the PC's cross-check of the parser, comes with research 16's PR 9"
+                        .to_owned(),
+                );
+            }
+            _ if flag.starts_with('-') && flag.len() > 1 => {
+                let name = OsStr::new(flag.split('=').next().unwrap_or_default());
+                return Err(format!("unknown option {}\n{USAGE}", shown(name)));
+            }
+            _ if dir.is_none() && !word.is_empty() => dir = Some(PathBuf::from(word)),
+            _ => return Err(format!("corpus takes one folder\n{USAGE}")),
+        }
+    }
+    match verb.to_str() {
+        Some("build") => {
+            if dir.is_some() {
+                return Err(format!(
+                    "corpus build makes its folder: give it as --out DIR\n{USAGE}"
+                ));
+            }
+            let encoder =
+                encoder.ok_or_else(|| format!("corpus build needs --encoder\n{USAGE}"))?;
+            let ffmpeg =
+                ffmpeg.ok_or_else(|| format!("corpus build needs --ffmpeg PATH\n{USAGE}"))?;
+            let out = out.ok_or_else(|| format!("corpus build needs --out DIR\n{USAGE}"))?;
+            if (hw_index.is_some() || hw_device.is_some()) != (encoder == Encoder::Amf)
+                || hw_device.is_some() && hw_index.is_none()
+            {
+                return Err(format!(
+                    "--encoder h264_amf needs --hw-index N (and may add --hw-device), which no other encoder takes: the adapter is chosen, never assumed\n{USAGE}"
+                ));
+            }
+            Ok(Command::CorpusBuild {
+                encoder,
+                ffmpeg,
+                hw_index,
+                hw_device,
+                finishing,
+                out,
+            })
+        }
+        Some("check") => {
+            if encoder.is_some()
+                || hw_index.is_some()
+                || out.is_some()
+                || hw_device.is_some()
+                || finishing
+            {
+                return Err(format!(
+                    "corpus check takes the corpus folder and --ffmpeg PATH\n{USAGE}"
+                ));
+            }
+            let dir =
+                dir.ok_or_else(|| format!("corpus check needs the corpus folder\n{USAGE}"))?;
+            let ffmpeg = ffmpeg.ok_or_else(|| {
+                format!(
+                    "corpus check needs --ffmpeg PATH until the linked decoder (research 16's PR 6)\n{USAGE}"
+                )
+            })?;
+            Ok(Command::CorpusCheck { dir, ffmpeg })
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// `corpus build`'s settings from the command line.
+#[cfg(feature = "dev-tools")]
+struct CorpusBuild<'a> {
+    encoder: Encoder,
+    ffmpeg: &'a Path,
+    hw_index: Option<u32>,
+    hw_device: Option<&'a str>,
+    finishing: bool,
+    folder: &'a Path,
+}
+
+/// `corpus build`: the clips, telling `out` each step.
+#[cfg(feature = "dev-tools")]
+fn corpus_build(settings: CorpusBuild<'_>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let build = crate::corpus::build::Build {
+        encoder: settings.encoder,
+        ffmpeg: settings.ffmpeg,
+        hw_index: settings.hw_index,
+        hw_device: settings.hw_device,
+        finishing: settings.finishing,
+        out: settings.folder,
+    };
+    match build.run(&mut |line| {
+        let _ = writeln!(out, "{line}");
+    }) {
+        Ok(_) => 0,
+        Err(error) => {
+            say(err, &format!("corpus build: {error}"));
+            error.code
+        }
+    }
+}
+
+/// `corpus check`: every clip judged, then the summary on `out`.
+#[cfg(feature = "dev-tools")]
+fn corpus_check(dir: &Path, ffmpeg: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    // Without a decoder nothing can be judged, so a missing FFmpeg stops it at once.
+    let starts = std::process::Command::new(ffmpeg)
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !starts {
+        say(err, "corpus check: FFmpeg didn't start");
+        return 3;
+    }
+    let decoder = |clip: &Path| -> Box<dyn crate::decode::Decoder> {
+        Box::new(crate::decode::cli::Cli::new(ffmpeg, clip))
+    };
+    let check = crate::corpus::check::Check {
+        dir,
+        decoder: &decoder,
+    };
+    let result = check.run(&mut |line| {
+        let _ = writeln!(out, "{line}");
+    });
+    match result {
+        Ok(report) => {
+            let _ = write!(out, "{}", report.to_text());
+            if report.pass { 0 } else { 1 }
+        }
+        Err(error) => {
+            say(err, &format!("corpus check: {error}"));
+            error.code
+        }
+    }
 }
 
 /// The file's name for messages and reports, or `None` if it isn't UTF-8.
@@ -907,6 +1122,28 @@ pub fn run_with(
             err,
             stdout_is_terminal,
         ),
+        #[cfg(feature = "dev-tools")]
+        Ok(Command::CorpusBuild {
+            encoder,
+            ffmpeg,
+            hw_index,
+            hw_device,
+            finishing,
+            out: folder,
+        }) => corpus_build(
+            CorpusBuild {
+                encoder,
+                ffmpeg: &ffmpeg,
+                hw_index,
+                hw_device: hw_device.as_deref(),
+                finishing,
+                folder: &folder,
+            },
+            out,
+            err,
+        ),
+        #[cfg(feature = "dev-tools")]
+        Ok(Command::CorpusCheck { dir, ffmpeg }) => corpus_check(&dir, &ffmpeg, out, err),
         Ok(command) => check(command, out, err),
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -1035,6 +1272,39 @@ mod tests {
                 wav_dir: None,
             })
         );
+        assert_eq!(
+            parse_args(&args(
+                "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --out c"
+            )),
+            Ok(Command::CorpusBuild {
+                encoder: Encoder::Amf,
+                ffmpeg: PathBuf::from("f"),
+                hw_index: Some(1),
+                hw_device: None,
+                finishing: false,
+                out: PathBuf::from("c"),
+            })
+        );
+        assert_eq!(
+            parse_args(&args(
+                "corpus build --encoder h264_amf --ffmpeg f --hw-index 0 --hw-device 1002:7550 --finishing h264_metadata --out c"
+            )),
+            Ok(Command::CorpusBuild {
+                encoder: Encoder::Amf,
+                ffmpeg: PathBuf::from("f"),
+                hw_index: Some(0),
+                hw_device: Some("1002:7550".to_owned()),
+                finishing: true,
+                out: PathBuf::from("c"),
+            })
+        );
+        assert_eq!(
+            parse_args(&args("corpus check c --ffmpeg f")),
+            Ok(Command::CorpusCheck {
+                dir: PathBuf::from("c"),
+                ffmpeg: PathBuf::from("f"),
+            })
+        );
         assert!(matches!(
             parse_args(&args(
                 "synth --preset 1080p60 --defect av50 --wav-dir w --expect e.json"
@@ -1126,6 +1396,22 @@ mod tests {
             "synth --preset 1080p60 --expect e.json --seconds 0",
             "synth --preset 1081x1080@60 --expect e.json",
             "synth --preset 1080p60 --expect e.json extra",
+            "corpus",
+            "corpus frobnicate",
+            "corpus build --encoder libx264 --ffmpeg f --out c",
+            "corpus build --encoder ipcm --ffmpeg f",
+            "corpus build --encoder ipcm --out c",
+            "corpus build --encoder ipcm --ffmpeg f --out c d",
+            "corpus build --encoder h264_videotoolbox --ffmpeg f --hw-index 1 --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --hw-device 1002:7550 --out c",
+            "corpus build --encoder h264_amf --ffmpeg f --hw-index 1 --hw-device 1002 --out c",
+            "corpus build --encoder ipcm --ffmpeg f --finishing x --out c",
+            "corpus check c --ffmpeg f --finishing h264_metadata",
+            "corpus check c",
+            "corpus check --ffmpeg f",
+            "corpus check c --ffmpeg f --encoder ipcm",
+            "corpus check c --ffmpeg f --ffprobe p",
             "--version extra",
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
