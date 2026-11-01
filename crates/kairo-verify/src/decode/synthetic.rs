@@ -146,6 +146,12 @@ pub struct SyntheticAudio {
 impl SyntheticAudio {
     /// One sample per frame.
     pub fn render(&self) -> Vec<f32> {
+        self.render_seeded(0)
+    }
+
+    /// The same, its noise from a seed of its own: [`Synthetic`] gives each track its index,
+    /// so two noisy tracks don't carry the same noise.
+    pub fn render_seeded(&self, seed: u64) -> Vec<f32> {
         let rate = crate::analyze::audio::RATE;
         let mut x = vec![0.0_f64; self.frames];
         for &(sound, at, gain_db) in &self.sounds {
@@ -169,7 +175,7 @@ impl SyntheticAudio {
         if let Some(db) = self.noise_db {
             // Box–Muller from SplitMix64.
             let sigma = 10_f64.powf(db / 20.0);
-            let mut state = 0x4B41_4952_4F4E_4F49_u64;
+            let mut state = 0x4B41_4952_4F4E_4F49_u64 ^ splitmix(seed);
             let mut uniform = || {
                 state = splitmix(state);
                 ((state >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
@@ -404,7 +410,7 @@ impl Decoder for Synthetic {
         let channels = channels.max(1);
         let mut stats = DecodeStats::default();
         let mut chunk = Vec::with_capacity(4_096 * channels);
-        for block in spec.render().chunks(4_096) {
+        for block in spec.render_seeded(track as u64).chunks(4_096) {
             chunk.clear();
             for &v in block {
                 chunk.extend(std::iter::repeat_n(v, channels));

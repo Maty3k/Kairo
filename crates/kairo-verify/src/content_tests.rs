@@ -1572,3 +1572,95 @@ fn an_aac_clip_passes_the_audio_checks() {
         }
     }
 }
+
+/// Opt-in: 3 kHz mic markers at sub-sample onsets through FFmpeg's `aac` at 96 and 160 kbps
+/// come back on their own cycle (PR 5a's review dsp-3: AAC smears a 3 kHz rise by up to
+/// 0.27 ms, more than half its 0.33 ms period).
+#[cfg(feature = "dev-tools")]
+#[test]
+#[ignore = "needs KAIRO_FFMPEG"]
+fn three_khz_markers_keep_their_cycle_through_aac() {
+    use std::process::Command;
+
+    use crate::analyze::audio::{Detector, RATE};
+
+    let ffmpeg = ffmpeg();
+    let dir = Scratch::new("markers");
+    // 200 markers a second apart, each a different fraction of a sample late.
+    let onsets: Vec<f64> = (0..200)
+        .map(|k| 2_400.0 + 48_000.0 * f64::from(k) + (f64::from(k) * 0.618_034).fract())
+        .collect();
+    let sounds = onsets
+        .iter()
+        .map(|&o| (Sound::Beep(3_000.0), o / RATE, 0.0))
+        .collect();
+    let mono = SyntheticAudio {
+        frames: 200 * 48_000 + 4_800,
+        sounds,
+        noise_db: Some(-70.0),
+    }
+    .render();
+    for (channels, kbps) in [(2_u16, "96k"), (2, "160k"), (1, "128k")] {
+        let samples: Vec<f32> = mono
+            .iter()
+            .flat_map(|&v| std::iter::repeat_n(v, usize::from(channels)))
+            .collect();
+        write_wav(&dir.0.join("m.wav"), channels, &samples);
+        let encoded = Command::new(&ffmpeg)
+            .current_dir(&dir.0)
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                "m.wav",
+            ])
+            .args(["-c:a", "aac", "-b:a", kbps, "-use_editlist", "0", "m.mp4"])
+            .status()
+            .unwrap();
+        assert!(encoded.success());
+        let decoded = Command::new(&ffmpeg)
+            .current_dir(&dir.0)
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-v",
+                "error",
+                "-ignore_editlist",
+                "1",
+            ])
+            .args(["-c:a", "aac", "-i", "m.mp4", "-f", "f32le", "-"])
+            .output()
+            .unwrap();
+        let pcm: Vec<f32> = decoded
+            .stdout
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
+            .collect();
+        let mut x = Vec::new();
+        crate::analyze::audio::downmix(&pcm, usize::from(channels), &mut x);
+        let detector = Detector::new(3_000.0);
+        let (mut found, mut slips) = (0, Vec::new());
+        for &o in &onsets {
+            // The encoder's priming comes first.
+            let truth = o + 1_024.0;
+            if let Some(b) = detector.find(&x, truth, 100.0 * 48.0) {
+                found += 1;
+                let error_us = (b.at - truth) / RATE * 1e6;
+                if error_us.abs() > 100.0 {
+                    slips.push(error_us.round());
+                }
+            }
+        }
+        eprintln!(
+            "{channels} ch {kbps}: {found} of {} found, slips {slips:?}",
+            onsets.len()
+        );
+        assert!(slips.is_empty(), "{channels} ch {kbps}: {slips:?}");
+        assert!(found >= 198, "{channels} ch {kbps}: {found}");
+    }
+}

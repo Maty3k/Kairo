@@ -280,9 +280,12 @@ fn read_f32(
     let mut samples = Vec::with_capacity(AUDIO_CHUNK * channels.max(1));
     let (mut filled, mut frames) = (0, 0);
     loop {
-        let n = reader
-            .read(&mut bytes[filled..])
-            .map_err(|e| DecodeError::Read(e.to_string()))?;
+        let n = match reader.read(&mut bytes[filled..]) {
+            Ok(n) => n,
+            // A signal during the read: read again, as read_exact does for the pictures.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(DecodeError::Read(e.to_string())),
+        };
         filled += n;
         let whole = filled / frame * frame;
         if whole > 0 && (n == 0 || filled == bytes.len()) {

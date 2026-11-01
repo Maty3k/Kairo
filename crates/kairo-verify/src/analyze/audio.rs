@@ -31,6 +31,20 @@ pub const BEEP_HZ_TOLERANCE: f64 = 1.0;
 /// Windows quieter than this RMS, in dBFS, are silence to the cue's matched filter.
 pub const SILENCE_DB: f64 = -90.0;
 
+/// The share of a search window's envelope taken as its noise: a beep fills at most half of any
+/// window the detectors search, so the lowest quarter is noise.
+const FLOOR_QUANTILE: f64 = 0.25;
+
+/// How far, in dB, a beep's 1 ms envelope may disagree with its narrowband level, and its
+/// narrowband level wander over its steady part. Another sound leaking into the envelope moves
+/// them further; AAC at 96 kbps keeps a clean beep's steady part within 0.3 dB.
+const STEADY_DB: f64 = 2.0;
+
+/// How far under its steady level a beep may be just after its ramp, from 2 to 10 ms: AAC's
+/// smeared attack takes up to 4.2 dB off a 3 kHz marker at 96 kbps, while a beep timed at
+/// another sound's start reads 20 dB or more under there.
+const ATTACK_DB: f64 = 6.0;
+
 /// Appends the mean of each frame of `interleaved` to `out`: (L+R)/2 for stereo, the samples
 /// themselves for mono. A partial last frame is dropped.
 pub fn downmix(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) {
@@ -95,31 +109,100 @@ fn quantile(values: &[f64], q: f64) -> Option<f64> {
     Some(*value)
 }
 
-/// The first upward crossing of half the plateau in `from..to`, after at least 4 ms under a
-/// quarter of it, interpolated (signals.md §3.3 steps 3–4); the plateau is the envelope's 95th
-/// percentile there.
+/// Each beep-like rise of `hz` in `from..to`, in order, as the interpolated upward crossing of
+/// half its own plateau after at least 4 ms under a quarter of it (signals.md §3.3 steps 3–4).
+/// A rise starts where the envelope passes a trigger after 4 ms under it: four times the
+/// window's noise, and at least half of 20 dB under the quietest beep that counts, so a beep
+/// too quiet to count is still measured. Its plateau is the median envelope over its steady
+/// part, 10 to 90 ms on, so a louder sound elsewhere in the window can't set it. A rise whose plateau disagrees with the
+/// narrowband level there by more than [`STEADY_DB`] is another sound leaking into the
+/// envelope, and is passed over.
+fn rises(x: &[f32], hz: f64, from: usize, to: usize) -> Vec<f64> {
+    let (steady, ramp) = ((10.0 * MS) as usize, (90.0 * MS) as usize);
+    // The envelope runs on past `to`, so a rise near the window's end has its steady part.
+    let env = envelope(x, hz, from, (to + ramp).min(x.len()).max(to));
+    let window = &env[..to.saturating_sub(from).min(env.len())];
+    let floor = 10_f64.powf((BEEP_MIN_DB - 20.0) / 20.0) / 2.0;
+    let trigger = quantile(window, FLOOR_QUANTILE).map_or(floor, |q| floor.max(4.0 * q));
+    let mut out = Vec::new();
+    let mut quiet = 0;
+    for i in 0..window.len() {
+        if env[i] < trigger {
+            quiet += 1;
+            continue;
+        }
+        let armed = quiet >= QUIET;
+        quiet = 0;
+        if !armed {
+            continue;
+        }
+        let Some(plateau) = env.get(i + steady..i + ramp).and_then(|s| quantile(s, 0.5)) else {
+            continue;
+        };
+        let consistent = level_db(x, hz, from + i + steady, ramp - steady)
+            .is_some_and(|level| (db(plateau) - level).abs() <= STEADY_DB);
+        if plateau < 2.0 * trigger || !consistent {
+            continue;
+        }
+        let (half, quarter) = (plateau / 2.0, plateau / 4.0);
+        // The half crossing within 10 ms of the rise, and 4 ms under a quarter before it.
+        let Some(j) =
+            (i.max(1)..(i + steady).min(env.len())).find(|&j| env[j - 1] < half && env[j] >= half)
+        else {
+            continue;
+        };
+        let Some(r) = (0..j).rev().find(|&k| env[k] < quarter) else {
+            continue;
+        };
+        if r + 1 < QUIET || env[r + 1 - QUIET..=r].iter().any(|&v| v >= quarter) {
+            continue;
+        }
+        let fraction = (half - env[j - 1]) / (env[j] - env[j - 1]);
+        out.push((from + j - 1) as f64 + fraction);
+    }
+    out
+}
+
+/// The first rise in `from..to` (see [`rises`]).
 fn half_crossing(x: &[f32], hz: f64, from: usize, to: usize) -> Option<f64> {
-    let env = envelope(x, hz, from, to);
-    let plateau = quantile(&env, 0.95)?;
-    if plateau <= 0.0 {
+    rises(x, hz, from, to).first().copied()
+}
+
+/// Where the envelope of the beep starting near `onset` falls through half its plateau (the
+/// median over its steady part), interpolated, within 10 ms of where a beep's end belongs.
+fn fall_crossing(x: &[f32], hz: f64, onset: f64) -> Option<f64> {
+    let at = |ms: f64| (onset + ms * MS).round().max(0.0) as usize;
+    let plateau = quantile(&envelope(x, hz, at(10.0), at(90.0)), 0.5)?;
+    let (from, to) = (
+        at(f64::from(testsig::BEEP_MS) - 10.0),
+        at(f64::from(testsig::BEEP_MS) + 10.0),
+    );
+    if plateau <= 0.0 || to > x.len() {
         return None;
     }
-    let (half, quarter) = (plateau / 2.0, plateau / 4.0);
-    let mut quiet = 0;
-    let mut armed = false;
-    for (i, pair) in env.windows(2).enumerate() {
-        if pair[0] < quarter {
-            quiet += 1;
-            armed |= quiet >= QUIET;
-        } else {
-            quiet = 0;
-        }
-        if armed && pair[0] < half && pair[1] >= half {
-            let fraction = (half - pair[0]) / (pair[1] - pair[0]);
-            return Some((from + i) as f64 + fraction);
-        }
-    }
-    None
+    let half = plateau / 2.0;
+    let env = envelope(x, hz, from, to);
+    let i = env.windows(2).position(|p| p[0] >= half && p[1] < half)?;
+    Some((from + i) as f64 + (env[i] - half) / (env[i] - env[i + 1]))
+}
+
+/// Whether the narrowband level of `hz` holds once the beep at `at` is up: within
+/// [`ATTACK_DB`] of `level` over [at + 2, at + 10] ms, and within [`STEADY_DB`] over each half
+/// of [at + 10, at + 90] ms. A beep timed at another sound's start, or overlapped by one at its
+/// own frequency, doesn't.
+fn steady(x: &[f32], hz: f64, at: f64, level: f64) -> bool {
+    [
+        (2.0, 8.0, ATTACK_DB),
+        (10.0, 40.0, STEADY_DB),
+        (50.0, 40.0, STEADY_DB),
+    ]
+    .iter()
+    .all(|&(offset, ms, tolerance)| {
+        let start = (at + offset * MS).round();
+        start >= 0.0
+            && level_db(x, hz, start as usize, (ms * MS) as usize)
+                .is_some_and(|l| (l - level).abs() <= tolerance)
+    })
 }
 
 /// The onset whose carrier phase over [onset + 10, onset + 90] ms matches the samples, on the
@@ -168,6 +251,8 @@ pub struct Detector {
     /// Where the envelope of the beep itself crosses half its plateau, in samples after its
     /// onset: subtracted from every crossing.
     crossing: f64,
+    /// Where it falls through half its plateau again, in samples after its onset.
+    fall: f64,
 }
 
 impl Detector {
@@ -179,7 +264,8 @@ impl Detector {
             .map(|n| testsig::tone_burst_at(hz, testsig::BEEP_MS, (n as f64 - lead) / RATE) as f32)
             .collect();
         let crossing = half_crossing(&template, hz, 0, template.len()).map_or(0.0, |c| c - lead);
-        Self { hz, crossing }
+        let fall = fall_crossing(&template, hz, lead).map_or(beep, |f| f - lead);
+        Self { hz, crossing, fall }
     }
 
     /// The tone's frequency.
@@ -187,28 +273,49 @@ impl Detector {
         self.hz
     }
 
-    /// The template's own crossing time, in ms (0.953 at 1 kHz in signals.md §3.3).
+    /// The template's own crossing time, in ms: 0.961 at 1 kHz and 0.993 at 2 kHz, about 10 µs
+    /// later than signals.md §3.3's 0.953 and 0.986 because the 48-sample boxcar centres half a
+    /// sample late; measurements subtract it, so the offset cancels.
     pub fn crossing_ms(&self) -> f64 {
         self.crossing / MS
     }
 
-    /// The beep whose onset lies within `radius` samples of `center`, measured whatever its level
-    /// or frequency; see [`Beep`] and [`Detector::counts`].
+    /// The first beep whose onset lies within `radius` samples of `center`, measured whatever
+    /// its level or frequency; see [`Beep`] and [`Detector::counts`]. A rise whose narrowband
+    /// level doesn't hold once it is up is passed over for the next: a beep that another sound
+    /// overlaps at its start goes unmeasured rather than timed at that sound.
     pub fn measure(&self, x: &[f32], center: f64, radius: f64) -> Option<Beep> {
         let from = (center - radius).max(0.0) as usize;
         let to = ((center + radius).max(0.0) as usize).min(x.len());
         if to <= from + QUIET {
             return None;
         }
-        let coarse = half_crossing(x, self.hz, from, to)? - self.crossing;
-        let at = phase_onset(x, self.hz, coarse)?;
-        let (start, len) = plateau(at)?;
-        Some(Beep {
-            at,
-            coarse,
-            level_db: level_db(x, self.hz, start, len)?,
-            hz: peak_hz(x, self.hz, start, len)?,
-        })
+        rises(x, self.hz, from, to)
+            .into_iter()
+            .find_map(|crossing| {
+                // The carrier's cycle is chosen from the mean of the beep's start and end, every
+                // beep lasting 100 ms: AAC smears a 3 kHz rise by −180 to +270 µs, more than half a
+                // cycle, but its fall by ±70 µs at 96–160 kbps (PR 5a's review dsp-3), while another
+                // tone's ramp on the fall can move that by 0.3 ms; the mean stays within 140 µs of
+                // both. An end that disagrees with the start by over 0.5 ms isn't the beep's.
+                let rise = crossing - self.crossing;
+                let coarse = fall_crossing(x, self.hz, rise)
+                    .map(|f| f - self.fall)
+                    .filter(|&f| (f - rise).abs() <= 0.5 * MS)
+                    .map_or(rise, |f| (rise + f) / 2.0);
+                let at = phase_onset(x, self.hz, coarse)?;
+                let (start, len) = plateau(at)?;
+                let level = level_db(x, self.hz, start, len)?;
+                if !steady(x, self.hz, at, level) {
+                    return None;
+                }
+                Some(Beep {
+                    at,
+                    coarse,
+                    level_db: level,
+                    hz: peak_hz(x, self.hz, start, len)?,
+                })
+            })
     }
 
     /// Whether `beep` counts as one of this tone's: at least −60 dBFS and within 1 Hz.
@@ -221,33 +328,44 @@ impl Detector {
         self.measure(x, center, radius).filter(|b| self.counts(b))
     }
 
-    /// Every beep in `x` that counts, in order: wherever the envelope rises past half of
-    /// −60 dBFS after 4 ms under it, the beep found within 250 ms.
+    /// Every beep in `x` that counts, in order: wherever the envelope rises past a trigger after
+    /// 4 ms under it, the beep found within 250 ms and then again around its own onset. The
+    /// trigger is half of −60 dBFS, or four times the envelope's median over each 10 s if that
+    /// is higher, so a noisy track triggers on its beeps, not its noise; after a trigger finds
+    /// nothing, the next 125 ms (already searched) is skipped.
     pub fn scan(&self, x: &[f32]) -> Vec<Beep> {
-        let threshold = 10_f64.powf(BEEP_MIN_DB / 20.0) / 2.0;
+        let floor = 10_f64.powf(BEEP_MIN_DB / 20.0) / 2.0;
+        let beep = f64::from(testsig::BEEP_MS) * MS;
         let mut beeps: Vec<Beep> = Vec::new();
         let chunk = (10.0 * RATE) as usize;
         let mut quiet = 0;
+        let mut skip_to = 0.0;
         let mut start = 0;
         while start < x.len() {
             let end = (start + chunk).min(x.len());
-            for (i, level) in envelope(x, self.hz, start, end).into_iter().enumerate() {
-                if level < threshold {
+            let env = envelope(x, self.hz, start, end);
+            let trigger = quantile(&env, 0.5).map_or(floor, |m| floor.max(4.0 * m));
+            for (i, &level) in env.iter().enumerate() {
+                if level < trigger {
                     quiet += 1;
                     continue;
                 }
                 let rising = quiet >= QUIET;
                 quiet = 0;
                 let n = (start + i) as f64;
-                let after_last = beeps
-                    .last()
-                    .is_none_or(|b| n > b.at + f64::from(testsig::BEEP_MS) * MS);
-                if rising
-                    && after_last
-                    && let Some(beep) = self.find(x, n, 250.0 * MS)
-                    && beeps.last().is_none_or(|b| beep.at > b.at + 50.0 * MS)
+                if !rising || n < skip_to || beeps.last().is_some_and(|b| n <= b.at + beep) {
+                    continue;
+                }
+                // Found again around its own onset: a window that held only the beep's start
+                // can't time it.
+                match self
+                    .find(x, n, 250.0 * MS)
+                    .and_then(|b| self.find(x, b.at, 100.0 * MS))
                 {
-                    beeps.push(beep);
+                    Some(found) if beeps.last().is_none_or(|b| found.at > b.at + beep) => {
+                        beeps.push(found);
+                    }
+                    _ => skip_to = n + 125.0 * MS,
                 }
             }
             start = end;
@@ -449,11 +567,12 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
     let size = (2 * len).next_power_of_two().max(1 << 15);
     let step = size - len + 1;
     // The reversed template's spectrum: correlation as a convolution.
+    let table = twiddles(size);
     let (mut hr, mut hi) = (vec![0.0; size], vec![0.0; size]);
     for (i, &v) in template.iter().enumerate() {
         hr[len - 1 - i] = f64::from(v);
     }
-    fft(&mut hr, &mut hi, false);
+    fft_with(&mut hr, &mut hi, false, &table);
     let last = x.len() - len;
     let mut best: Option<CueMatch> = None;
     let (mut re, mut im) = (vec![0.0; size], vec![0.0; size]);
@@ -469,13 +588,13 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
             total += *r * *r;
             energies[i + 1] = total;
         }
-        fft(&mut re, &mut im, false);
+        fft_with(&mut re, &mut im, false, &table);
         for k in 0..size {
             let (a, b) = (re[k], im[k]);
             re[k] = a * hr[k] - b * hi[k];
             im[k] = a * hi[k] + b * hr[k];
         }
-        fft(&mut re, &mut im, true);
+        fft_with(&mut re, &mut im, true, &table);
         for (m, &correlation) in re.iter().enumerate().skip(len - 1) {
             let at = block + m - (len - 1);
             if at > last {
@@ -502,8 +621,23 @@ pub fn match_cue(x: &[f32], template: &[f32]) -> Option<CueMatch> {
 /// An in-place radix-2 FFT of `re` + i·`im`, whose length must be a power of two; `inverse`
 /// runs the inverse transform, scaled by 1/n.
 pub(crate) fn fft(re: &mut [f64], im: &mut [f64], inverse: bool) {
+    fft_with(re, im, inverse, &twiddles(re.len()));
+}
+
+/// The forward twiddle factors of an `n`-point FFT: e^(−2πik/n) for k < n/2.
+fn twiddles(n: usize) -> Vec<(f64, f64)> {
+    (0..n / 2)
+        .map(|k| {
+            let angle = -TAU * k as f64 / n as f64;
+            (angle.cos(), angle.sin())
+        })
+        .collect()
+}
+
+/// [`fft`] with its twiddle factors built once, by [`twiddles`], for many transforms of a size.
+fn fft_with(re: &mut [f64], im: &mut [f64], inverse: bool, twiddles: &[(f64, f64)]) {
     let n = re.len();
-    if n < 2 || !n.is_power_of_two() || im.len() != n {
+    if n < 2 || !n.is_power_of_two() || im.len() != n || twiddles.len() != n / 2 {
         return;
     }
     let mut j = 0;
@@ -519,19 +653,14 @@ pub(crate) fn fft(re: &mut [f64], im: &mut [f64], inverse: bool) {
             im.swap(i, j);
         }
     }
-    let sign = if inverse { 1.0 } else { -1.0 };
-    let twiddles: Vec<(f64, f64)> = (0..n / 2)
-        .map(|k| {
-            let angle = sign * TAU * k as f64 / n as f64;
-            (angle.cos(), angle.sin())
-        })
-        .collect();
+    let sign = if inverse { -1.0 } else { 1.0 };
     let mut len = 2;
     while len <= n {
         let stride = n / len;
         for start in (0..n).step_by(len) {
             for k in 0..len / 2 {
                 let (wr, wi) = twiddles[k * stride];
+                let wi = sign * wi;
                 let (a, b) = (start + k, start + k + len / 2);
                 let (tr, ti) = (re[b] * wr - im[b] * wi, re[b] * wi + im[b] * wr);
                 re[b] = re[a] - tr;
@@ -584,6 +713,88 @@ mod tests {
         }
     }
 
+    /// Adds a burst of `hz`, `ms` long, at `onset` (samples) and `gain` on testsig's level.
+    fn add(x: &mut [f32], hz: f64, ms: u32, onset: f64, gain: f64) {
+        let first = onset.floor().max(0.0) as usize;
+        let last = ((onset + f64::from(ms) * MS).ceil() as usize + 1).min(x.len());
+        for (n, v) in x.iter_mut().enumerate().take(last).skip(first) {
+            *v += (gain * testsig::tone_burst_at(hz, ms, (n as f64 - onset) / RATE)) as f32;
+        }
+    }
+
+    #[test]
+    fn a_scan_keeps_every_beep_under_noise() {
+        // PR 5a's review dsp-1: a fixed trigger fired on noise near −60 dBFS and missed beeps
+        // under −55 dBFS. Now each beep is found once, on its own cycle.
+        let onsets: Vec<f64> = (0..20)
+            .map(|k| 4_800.0 + 48_000.0 * f64::from(k) + 0.37)
+            .collect();
+        for (hz, rms) in [
+            (2_000.0, -60.0),
+            (2_000.0, -50.0),
+            (3_000.0, -60.0),
+            (1_000.0, -55.0),
+        ] {
+            let beeps: Vec<(f64, f64, f64)> = onsets.iter().map(|&o| (hz, o, 1.0)).collect();
+            let mut x = track(20.5, &beeps);
+            noise(&mut x, rms, 11);
+            let found = Detector::new(hz).scan(&x);
+            assert_eq!(found.len(), onsets.len(), "{hz} Hz at {rms} dBFS");
+            for (b, &o) in found.iter().zip(&onsets) {
+                assert!(
+                    (b.at - o).abs() < 0.25 * RATE / hz / 2.0,
+                    "{hz} Hz at {rms}: {} vs {o}",
+                    b.at
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_sounds_near_a_beep_never_move_it_a_cycle() {
+        // PR 5a's review dsp-2: a louder sound 400–500 Hz off a beep, in the same search window,
+        // set the plateau and slipped the onset a cycle, or timed the beep at its own start. Now
+        // a beep comes back on its own onset, or unmeasured when the sound overlaps its start.
+        let onset = 24_000.3;
+        let cue = |x: &mut [f32], at: f64, gain: f64| {
+            for (n, v) in x.iter_mut().enumerate() {
+                let t = (n as f64 - at) / RATE;
+                if (0.0..0.22).contains(&t) {
+                    *v += (gain * testsig::cue_placeholder_at(t)) as f32;
+                }
+            }
+        };
+        let six_db = 10_f64.powf(6.0 / 20.0);
+        for hz in [1_000.0, 2_000.0, 3_000.0] {
+            let detector = Detector::new(hz);
+            // Apart from the beep: the cue 6 dB louder ending 40 ms before it or starting 50 ms
+            // after it ends, and a 100 ms tone 400 Hz off starting 20 ms after it ends.
+            type Sound<'a> = Box<dyn Fn(&mut [f32]) + 'a>;
+            let apart: [Sound<'_>; 3] = [
+                Box::new(|x: &mut [f32]| cue(x, onset - 260.0 * MS, six_db)),
+                Box::new(|x: &mut [f32]| cue(x, onset + 150.0 * MS, six_db)),
+                Box::new(|x: &mut [f32]| add(x, hz + 400.0, 100, onset + 120.0 * MS, six_db)),
+            ];
+            for (i, sound) in apart.iter().enumerate() {
+                let mut x = track(1.0, &[(hz, onset, 1.0)]);
+                sound(&mut x);
+                let beep = detector.find(&x, onset, 250.0 * MS);
+                assert!(
+                    beep.is_some_and(|b| (b.at - onset).abs() < 0.05),
+                    "{hz} Hz, sound {i}: {beep:?}"
+                );
+            }
+            // Overlapping its start: a 200 ms tone 400 Hz off, as loud, from 50 ms before it.
+            let mut x = track(1.0, &[(hz, onset, 1.0)]);
+            add(&mut x, hz - 400.0, 200, onset - 50.0 * MS, 1.0);
+            let beep = detector.find(&x, onset, 250.0 * MS);
+            assert!(
+                beep.is_none_or(|b| (b.at - onset).abs() < 0.05),
+                "{hz} Hz, overlapped: {beep:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_fft_inverts_and_finds_a_cosine() {
         let n = 64;
@@ -608,10 +819,11 @@ mod tests {
 
     #[test]
     fn the_templates_cross_where_the_design_says() {
-        // signals.md §3.3: 0.953 ms at 1 kHz and 0.986 ms at 2 kHz.
-        for (hz, ms) in [(1_000.0, 0.953), (2_000.0, 0.986)] {
+        // signals.md §3.3's 0.953 ms at 1 kHz and 0.986 ms at 2 kHz, each about 10 µs later
+        // here: the 48-sample boxcar centres half a sample late (PR 5a's review dsp-7).
+        for (hz, ms) in [(1_000.0, 0.961), (2_000.0, 0.993)] {
             let crossing = Detector::new(hz).crossing_ms();
-            assert!((crossing - ms).abs() < 0.03, "{hz} Hz: {crossing} ms");
+            assert!((crossing - ms).abs() < 0.005, "{hz} Hz: {crossing} ms");
         }
     }
 
@@ -633,7 +845,8 @@ mod tests {
                 let beep = detector.find(&x, onset + 30.0, 250.0 * MS).unwrap();
                 let error_us = (beep.at - onset).abs() / RATE * 1e6;
                 assert!(error_us < 1.0, "{hz} Hz at {onset}: {error_us} µs");
-                assert!((beep.coarse - onset).abs() < 0.2 * MS, "{beep:?}");
+                // The coarse onset picks the carrier's cycle: it must be within half of one.
+                assert!((beep.coarse - onset).abs() < 0.5 * RATE / hz, "{beep:?}");
                 assert!((beep.level_db + 30.0).abs() < 0.05, "{beep:?}");
                 assert!((beep.hz - hz).abs() < 0.1, "{beep:?}");
             }
