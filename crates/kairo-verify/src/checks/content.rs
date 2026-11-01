@@ -4,8 +4,9 @@
 //! `content.flash`, `content.bars`, `content.colour_matrix`, `content.bars_lines`,
 //! `content.levels`, `hdr.curve_levels`, `source.stability`, and the audio checks of
 //! [`super::audio`]. With the testbed's log (`--testbed-log`, README §4.9) the rates, the run tag
-//! and the HDR levels come from it, steps that touch a frame the testbed itself missed count as
-//! the source's and not the clip's, `source.stability` judges the testbed, and A/V is exact.
+//! and the HDR levels come from it, steps the testbed's own misses explain count as the source's
+//! and not the clip's ([`super::source::Excuses`]), `source.stability` judges the testbed, and
+//! A/V is exact where the log has display times.
 //!
 //! Every picture's and sample's time comes from Kairo's sample tables, never from the decoder.
 
@@ -13,10 +14,10 @@ use std::ops::ControlFlow;
 
 use serde_json::json;
 
-use super::source::Source;
+use super::source::{Excuses, Source};
 use super::{Ctx, Finding, Outcome, Status, audio, skipped, weigh};
 use crate::analyze::bars::{self, BandSums, Bands, FrameBars};
-use crate::analyze::cadence::{self, Counts, Event};
+use crate::analyze::cadence::{self, Counts, Event, Shows};
 use crate::analyze::flash::{self, Flashes};
 use crate::analyze::levels::{self, Expected, Patch};
 use crate::analyze::{self, Geometry, Line, NoLine, Reading};
@@ -107,10 +108,12 @@ struct Analysis {
     source_fps: Option<u32>,
     /// The line's testbed rate when it is faster than the expect file's `source_hz` allows.
     too_fast: Option<(f64, u32)>,
-    /// The display's refresh rate and how many vblanks each testbed frame lasts.
-    refresh: Option<(f64, u32)>,
+    /// The display's refresh rate and which testbed frame it shows at each vblank.
+    refresh: Option<(f64, Shows)>,
     fps: Option<u32>,
     counts: Option<Counts>,
+    /// The last testbed frame of the misses that excused a step of the clip.
+    excused_until: Option<i64>,
     /// The ideal's (drop-and-duplicate share, judder share).
     ideal: Option<(f64, f64)>,
     /// The flash at the nominal rate F the lit frames fit best (F or F ± 1), with that F.
@@ -360,11 +363,15 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
             .map(|r| r as u32)
     });
     let source_hz = ctx.plan.expect.as_ref().and_then(|e| e.source_hz);
+    // A log states its testbed's rate and pacing, and source.stability checks the barcodes
+    // against them; without one, a testbed can't be faster than its display.
     let too_fast = rate
         .zip(source_hz)
-        .filter(|&(rate, hz)| rate > f64::from(hz) * (1.0 + SOURCE_RATE_SLACK));
+        .filter(|&(rate, hz)| rate > f64::from(hz) * (1.0 + SOURCE_RATE_SLACK))
+        .filter(|_| source.is_none());
     let refresh = match &source {
-        Some(s) => Some((s.refresh_hz, s.every())),
+        Some(s) if s.timer => Some((s.refresh_hz, Shows::Newest(s.fps))),
+        Some(s) => Some((s.refresh_hz, Shows::Every(s.every()))),
         None => line_refresh(rate, source_fps, source_hz),
     };
     let fps = ctx
@@ -372,9 +379,16 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         .measured
         .and_then(|m| (m.fps.1 == 1).then_some(m.fps.0))
         .and_then(|f| u32::try_from(f).ok());
-    // Steps that touch a frame the testbed missed are the source's (README §6.3).
+    // Steps the testbed's misses explain are the source's (README §6.3).
+    let mut excused_until = None;
     let counts = source_fps.zip(fps).and_then(|(fs, f)| match &source {
-        Some(s) => cadence::count_excluding(&numbers, fs, f, |from, to| s.affects(from, to)),
+        Some(s) => {
+            let mut excuses = Excuses::new(s, f);
+            let counts =
+                cadence::count_excluding(&numbers, fs, f, |from, to| excuses.excuse(from, to));
+            excused_until = excuses.used_until();
+            counts
+        }
         None => cadence::count(&numbers, fs, f),
     });
     // The ideal replays every vblank for 10 s: bounded to displays up to 2 kHz.
@@ -382,7 +396,7 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         .filter(|&(hz, _)| hz <= MAX_IDEAL_HZ)
         .zip(source_fps)
         .zip(fps.and_then(cadence::pacer_rate))
-        .and_then(|(((hz, every), fs), rate)| cadence::ideal(hz, every, fs, rate));
+        .and_then(|(((hz, shows), fs), rate)| cadence::ideal(hz, shows, fs, rate));
     // F from the log; else from the line, checked against the lit frames: F ± 1 when it fits
     // them better (README §6.3 `content.flash`).
     let flashes = match &source {
@@ -430,6 +444,7 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         refresh,
         fps,
         counts,
+        excused_until,
         ideal,
         flashes,
         p99_step_error_hns,
@@ -444,7 +459,7 @@ fn line_refresh(
     rate: Option<f64>,
     source_fps: Option<u32>,
     source_hz: Option<u32>,
-) -> Option<(f64, u32)> {
+) -> Option<(f64, Shows)> {
     rate.zip(source_fps).map(|(rate, fs)| {
         // With the testbed's refresh rate known, each frame lasts that many vblanks of it (more
         // than four for a timer-paced testbed, 72 fps on 360 Hz; README §4.3); without, one: a
@@ -459,8 +474,34 @@ fn line_refresh(
             .map(f64::from)
             .filter(|&hz| (hz - measured).abs() <= SOURCE_RATE_SLACK * hz)
             .unwrap_or(measured);
-        (hz, every)
+        (hz, Shows::Every(every))
     })
+}
+
+/// The testbed's rate by the clip: the median, over its readable frames, of the rate to the
+/// readable frame `window` later. A stretch the testbed froze or the capture held, up to half
+/// the clip, doesn't move it the way it bends the barcode line.
+fn windowed_rate(
+    numbers: &[Option<i64>],
+    pts: &[i64],
+    timescale: u64,
+    window: usize,
+) -> Option<f64> {
+    let readable: Vec<(i64, i64)> = numbers
+        .iter()
+        .zip(pts)
+        .filter_map(|(n, &t)| Some(((*n)?, t)))
+        .collect();
+    let w = window.clamp(1, readable.len().saturating_sub(1).max(1));
+    let mut rates: Vec<f64> = readable
+        .windows(w + 1)
+        .filter_map(|r| {
+            let seconds = (r[w].1 - r[0].1) as f64 / timescale as f64;
+            (seconds > 0.0).then(|| (r[w].0 - r[0].0) as f64 / seconds)
+        })
+        .collect();
+    rates.sort_by(f64::total_cmp);
+    rates.get(rates.len() / 2).copied()
 }
 
 /// The 99th percentile (nearest rank) of |display(to) − display(from) − one output frame| over
@@ -663,8 +704,8 @@ fn audio_analysis<'d>(
         .as_ref()
         .map(|(f, _)| *f)
         .or(analysis.source_fps);
-    // With the testbed's log, its beeps' played times on the video's clock (exact A/V, README
-    // §6.3 av.offset); without, the flashes on the barcode line.
+    // With the testbed's log and its display times, its beeps' played times on the video's
+    // clock (exact A/V, README §6.3 av.offset); without, the flashes on the barcode line.
     let clock = analysis
         .source
         .as_ref()
@@ -675,13 +716,19 @@ fn audio_analysis<'d>(
         .zip(clock)
         .filter(|(s, _)| s.beeps.iter().any(|b| b.2.is_some()));
     let game = match (logged, &analysis.line, flash_fps) {
-        (Some((s, clock)), _, _) => Ok(audio::game_from_log(s, clock, &analysis.numbers)),
-        (None, Ok(line), Some(f)) => Ok(audio::game_expected(
-            line,
-            &analysis.numbers,
-            &analysis.pts,
-            ctx.timing.timescale,
-            f,
+        (Some((s, clock)), _, _) => Ok((
+            audio::game_from_log(s, clock, &analysis.numbers),
+            "game beeps, against the testbed's log",
+        )),
+        (None, Ok(line), Some(f)) => Ok((
+            audio::game_expected(
+                line,
+                &analysis.numbers,
+                &analysis.pts,
+                ctx.timing.timescale,
+                f,
+            ),
+            "game beeps, on the barcode line",
         )),
         (None, Err(reason), _) => Err(format!("no barcode line to time the flashes: {reason}")),
         (None, Ok(_), None) => Err("no testbed rate to time the flashes".to_owned()),
@@ -912,7 +959,7 @@ fn barcode(plan: &Plan, readings: &[Reading], logged_tag: Option<u8>) -> Outcome
 fn set_aside(counts: &Counts) -> String {
     match counts.source_events.len() {
         0 => String::new(),
-        n => format!("; {n} steps at testbed misses set aside (source.stability)"),
+        n => format!("; {n} steps the testbed's misses explain set aside (source.stability)"),
     }
 }
 
@@ -1111,10 +1158,14 @@ fn source_stability(a: &Analysis) -> Outcome {
     let (Some(&first), Some(&last)) = (readable.iter().min(), readable.iter().max()) else {
         return Outcome::cannot("no readable barcode places the clip in the log");
     };
+    // Misses after the clip's last frame that excused its steps count too (a stall under way
+    // when the clip ends).
+    let last = a.excused_until.map_or(last, |u| last.max(u));
     let st = source.stability(first, last);
     let share = st.share();
     let max = profile::SOURCE_MISSED_MAX;
-    let rate = a.line.as_ref().ok().map(|l| l.rate(a.timescale));
+    let window = a.fps.map_or(a.numbers.len() / 4, |f| f as usize);
+    let rate = windowed_rate(&a.numbers, &a.pts, a.timescale, window);
     let mut outcome = Outcome {
         value: json!({"first": first, "last": last, "frames": st.frames, "missed": st.missed,
                       "unlogged": st.unlogged, "share": share, "log_fps": source.fps,
@@ -1464,9 +1515,10 @@ mod tests {
             }),
             source_fps: Some(180),
             too_fast: None,
-            refresh: Some((180.0, 1)),
+            refresh: Some((180.0, Shows::Every(1))),
             fps: Some(60),
             counts,
+            excused_until: None,
             ideal: Some((0.0, 0.0)),
             flashes: None,
             p99_step_error_hns: None,

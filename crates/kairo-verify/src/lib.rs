@@ -14,8 +14,9 @@
 //! beeps, against the pictures and each other: `av.offset`, `av.offset_tight`,
 //! `av.inter_track`, `audio.tone_snr`, `audio.routing` and `audio.cue` (README §6.3–6.4).
 //! With the testbed's log (`--testbed-log`) and `kairo-tone`'s (`--voice-log`), the rates, the
-//! run tag and the HDR levels come from the log, events at the testbed's own misses are set
-//! aside, `source.stability` judges the testbed, and A/V is exact (README §6.3). Without a testbed
+//! run tag and the HDR levels come from the log, the events the testbed's own misses explain
+//! are set aside, `source.stability` judges the testbed, and A/V is exact where the log has
+//! display times (README §6.3). Without a testbed
 //! log `source.stability` can't run, so `capture` and `engine` clips that show the pattern end
 //! in `error`; `test`, `smoke` and the exports are judged on what runs, and so are clips without
 //! the pattern, such as a real game clip. [`logsum`] judges a testbed or tone log itself

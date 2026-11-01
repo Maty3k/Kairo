@@ -37,7 +37,7 @@ use crate::{Clip, boxes};
 #[cfg(feature = "dev-tools")]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
-                    [--testbed-log FILE] [--voice-log FILE]
+                    [--testbed-log FILE [--voice-log FILE]]
                     [--cue FILE.wav] [--av-tight] [--voice-included]
                     [--decoder linked|cli|none] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
@@ -64,7 +64,7 @@ linked LGPL FFmpeg on Windows; elsewhere, without --ffmpeg, only the structure i
 #[cfg(not(feature = "dev-tools"))]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
-                    [--testbed-log FILE] [--voice-log FILE]
+                    [--testbed-log FILE [--voice-log FILE]]
                     [--decoder linked|none] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
        kairo-verify log <testbed.log|tone.log> [--json FILE|-]
@@ -302,6 +302,11 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     if voice_included && !profile.is_share_export() {
         return Err(format!(
             "--voice-included goes with a share export's profile: share, discord, whatsapp or reels\n{USAGE}"
+        ));
+    }
+    if voice_log.is_some() && testbed_log.is_none() {
+        return Err(format!(
+            "--voice-log needs --testbed-log: the tone log is placed on the clip by the testbed's display times\n{USAGE}"
         ));
     }
     if json == Some(Output::Stdout) && summary == Some(Output::Stdout) {
@@ -1532,6 +1537,7 @@ mod tests {
             "check a.mp4 --profile",
             "check a.mp4 --profile test --av-tight",
             "check a.mp4 --profile engine --voice-included",
+            "check a.mp4 --profile engine --voice-log v.log",
             "boxes",
             "boxes a b",
             "mutate",

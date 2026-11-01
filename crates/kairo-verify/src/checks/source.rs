@@ -4,16 +4,19 @@
 //! HDR levels, each frame's display time, the beeps' played times and the frames the testbed
 //! itself missed, so that a capture isn't blamed for them.
 //!
-//! A frame counts as the testbed's miss when the log has an `m` line for it, when it was never
-//! drawn (a gap between drawn frames' numbers), or when it was drawn but never shown while the
-//! testbed ran at or below its display's refresh rate. Above the refresh rate (timer pacing),
-//! frames the display passes over are the design, not misses. A run whose log has no display
-//! times (`e no_frame_statistics`: DXGI gave none) has `-` for every frame, which means unknown
-//! there, so no miss is read from it.
+//! A frame counts as the testbed's miss when the log has an `m` line for it (a frame skipped, or
+//! shown more than k vblanks after the one before it), when it was never drawn (a gap between
+//! drawn frames' numbers), or, with vsync pacing, when its display time is `-` just before a
+//! frame the testbed marked late: the statistics passed over an irregular stretch, where the
+//! unreported frame may be the late one. Any other `-` means the statistics didn't say (none
+//! yet, a stretch they never reported, or none at all after `e no_frame_statistics`), and with
+//! timer pacing it is a frame the display passed over by design.
+//!
+//! What the misses excuse is bounded by what they can do to the screen ([`Excuses`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kairo_core::testbed_log::{TestbedLog, TestbedRecord, ToneLog};
+use kairo_core::testbed_log::{Pace, TestbedLog, TestbedRecord, ToneLog};
 
 /// A testbed log, read for the checks.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +27,8 @@ pub(crate) struct Source {
     pub nominal_fps: u32,
     /// Its display's refresh rate, in Hz.
     pub refresh_hz: f64,
+    /// Whether it was timer-paced: its display shows the newest frame at each vblank.
+    pub timer: bool,
     /// Its run tag.
     pub run_tag: u8,
     /// The OS's SDR white and the display's peak, in nits, when it drew in HDR.
@@ -93,9 +98,20 @@ impl Source {
                 if matches!(e.name(), "no_frame_statistics" | "no_vblank_timing"))
         });
         let timed = !untimed && shown.values().any(Option::is_some);
-        // Drawn but never shown, at or below the refresh rate, where the log has display times.
-        if timed && f64::from(h.fps) <= refresh_hz * 1.005 {
-            misses.extend(shown.iter().filter(|(_, d)| d.is_none()).map(|(n, _)| *n));
+        let timer = h.pace == Pace::Timer;
+        // With vsync, a `-` just before a frame marked late: from the last frame back, each
+        // `-` frame belongs to the next frame that has a display time.
+        if timed && !timer {
+            let mut before_late = false;
+            let mut unknown_before_late = Vec::new();
+            for (&n, display) in shown.iter().rev() {
+                match display {
+                    Some(_) => before_late = misses.contains(&n),
+                    None if before_late => unknown_before_late.push(n),
+                    None => {}
+                }
+            }
+            misses.extend(unknown_before_late);
         }
         let beeps = log
             .beeps()
@@ -111,6 +127,7 @@ impl Source {
             fps: h.fps,
             nominal_fps: h.nominal_fps,
             refresh_hz,
+            timer,
             run_tag: h.run_tag,
             hdr: h.sdr_white_nits.zip(h.max_nits).filter(|_| h.hdr),
             timed,
@@ -131,12 +148,16 @@ impl Source {
         self.misses.contains(&n)
     }
 
-    /// Whether a step of the clip from testbed frame `from` to `to` touches a testbed miss: one
-    /// of the frames it passed over, or the frame after the one it landed on (a frame shown late
-    /// keeps its predecessor on screen, so a capture repeats or lands short).
-    pub fn affects(&self, from: i64, to: i64) -> bool {
-        let (low, high) = if from <= to { (from, to) } else { (to, from) };
-        self.misses.range(low + 1..=high + 1).next().is_some()
+    /// The runs of consecutive missed frames, first and last, in order.
+    fn miss_runs(&self) -> Vec<(i64, i64)> {
+        let mut runs: Vec<(i64, i64)> = Vec::new();
+        for &n in &self.misses {
+            match runs.last_mut() {
+                Some(run) if run.1 + 1 == n => run.1 = n,
+                _ => runs.push((n, n)),
+            }
+        }
+        runs
     }
 
     /// When frame `n` first showed, in seconds of QPC time, if the log says.
@@ -162,7 +183,8 @@ impl Source {
         Some(gaps[((gaps.len() - 1) as f64 * 0.05).floor() as usize])
     }
 
-    /// The log's word on frames `first..=last`, the span a clip shows.
+    /// The log's word on frames `first..=last`: the span a clip shows, which the caller carries
+    /// on over any misses that excused its steps (a stall still under way at the clip's end).
     pub fn stability(&self, first: i64, last: i64) -> Stability {
         if last < first {
             return Stability {
@@ -187,6 +209,67 @@ impl Source {
     }
 }
 
+/// What the testbed's misses can excuse among a clip's steps (README §6.3), bounded by what they
+/// can do to the screen. A run of m missed frames in a row held the frame before it on screen
+/// for m more frame times, so it can account for at most ⌈(m + 1)·fps / F_s⌉ + 1 of the steps
+/// that touch it (a step from N to N′ touches the misses in N + 1 ..= N′ + 1), each off its
+/// nominal size by at most m + 1 testbed frames. The testbed's numbers never go back, so no step
+/// back in time is its. The runs that excused a step are kept, so `source.stability` counts them.
+pub(crate) struct Excuses {
+    /// Each run of missed frames: first, last, and how many more steps it may excuse.
+    runs: Vec<(i64, i64, u64)>,
+    /// Testbed frames per output frame.
+    nominal: f64,
+    /// The last missed frame of the runs that excused a step.
+    used_until: Option<i64>,
+}
+
+impl Excuses {
+    /// The excuses `source`'s misses give a clip at `fps` output frames per second.
+    pub fn new(source: &Source, fps: u32) -> Excuses {
+        let per_frame = f64::from(fps.max(1)) / f64::from(source.fps.max(1));
+        let runs = source
+            .miss_runs()
+            .into_iter()
+            .map(|(a, b)| {
+                let m = (b - a + 1) as f64;
+                (a, b, ((m + 1.0) * per_frame).ceil() as u64 + 1)
+            })
+            .collect();
+        Excuses {
+            runs,
+            nominal: 1.0 / per_frame,
+            used_until: None,
+        }
+    }
+
+    /// Whether the testbed's misses explain the step from testbed frame `from` to `to`; uses up
+    /// one step of the run that does.
+    pub fn excuse(&mut self, from: i64, to: i64) -> bool {
+        if to < from {
+            return false;
+        }
+        let off = ((to - from) as f64 - self.nominal).abs();
+        let first = self.runs.partition_point(|r| r.1 < from + 1);
+        for run in &mut self.runs[first..] {
+            if run.0 > to + 1 {
+                break;
+            }
+            if run.2 > 0 && off <= (run.1 - run.0 + 2) as f64 {
+                run.2 -= 1;
+                self.used_until = Some(self.used_until.map_or(run.1, |u| u.max(run.1)));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The last missed frame that excused a step, if any did.
+    pub fn used_until(&self) -> Option<i64> {
+        self.used_until
+    }
+}
+
 /// `kairo-tone`'s beeps: each beep's number and when it played, in seconds of QPC time.
 pub(crate) fn voices(log: &ToneLog) -> Vec<(i64, f64)> {
     log.voices()
@@ -206,29 +289,73 @@ mod tests {
     }
 
     #[test]
-    fn misses_are_m_lines_gaps_and_frames_never_shown() {
+    fn misses_are_m_lines_gaps_and_unknown_frames_before_a_late_one() {
         let s = Source::new(&log(
-            "f 0 0 1 0\nf 1 1 2 -\nf 2 2 3 4\nf 5 5 6 7\nm 6 vblank\nf 7 7 8 9\nb 1 180 10 12\n",
+            "f 0 0 1 0\nf 1 1 2 -\nf 2 2 3 4\nm 2 vblank\nf 3 3 4 -\nf 4 4 5 6\n\
+             f 7 7 8 9\nm 8 vblank\nf 9 9 10 11\nb 1 180 10 12\n",
             180,
             "vsync",
         ));
         assert_eq!(s.every(), 1);
         assert!(!s.is_miss(0));
-        assert!(s.is_miss(1), "never shown");
-        assert!(s.is_miss(3) && s.is_miss(4), "never drawn");
-        assert!(s.is_miss(6), "an m line");
+        assert!(s.is_miss(1), "unknown, before the late frame 2");
+        assert!(s.is_miss(2), "an m line: shown late");
+        assert!(!s.is_miss(3), "unknown, before frame 4 on time");
+        assert!(s.is_miss(5) && s.is_miss(6), "never drawn");
+        assert!(s.is_miss(8), "an m line for a frame never drawn");
         assert_eq!(s.display_s(2), Some(4e-7));
         assert_eq!(s.display_s(1), None);
-        // A step from 2 to 5 passed over 3 and 4; a repeat of 0 sits before the miss at 1.
-        assert!(s.affects(2, 5));
-        assert!(s.affects(0, 0));
-        assert!(!s.affects(7, 7));
-        let st = s.stability(0, 7);
-        assert_eq!((st.frames, st.missed, st.unlogged), (8, 4, 0));
+        let st = s.stability(0, 9);
+        assert_eq!((st.frames, st.missed, st.unlogged), (10, 5, 0));
         assert!((st.share() - 0.5).abs() < 1e-12);
         // Frames past the log's end are unlogged.
-        assert_eq!(s.stability(5, 12).unlogged, 5);
+        assert_eq!(s.stability(5, 12).unlogged, 3);
         assert_eq!(s.beeps, [(1, 180, Some(1.2e-6))]);
+    }
+
+    /// A 180 fps vsync log of frames 1,000–2,999, all shown, with these frames missed.
+    fn missing(missed: impl Fn(i64) -> bool) -> Source {
+        let lines: String = (1_000..3_000)
+            .map(|n| {
+                if missed(n) {
+                    format!("m {n} vblank\n")
+                } else {
+                    format!("f {n} {n} {n} {n}\n")
+                }
+            })
+            .collect();
+        Source::new(&log(&lines, 180, "vsync"))
+    }
+
+    #[test]
+    fn a_miss_excuses_only_what_it_can_do_to_the_screen() {
+        // At 60 fps a tick is 3 testbed frames. One miss holds a frame two vblanks, too short
+        // for a capture to show it twice, so a freeze at it stays the capture's; it can account
+        // for the short and long steps around it, two of them, by a frame each.
+        let one = missing(|n| n == 1_121);
+        let mut x = Excuses::new(&one, 60);
+        assert!(!x.excuse(1_120, 1_120), "a repeat");
+        assert!(!x.excuse(1_120, 1_138), "the freeze's jump");
+        assert!(x.excuse(1_118, 1_120));
+        assert!(x.excuse(1_120, 1_124));
+        assert!(!x.excuse(1_120, 1_124), "used up");
+        assert_eq!(x.used_until(), Some(1_121));
+        // A stall of 30 frames held the frame half a second: its repeats at 60 fps and the jump
+        // after them are the testbed's, up to ⌈31/3⌉ + 1 = 12 steps.
+        let stall = missing(|n| (1_121..=1_150).contains(&n));
+        let mut x = Excuses::new(&stall, 60);
+        assert!((0..11).all(|_| x.excuse(1_120, 1_120)));
+        assert!(x.excuse(1_120, 1_151));
+        assert!(!x.excuse(1_120, 1_120));
+        // Never a step back in time, nor the step that returns past a splice.
+        let one = missing(|n| n == 1_600);
+        let mut x = Excuses::new(&one, 60);
+        assert!(!x.excuse(1_897, 1_450));
+        assert!(!x.excuse(1_450, 1_903));
+        assert_eq!(x.used_until(), None);
+        // At the testbed's own rate a miss shows as a repeat and the skip after it.
+        let mut x = Excuses::new(&missing(|n| n == 1_500), 180);
+        assert!(x.excuse(1_499, 1_499) && x.excuse(1_499, 1_501));
     }
 
     #[test]
@@ -260,14 +387,24 @@ mod tests {
         // A log with no display time at all says the same, event or not.
         let s = Source::new(&log("f 0 0 1 -\nf 1 1 2 -\n", 180, "vsync"));
         assert!(!s.timed && !s.is_miss(0) && !s.is_miss(1));
-        let s = Source::new(&log("f 0 0 1 0\nf 1 1 2 -\n", 180, "vsync"));
+        let s = Source::new(&log(
+            "f 0 0 1 0\nf 1 1 2 -\nf 2 2 3 4\nm 2 vblank\n",
+            180,
+            "vsync",
+        ));
         assert!(s.timed && s.is_miss(1));
     }
 
     #[test]
-    fn above_the_refresh_frames_passed_over_are_no_misses() {
-        let s = Source::new(&log("f 0 0 1 0\nf 1 1 2 -\nf 2 2 3 4\n", 360, "timer"));
+    fn timer_frames_passed_over_are_no_misses() {
+        let s = Source::new(&log(
+            "f 0 0 1 0\nf 1 1 2 -\nf 2 2 3 4\nm 2 slot\n",
+            360,
+            "timer",
+        ));
+        assert!(s.timer);
         assert!(!s.is_miss(1));
+        assert!(s.is_miss(2), "its slot missed");
         assert_eq!(s.every(), 1);
     }
 }

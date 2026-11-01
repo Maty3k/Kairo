@@ -208,6 +208,10 @@ pub(crate) fn voice_from_log(voices: &[(i64, f64)], clock: f64, length: f64) -> 
         .collect()
 }
 
+/// Where the game beeps belong (each flash m with its expected onset, in samples) and how they
+/// were placed, for the report; or why there are none.
+pub(crate) type GameWindows = Result<(Vec<(i64, f64)>, &'static str), String>;
+
 /// The beeps and levels each track shows at every event, worked out once for all six checks.
 pub(crate) struct Audio<'a> {
     tracks: Vec<Track<'a>>,
@@ -223,6 +227,8 @@ pub(crate) struct Audio<'a> {
     cues: Vec<Option<CueMatch>>,
     /// Why there are no game windows, when there aren't.
     no_game: Option<String>,
+    /// How the game windows were placed, for the report.
+    game_via: &'static str,
     /// Where the voice beeps belong by `kairo-tone`'s log; empty without one.
     voice_expected: Vec<f64>,
 }
@@ -271,12 +277,12 @@ fn preference(tracks: &[Track<'_>], first: &str) -> Vec<usize> {
 }
 
 impl<'a> Audio<'a> {
-    /// Measures `tracks` against the game beeps' expected onsets, or `no_game` saying why there
-    /// are none, and the voice beeps' from `kairo-tone`'s log when there is one. `cue` is the
-    /// cue's PCM at 48 kHz.
+    /// Measures `tracks` against the game beeps' expected onsets and how they were placed, or
+    /// why there are none, and the voice beeps' from `kairo-tone`'s log when there is one.
+    /// `cue` is the cue's PCM at 48 kHz.
     pub fn new(
         tracks: Vec<Track<'a>>,
-        game: Result<Vec<(i64, f64)>, String>,
+        game: GameWindows,
         voice: Option<Vec<f64>>,
         cue: &[f32],
     ) -> Self {
@@ -284,9 +290,9 @@ impl<'a> Audio<'a> {
             .iter()
             .map(|&k| (k, Detector::new(k.hz())))
             .collect();
-        let (game, no_game) = match game {
-            Ok(game) => (game, None),
-            Err(why) => (Vec::new(), Some(why)),
+        let (game, game_via, no_game) = match game {
+            Ok((game, via)) => (game, via, None),
+            Err(why) => (Vec::new(), "game beeps", Some(why)),
         };
         // Each tone's reference onsets (samples): the game's from the beeps found nearest each
         // flash, the others from a scan.
@@ -405,6 +411,7 @@ impl<'a> Audio<'a> {
             scans,
             cues,
             no_game,
+            game_via,
             voice_expected: voice.unwrap_or_default(),
         }
     }
@@ -458,10 +465,12 @@ impl<'a> Audio<'a> {
         (0..self.tracks.len())
             .map(|i| {
                 if let Some(timed) = &direct[i] {
-                    return Some((timed.clone(), Kind::Game, "game beeps".to_owned()));
+                    return Some((timed.clone(), Kind::Game, self.game_via.to_owned()));
                 }
                 // A voice track is timed against `kairo-tone`'s log when there is one (README §6.3:
-                // voice-only tracks from the voice log, else from Mix).
+                // voice-only tracks from the voice log, else from Mix), each beep searched for
+                // as widely as a game beep, and never through the Mix, which shares any delay
+                // of the voice path.
                 if !self.voice_expected.is_empty()
                     && self.tracks[i].expected.tone(Kind::Voice) == Tone::Present
                 {
@@ -472,7 +481,7 @@ impl<'a> Audio<'a> {
                         .voice_expected
                         .iter()
                         .filter_map(|&e| {
-                            let found = d.measure(samples, e, EVENT_RADIUS).filter(|b| d.counts(b));
+                            let found = d.measure(samples, e, WIDE_RADIUS).filter(|b| d.counts(b));
                             if found.is_none() && e + BEEP_LEN > end {
                                 return None;
                             }
@@ -483,13 +492,11 @@ impl<'a> Audio<'a> {
                             })
                         })
                         .collect();
-                    if timed.iter().any(|t| t.offset_ms.is_some()) {
-                        return Some((
-                            timed,
-                            Kind::Voice,
-                            "voice beeps, against kairo-tone's log".to_owned(),
-                        ));
-                    }
+                    return Some((
+                        timed,
+                        Kind::Voice,
+                        "voice beeps, against kairo-tone's log".to_owned(),
+                    ));
                 }
                 let a = anchor.filter(|&a| a != i)?;
                 let anchor_timed: Vec<(f64, f64)> = direct[a]
@@ -609,13 +616,21 @@ pub(crate) fn av_offset(audio: &Audio<'_>) -> Outcome {
                         fmt_ms(o)
                     )
                 }),
-                None => outcome.fails.push(format!(
-                    "{}: no game beep within {} ms of flash {} at {:.3} s",
-                    track.title,
-                    WIDE_RADIUS / MS,
-                    t.flash.unwrap_or_default(),
-                    t.at_s
-                )),
+                None => outcome.fails.push(match t.flash {
+                    Some(m) => format!(
+                        "{}: no game beep within {} ms of flash {m} at {:.3} s",
+                        track.title,
+                        WIDE_RADIUS / MS,
+                        t.at_s
+                    ),
+                    None => format!(
+                        "{}: no {} beep within {} ms of where kairo-tone's log puts it, at {:.3} s",
+                        track.title,
+                        kind.name(),
+                        WIDE_RADIUS / MS,
+                        t.at_s
+                    ),
+                }),
             }
         }
     }

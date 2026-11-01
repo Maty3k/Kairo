@@ -101,13 +101,13 @@ pub fn count(numbers: &[Option<i64>], source_fps: u32, fps: u32) -> Option<Count
 }
 
 /// [`count`], leaving out (into [`Counts::source_events`]) each repeat, skip, backward or judder
-/// step from testbed frame `from` to `to` for which `source(from, to)` holds: an event the
-/// testbed's own miss explains. A step on cadence needs no excuse and always counts.
+/// step from testbed frame `from` to `to`, in order, for which `source(from, to)` holds: an event
+/// the testbed's own miss explains. A step on cadence needs no excuse and always counts.
 pub fn count_excluding(
     numbers: &[Option<i64>],
     source_fps: u32,
     fps: u32,
-    source: impl Fn(i64, i64) -> bool,
+    mut source: impl FnMut(i64, i64) -> bool,
 ) -> Option<Counts> {
     let mut counts = Counts {
         longest_hold: 1,
@@ -158,12 +158,40 @@ pub const IDEAL_PHASES: i64 = 7;
 /// How long the ideal delivery runs.
 const IDEAL_SECONDS: f64 = 10.0;
 
-/// The ideal: a display at `refresh_hz` showing testbed frame `⌊v / every⌋` on vblank `v`
-/// (`every` vblanks per testbed frame), delivered on every vblank and paced at `rate`. Returns
-/// the worst drop-and-duplicate share and the worst judder share over [`IDEAL_PHASES`] phases,
-/// ticks falling 1/14 to 13/14 of a vblank after one.
-pub fn ideal(refresh_hz: f64, every: u32, source_fps: u32, rate: FrameRate) -> Option<(f64, f64)> {
-    if !(refresh_hz.is_finite() && refresh_hz >= 1.0) || every == 0 {
+/// Which testbed frame a display shows at each vblank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shows {
+    /// Each frame for this many vblanks (vsync pacing): frame `⌊v / k⌋` at vblank `v`.
+    Every(u32),
+    /// The newest frame of a testbed drawing this many a second on its own clock (timer
+    /// pacing): frame `⌊v × fps / refresh⌋` at vblank `v`, frames passed over above the refresh.
+    Newest(u32),
+}
+
+impl Shows {
+    /// The frame shown at vblank `v` of a display at `refresh_hz`.
+    fn frame_at(self, v: i64, refresh_hz: f64) -> i64 {
+        match self {
+            Shows::Every(k) => v / i64::from(k),
+            Shows::Newest(fps) => (v as f64 * f64::from(fps) / refresh_hz + 1e-9).floor() as i64,
+        }
+    }
+}
+
+/// The ideal: a display at `refresh_hz` showing testbed frames as `shows` says, delivered on
+/// every vblank and paced at `rate`. Returns the worst drop-and-duplicate share and the worst
+/// judder share over [`IDEAL_PHASES`] phases, ticks falling 1/14 to 13/14 of a vblank after one.
+pub fn ideal(
+    refresh_hz: f64,
+    shows: Shows,
+    source_fps: u32,
+    rate: FrameRate,
+) -> Option<(f64, f64)> {
+    let valid = match shows {
+        Shows::Every(k) => k > 0,
+        Shows::Newest(fps) => fps > 0,
+    };
+    if !(refresh_hz.is_finite() && refresh_hz >= 1.0) || !valid {
         return None;
     }
     let vblank = HNS_PER_SECOND as f64 / refresh_hz;
@@ -185,7 +213,7 @@ pub fn ideal(refresh_hz: f64, every: u32, source_fps: u32, rate: FrameRate) -> O
         let numbers: Vec<Option<i64>> = replay
             .shown_hns
             .iter()
-            .map(|&ts| Some((ts as f64 / vblank).round() as i64 / i64::from(every)))
+            .map(|&ts| Some(shows.frame_at((ts as f64 / vblank).round() as i64, refresh_hz)))
             .collect();
         let counts = count(&numbers, source_fps, rate.hz() as u32)?;
         worst.0 = worst.0.max(counts.drop_dup_share());
@@ -284,7 +312,7 @@ mod tests {
     fn the_ideal_matches_the_design_table() {
         // README §2 item 12 (judder_rule.py): every-vblank delivery paced at 60 fps.
         let rate = FrameRate::Fps60;
-        let at = |hz: f64| ideal(hz, 1, hz as u32, rate).unwrap();
+        let at = |hz: f64| ideal(hz, Shows::Every(1), hz as u32, rate).unwrap();
         let close = |a: f64, b: f64| (a - b).abs() < 0.005;
         assert_eq!(at(180.0), (0.0, 0.0));
         assert_eq!(at(120.0), (0.0, 0.0));
@@ -297,9 +325,31 @@ mod tests {
         assert!(close(at(50.0).0, 1.0 / 6.0), "{:?}", at(50.0));
         // A 90 fps testbed on a 180 Hz panel (each frame shows for two vblanks) judders at
         // 60 fps however well it is delivered, so the ideal carries it and the clip isn't blamed.
-        assert_eq!(ideal(180.0, 2, 90, rate).map(|i| i.1), Some(1.0));
-        assert!(ideal(f64::NAN, 1, 180, rate).is_none());
-        assert!(ideal(180.0, 0, 180, rate).is_none());
+        assert_eq!(
+            ideal(180.0, Shows::Every(2), 90, rate).map(|i| i.1),
+            Some(1.0)
+        );
+        assert!(ideal(f64::NAN, Shows::Every(1), 180, rate).is_none());
+        assert!(ideal(180.0, Shows::Every(0), 180, rate).is_none());
         assert_eq!(pacer_rate(25), None);
+    }
+
+    #[test]
+    fn a_timer_testbed_shows_its_newest_frame_each_vblank() {
+        // 360 fps on 180 Hz: every other frame shows, so a 30 or 60 fps capture steps evenly
+        // and a 120 fps one, a vblank and a half a frame, judders on every step (counting it as
+        // 360 a second, every step would be half a tick).
+        for rate in [FrameRate::Fps30, FrameRate::Fps60] {
+            assert_eq!(
+                ideal(180.0, Shows::Newest(360), 360, rate),
+                Some((0.0, 0.0))
+            );
+        }
+        let (_, judder) = ideal(180.0, Shows::Newest(360), 360, FrameRate::Fps120).unwrap();
+        assert_eq!(judder, 1.0);
+        let (drops, judder) = ideal(180.0, Shows::Newest(120), 120, FrameRate::Fps60).unwrap();
+        assert!(drops == 0.0 && judder == 0.0, "{drops} {judder}");
+        assert_eq!(Shows::Newest(120).frame_at(3, 180.0), 2);
+        assert_eq!(Shows::Newest(360).frame_at(180, 179.96), 360);
     }
 }
