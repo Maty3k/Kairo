@@ -1201,19 +1201,26 @@ mod cli {
             assert_eq!(code, 2, "{args:?}");
             assert!(!err.contains("someone"), "{err}");
         }
-        let (code, _, err) = run(&[
-            os("check"),
-            os("a.mp4"),
-            os("--profile"),
-            os("engine"),
-            os("--testbed-log"),
-            os("t.log"),
-        ]);
-        assert_eq!(code, 2);
-        assert!(
-            err.contains("--testbed-log comes with source.stability and the testbed and tone logs (research 16's PR 8)"),
-            "{err}"
-        );
+        // A log that can't be read or isn't one refuses the command line, naming the file only.
+        let dir = Dir::new();
+        let not_a_log = dir.0.join("t.log");
+        std::fs::write(&not_a_log, "f 0 1 2 3\n").unwrap();
+        for (flag, file) in [
+            ("--testbed-log", dir.0.join("missing.log")),
+            ("--testbed-log", not_a_log.clone()),
+            ("--voice-log", not_a_log.clone()),
+        ] {
+            let (code, _, err) = run(&[
+                os("check"),
+                os("a.mp4"),
+                os("--profile"),
+                os("engine"),
+                os(flag),
+                file.as_os_str(),
+            ]);
+            assert_eq!(code, 2, "{flag}");
+            assert!(!err.contains(&*dir.0.to_string_lossy()), "{err}");
+        }
     }
 
     #[test]

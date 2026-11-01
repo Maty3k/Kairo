@@ -8,6 +8,7 @@ mod audio;
 mod container;
 mod content;
 mod export;
+mod source;
 mod tracks;
 mod video;
 

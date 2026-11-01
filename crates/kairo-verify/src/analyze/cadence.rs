@@ -40,6 +40,9 @@ pub struct Counts {
     pub events: Vec<Event>,
     /// The judder steps, in order.
     pub judder_events: Vec<Event>,
+    /// Steps left out because they touch a frame the testbed itself missed (README §6.3: with a
+    /// log, events at testbed misses count as source), in order.
+    pub source_events: Vec<Event>,
 }
 
 impl Counts {
@@ -94,6 +97,18 @@ fn share(count: f64, steps: usize) -> f64 {
 /// run of readable frames, at `source_fps` testbed frames per second and `fps` output frames
 /// per second.
 pub fn count(numbers: &[Option<i64>], source_fps: u32, fps: u32) -> Option<Counts> {
+    count_excluding(numbers, source_fps, fps, |_, _| false)
+}
+
+/// [`count`], leaving out (into [`Counts::source_events`]) each repeat, skip, backward or judder
+/// step from testbed frame `from` to `to` for which `source(from, to)` holds: an event the
+/// testbed's own miss explains. A step on cadence needs no excuse and always counts.
+pub fn count_excluding(
+    numbers: &[Option<i64>],
+    source_fps: u32,
+    fps: u32,
+    source: impl Fn(i64, i64) -> bool,
+) -> Option<Counts> {
     let mut counts = Counts {
         longest_hold: 1,
         ..Counts::default()
@@ -112,7 +127,14 @@ pub fn count(numbers: &[Option<i64>], source_fps: u32, fps: u32) -> Option<Count
         let mut hold = 1;
         for step in cadence::steps(&run, i64::from(source_fps), fps).ok()? {
             let (from, to) = (run[step.index], run[step.index + 1]);
-            counts.add(&step, start + step.index + 1, from, to, &mut hold);
+            let frame = start + step.index + 1;
+            let event = step.delta <= 0 || step.ticks >= 2 || step.is_judder();
+            if event && source(from, to) {
+                counts.source_events.push(Event { frame, from, to });
+                hold = 1;
+                continue;
+            }
+            counts.add(&step, frame, from, to, &mut hold);
         }
         start = end;
     }
@@ -178,6 +200,27 @@ mod tests {
 
     fn numbers(values: &[i64]) -> Vec<Option<i64>> {
         values.iter().map(|&v| Some(v)).collect()
+    }
+
+    #[test]
+    fn only_events_at_source_misses_are_set_aside() {
+        // 180 fps content at 60 fps: a repeat of 9 and the skip after it, around a miss at 10.
+        let n = numbers(&[0, 3, 6, 9, 9, 15, 18, 21]);
+        let blind = count(&n, 180, 60).unwrap();
+        assert_eq!((blind.repeats, blind.skipped), (1, 1));
+        let counts = count_excluding(&n, 180, 60, |from, to| {
+            let (low, high) = (from.min(to), from.max(to));
+            (low + 1..=high + 1).contains(&10)
+        })
+        .unwrap();
+        assert_eq!((counts.repeats, counts.skipped, counts.steps), (0, 0, 5));
+        let set_aside: Vec<(i64, i64)> = counts
+            .source_events
+            .iter()
+            .map(|e| (e.from, e.to))
+            .collect();
+        // 6 → 9 lands just before the miss but is on cadence: it counts.
+        assert_eq!(set_aside, [(9, 9), (9, 15)]);
     }
 
     #[test]
