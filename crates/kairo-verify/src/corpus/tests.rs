@@ -444,6 +444,18 @@ fn clips_are_judged_by_research_16s_rules() {
         problems(&good, Verdict::Fail, &findings(328, &[0.0], &["video.gop"])),
         ["a good clip, but the verdict is fail", "video.gop failed"]
     );
+    // An unexpected failure names its first reason.
+    let mut decode = findings(328, &[0.0], &["decode.clean"]);
+    if let Some(f) = decode.iter_mut().find(|f| f.id == "decode.clean") {
+        f.detail = "2 decode errors; the last: Invalid data found".to_owned();
+    }
+    assert_eq!(
+        problems(&good, Verdict::Fail, &decode),
+        [
+            "a good clip, but the verdict is fail",
+            "decode.clean failed: 2 decode errors; the last: Invalid data found"
+        ]
+    );
     // The first frame held one tick short.
     assert_eq!(
         problems(&good, Verdict::Pass, &findings(327, &[0.0], &[])).len(),

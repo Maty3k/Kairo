@@ -256,8 +256,9 @@ impl Decoder for Linked {
             .map_err(|e| DecodeError::Start(format!("FFmpeg's decoder: {}", text(e))))?;
         let mut stats = DecodeStats::default();
         let mut picture = frame::Video::empty();
-        let mut packet = Packet::empty();
         loop {
+            // A new packet each time: `read` doesn't release the last one's data.
+            let mut packet = Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {}
                 Err(Error::Eof) => break,
@@ -305,8 +306,8 @@ impl Decoder for Linked {
         let mut stats = DecodeStats::default();
         let mut sound = frame::Audio::empty();
         let mut chunk = Vec::with_capacity(1_024 * channels);
-        let mut packet = Packet::empty();
         loop {
+            let mut packet = Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {}
                 Err(Error::Eof) => break,

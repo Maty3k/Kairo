@@ -680,14 +680,19 @@ pub fn judge(entry: &Entry, verdict: Verdict, checks: &[Finding]) -> Judged {
             problems.push(format!("{id} didn't fail"));
         }
     }
-    for id in &failed {
+    // An unexpected failure carries its first reason, so a corpus run's summary says why.
+    for finding in checks.iter().filter(|f| f.status == Status::Fail) {
         if !entry
             .must_fail
             .iter()
             .chain(&entry.may_fail)
-            .any(|m| m == id)
+            .any(|m| m == finding.id)
         {
-            problems.push(format!("{id} failed"));
+            problems.push(if finding.detail.is_empty() {
+                format!("{} failed", finding.id)
+            } else {
+                format!("{} failed: {}", finding.id, finding.detail)
+            });
         }
     }
     for finding in checks.iter().filter(|f| f.status == Status::Error) {
