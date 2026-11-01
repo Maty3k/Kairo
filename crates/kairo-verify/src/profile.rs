@@ -414,6 +414,9 @@ pub struct Plan {
     pub voice_included: bool,
     /// `--cue`: Kairo's cue at 48 kHz, (L+R)/2; testsig's placeholder when `None`.
     pub cue: Option<Vec<f32>>,
+    /// `content.bars_lines`' limit in codes as a PC corpus calibrates it (README §7.4), or
+    /// [`BARS_LINES_MAX_CODES`] when `None`.
+    pub bars_lines_codes: Option<f64>,
 }
 
 /// Why a profile, gate and expect file don't fit together.
@@ -474,6 +477,7 @@ impl Plan {
             av_tight: false,
             voice_included: false,
             cue: None,
+            bars_lines_codes: None,
         };
         match (profile, expect.as_ref()) {
             (Profile::Test, Some(e)) => {

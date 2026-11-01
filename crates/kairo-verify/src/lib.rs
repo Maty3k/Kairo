@@ -28,8 +28,9 @@
 //! [`mutate`] makes the bad clips that are one box-level change from a good one (README §7.3):
 //! moov after the media, an edit list, a wrong or missing `colr`, a second default track, and
 //! one uneven frame. [`synth`] renders pattern v1 for an encoder, as raw NV12 or as [`ipcm`]'s
-//! lossless I_PCM H.264, with the defects that live in the pictures and the clip's expect file
-//! (README §7.1–7.3).
+//! lossless I_PCM H.264, with its audio tracks as WAVs, the defects that live in the pictures or
+//! the sound, and the clip's expect file (README §7.1–7.3). [`corpus`] builds gate 1's good and
+//! bad clips with one encoder and judges them against their manifest (README §7.4).
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +41,7 @@ pub mod checks;
 pub mod cli;
 #[cfg(test)]
 mod content_tests;
+pub mod corpus;
 pub mod decode;
 pub mod expect;
 pub mod h264;

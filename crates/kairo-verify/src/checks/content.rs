@@ -555,7 +555,7 @@ fn video_check(
         "content.flash" => flash(analysis),
         "content.bars" => bars_psnr(plan, decoded, analysis),
         "content.colour_matrix" => colour_matrix(decoded, analysis),
-        "content.bars_lines" => bars_lines(decoded, analysis),
+        "content.bars_lines" => bars_lines(plan, decoded, analysis),
         "content.levels" if hdr => {
             Outcome::skip("the patches are HDR: hdr.curve_levels judges them")
         }
@@ -1130,15 +1130,24 @@ fn colour_matrix(decoded: &Decoded, a: &Analysis) -> Outcome {
     outcome
 }
 
-fn bars_lines(decoded: &Decoded, a: &Analysis) -> Outcome {
+fn bars_lines(plan: &Plan, decoded: &Decoded, a: &Analysis) -> Outcome {
     if decoded.bands.is_none() {
         return Outcome::skip("the picture is too small for the bars band");
     }
-    let limit = profile::BARS_LINES_MAX_CODES;
+    let (limit, source) = match plan.bars_lines_codes {
+        Some(codes) => (
+            codes,
+            "the corpus's calibration, max(4, 2 × its worst good clip) (README §7.4)",
+        ),
+        None => (
+            profile::BARS_LINES_MAX_CODES,
+            "README §2 item 14 (proposed)",
+        ),
+    };
     let worst = scored(a).map(|(_, b)| b.line).fold(0.0_f64, f64::max);
     let mut outcome = Outcome {
         value: json!({"max_codes": worst}),
-        limit: json!({"max_codes": limit, "source": "README §2 item 14 (proposed)"}),
+        limit: json!({"max_codes": limit, "source": source}),
         detail: format!("largest row or column residual {worst:.2} codes"),
         ..Outcome::default()
     };

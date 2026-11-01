@@ -7,11 +7,13 @@
 //! It runs, in the clip's folder so that FFmpeg's messages name the file only:
 //! `ffmpeg -v warning -nostdin -protocol_whitelist file,pipe -err_detect
 //! +crccheck+bitstream+buffer -ignore_editlist 1 -c:v h264 -i file:<file name> -map 0:v:0
-//! -fps_mode passthrough -pix_fmt yuv420p -f yuv4mpegpipe -`, and for audio track N `… -c:a aac
-//! -i file:<file name> -map 0:a:N -f f32le -` at the track's own channel count. YUV4MPEG2 states
-//! the picture size in its header, and its frames are packed yuv420p. No filter runs: it only decodes. Any line
-//! FFmpeg prints counts as a decode error, warnings included: FFmpeg reports a frame it had to
-//! conceal (the flags the linked backend reads) only as the warning `corrupt decoded frame`.
+//! -fps_mode passthrough -enc_time_base:v demux -pix_fmt yuv420p -f yuv4mpegpipe -`, and for
+//! audio track N `… -c:a aac -i file:<file name> -map 0:a:N -f f32le -` at the track's own
+//! channel count. YUV4MPEG2 states the picture size in its header, and its frames are packed
+//! yuv420p. No filter runs: it only decodes. Any line FFmpeg prints counts as a decode error,
+//! warnings included: FFmpeg reports a frame it had to conceal (the flags the linked backend
+//! reads) only as the warning `corrupt decoded frame`. The pipe keeps the clip's time base, so
+//! pictures less than a frame apart don't trip FFmpeg's warnings about its own output.
 //! A relative `--ffmpeg` path is taken from the caller's folder, not the clip's.
 
 use std::ffi::OsString;
@@ -238,11 +240,16 @@ impl Decoder for Cli {
         &mut self,
         each: &mut dyn FnMut(usize, &Planes<'_>) -> ControlFlow<()>,
     ) -> Result<DecodeStats, DecodeError> {
+        // The clip's own time base on the pipe: in the pipe's 1/fps, two pictures less than a
+        // frame apart (a VFR clip) would share a timestamp, and FFmpeg's warnings about it
+        // would read as decode errors.
         let output = [
             "-map",
             "0:v:0",
             "-fps_mode",
             "passthrough",
+            "-enc_time_base:v",
+            "demux",
             "-pix_fmt",
             "yuv420p",
             "-f",
