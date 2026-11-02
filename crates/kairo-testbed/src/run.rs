@@ -746,7 +746,7 @@ fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) ->
         let present_hns = platform::now_hns();
         let id = ctx.chain.present_count().unwrap_or(0);
         let missed = pacer.missed(frame, present_hns);
-        shown.presented(frame, target_hns, id, present_hns, missed);
+        shown.presented(frame, target_hns, id, present_hns, missed, false);
         if !started {
             started = true;
             ctx.started(start)?;
