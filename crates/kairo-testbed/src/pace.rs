@@ -419,6 +419,16 @@ impl Shown {
     }
 }
 
+/// What a blocking `Present` left in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    /// A frame: the earliest vblank the next one can take, its vblank plus its interval.
+    Frame(i64),
+    /// A black warm-up frame, when `Present` returned: it takes the first vblank after, with an
+    /// interval of 1. Kept as a time, since the grid may come only with a later reading.
+    Warmup(i64),
+}
+
 /// The last frame a vsync pacer drew.
 #[derive(Debug, Clone, Copy)]
 struct Drawn {
@@ -439,9 +449,8 @@ pub struct VsyncPacer {
     /// Whether the loop plans while the frame it presented last is still queued (`Present`
     /// blocks, as in exclusive fullscreen, rather than a waitable object).
     blocking: bool,
-    /// The earliest vblank the next frame can take behind a frame still queued: that frame's
-    /// vblank plus its interval.
-    queued: Option<i64>,
+    /// The present still queued when the loop plans.
+    queued: Option<Queued>,
     /// The monitor's own vblank clock, for when DXGI has no statistics.
     clock: Option<Grid>,
     /// Frame 0's vblank, once a grid has placed it.
@@ -532,8 +541,14 @@ impl VsyncPacer {
             return Step::Warmup;
         };
         let mut reachable = grid.next_after(now_hns);
-        if let Some(queued) = self.queued.filter(|_| self.blocking) {
-            reachable = reachable.max(grid.at_or_after(queued - self.period.times(1) / 2));
+        match self.queued.filter(|_| self.blocking) {
+            Some(Queued::Frame(t)) => {
+                reachable = reachable.max(grid.at_or_after(t - self.period.times(1) / 2));
+            }
+            Some(Queued::Warmup(present_hns)) => {
+                reachable = reachable.max(grid.next_after(present_hns) + 1);
+            }
+            None => {}
         }
         let earliest = grid.time_of(reachable);
         let t0 = match self.t0 {
@@ -583,9 +598,8 @@ impl VsyncPacer {
     /// A black warm-up frame was presented with interval 1, and `Present` returned at
     /// `present_hns`.
     pub fn warmup_presented(&mut self, present_hns: i64) {
-        if let Some(grid) = self.grid().filter(|_| self.blocking) {
-            let taken = grid.time_of(grid.next_after(present_hns));
-            self.queued = Some(taken + self.period.times(1));
+        if self.blocking {
+            self.queued = Some(Queued::Warmup(present_hns));
         }
     }
 
@@ -593,7 +607,7 @@ impl VsyncPacer {
     /// (`GetLastPresentCount`), and `Present` returned at `present_hns`.
     pub fn presented(&mut self, frame: u64, target_hns: i64, present_id: u32, present_hns: i64) {
         if self.blocking {
-            self.queued = Some(target_hns + self.period.times(self.k));
+            self.queued = Some(Queued::Frame(target_hns + self.period.times(self.k)));
         }
         self.shown
             .presented(frame, target_hns, present_id, present_hns, false);
@@ -943,8 +957,13 @@ mod tests {
         let mut i = 0;
         while drawn < frames {
             match d.stats(now) {
+                // The first call is DISJOINT (Microsoft's flip-model page).
+                _ if wait == Wait::Blocking && i == 0 => {}
                 Some(stats) => out.extend(pacer.on_stats(stats)),
-                None => pacer.on_vblank(d.time(d.vblank_at(now))),
+                // The waitable loop's model takes the monitor's clock until statistics come; the
+                // blocking one waits for them, as run.rs does for its first 3 s.
+                None if wait == Wait::Waitable => pacer.on_vblank(d.time(d.vblank_at(now))),
+                None => {}
             }
             // A blocking Present queues its frame once the one before it is taken.
             let queued = match wait {
@@ -1103,6 +1122,39 @@ mod tests {
                         near(shown, r.record.target_hns + latency_hns),
                         "{what}: {r:?}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_frame_0_takes_its_anchor_whenever_the_statistics_come() {
+        // The warm-up frames queued before the first statistics count too: wherever the anchor
+        // falls among the first vblanks, frame 0 shows on it (or, if no grid came before it had
+        // gone by, on the next whole second's), and nothing is skipped.
+        for k in [1, 2, 3] {
+            for anchor in 1..12_i64 {
+                let start = HZ180.times(anchor) - 1;
+                let run = run_loop(
+                    Wait::Blocking,
+                    k,
+                    30,
+                    Display::new(0, 0),
+                    start,
+                    |_| 0,
+                    |_| 0,
+                );
+                let what = format!("k {k} anchor {anchor}");
+                assert!(
+                    near(run.out[0].record.display_hns.unwrap(), run.anchor),
+                    "{what}: {:?} at {}",
+                    run.out[0],
+                    run.anchor
+                );
+                assert!(run.skipped.is_empty(), "{what}: {:?}", run.skipped);
+                for r in &run.out {
+                    let shown = r.record.display_hns.unwrap();
+                    assert!(near(shown, r.record.target_hns), "{what}: {r:?}");
                 }
             }
         }

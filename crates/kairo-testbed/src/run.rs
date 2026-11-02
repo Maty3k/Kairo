@@ -244,14 +244,14 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     if let Some(why) = cli::refuse_rate(config.pace, config.mode, fps, k, &vsync_rates) {
         return Err(Stop(exit::MONITOR, why));
     }
-    let gpu =
-        Gpu::on_adapter(target.adapter_luid, target.hmonitor).map_err(|e| Stop(exit::DEVICE, e))?;
-    // The watch's factory is made before the HDR state is read, so a toggle from here on makes
-    // it stale.
+    // The watch's factory is made before the device's, whose output the HDR state is read
+    // through, so a toggle from here on makes the watch stale.
     let hdr_watch = match config.hdr {
         Hdr::Auto => HdrWatch::new(target.adapter_luid, target.hmonitor),
         Hdr::Off => None,
     };
+    let gpu =
+        Gpu::on_adapter(target.adapter_luid, target.hmonitor).map_err(|e| Stop(exit::DEVICE, e))?;
     let hdr = match config.hdr {
         Hdr::Off => None,
         Hdr::Auto => gpu.output_hdr().filter(|o| o.pq).map(|o| {
