@@ -26,7 +26,7 @@ env:
 
 jobs:
   linux:
-    name: Linux (fmt, clippy, kairo-core, mock and verify tests, house rules)
+    name: Linux (fmt, clippy, kairo-core, mock, verify and testbed tests, house rules)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -46,8 +46,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Test kairo-core, the mock engine and kairo-verify
-        run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify --locked
+      - name: Test kairo-core, the mock engine, kairo-verify and the testbed's pure parts
+        run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify -p kairo-testbed --locked
 
       # The shipped kairo-verify has no dev-tools: it never spawns FFmpeg (research 16 §2 item 3).
       - name: kairo-verify without dev-tools
