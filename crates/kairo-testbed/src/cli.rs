@@ -11,13 +11,15 @@ pub const USAGE: &str =
     "usage: testbed --monitor <monitorDevicePath> [--mode borderless|windowed|exclusive]
                [--size WxH] [--activate] [--fps N] [--pace vsync|timer] [--seconds S]
                [--pattern full|motion] [--load scroll|churn|none] [--hdr auto|off] [--hdr-patches]
-               [--run-tag 0..127] [--log FILE] [--ready FILE] [--stop-on-stdin-eof]
+               [--beep on|off] [--run-tag 0..127] [--log FILE] [--ready FILE] [--stop-on-stdin-eof]
        testbed --version | --help
 --monitor takes the monitor's device path (pc harness displays lists them); there is no
 default screen. --size is for windowed mode (default 1280x720), and the window, frame
 included, must fit on the monitor. --fps defaults to the monitor's rounded refresh rate. --seconds defaults to 60. Exclusive mode needs focus, so it
 implies --activate, which waits until the foreground lock time-out has passed since the last
-input. The log and the ready file must not exist yet; the ready file's folder must be on NTFS.
+input. --beep (on by default) plays a 1 kHz beep at -30 dBFS, aimed at each flash after frame 0,
+on the default playback device. The log and the ready file must not exist yet; the ready file's
+folder must be on NTFS.
 Exit codes: 0 ok, 2 usage, 3 monitor not found or rate refused, 4 device or swap chain,
 5 focus or exclusive fullscreen not obtained.";
 
@@ -69,6 +71,8 @@ pub struct Config {
     pub hdr: Hdr,
     /// HDR patches above SDR white in the motion pattern too.
     pub hdr_patches: bool,
+    /// The 1 kHz game beep at each flash.
+    pub beep: bool,
     /// The run's tag; `None`: random.
     pub run_tag: Option<u8>,
     /// The QPC log.
@@ -108,6 +112,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut load = None;
     let mut hdr = None;
     let mut hdr_patches = false;
+    let mut beep = None;
     let mut run_tag = None;
     let mut log = None;
     let mut ready = None;
@@ -199,6 +204,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 once(hdr_patches, flag)?;
                 hdr_patches = true;
             }
+            "--beep" => {
+                once(beep.is_some(), flag)?;
+                beep = Some(match value(flag)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("--beep takes on or off\n{USAGE}")),
+                });
+            }
             "--run-tag" => {
                 once(run_tag.is_some(), flag)?;
                 run_tag = Some(number(&value(flag)?, 0, 127, flag)? as u8);
@@ -252,11 +265,115 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         load: load.unwrap_or(Load::Scroll),
         hdr,
         hdr_patches,
+        beep: beep.unwrap_or(true),
         run_tag,
         log,
         ready,
         stop_on_stdin_eof,
     })))
+}
+
+/// `kairo-tone.exe`'s usage text (README §5).
+pub const TONE_USAGE: &str =
+    "usage: kairo-tone beeps [--hz 2000] [--offset-ms 500] [--seconds S] [--dbfs -30]
+                        [--run-tag 0..127] [--log FILE] [--stop-on-stdin-eof]
+       kairo-tone --version | --help
+It plays a beep (100 ms, 2 ms ramps) at every whole QPC second plus --offset-ms on the default
+playback device, as its own process, and logs when each was meant to play and when it did.
+--dbfs is the peak level, -30 at most. --seconds defaults to 60. The log must not exist yet.
+Exit codes: 0 ok, 2 usage, 4 audio failed.";
+
+/// What `kairo-tone beeps` was asked to play.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToneConfig {
+    /// The beep's frequency.
+    pub hz: u32,
+    /// Where in each second it starts.
+    pub offset_ms: u32,
+    /// How long to play.
+    pub seconds: u32,
+    /// The peak level, −30 dBFS at most.
+    pub dbfs: f64,
+    /// The run's tag; `None`: random.
+    pub run_tag: Option<u8>,
+    /// The log.
+    pub log: Option<PathBuf>,
+    /// Stop at EOF on standard input.
+    pub stop_on_stdin_eof: bool,
+}
+
+/// What `kairo-tone`'s command line asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToneCommand {
+    /// `beeps`.
+    Beeps(ToneConfig),
+    /// `--version`.
+    Version,
+    /// `--help`.
+    Help,
+}
+
+/// Parses `kairo-tone`'s arguments, without the program name.
+pub fn parse_tone(args: &[String]) -> Result<ToneCommand, String> {
+    let (mode, rest) = match args {
+        [flag] if flag == "--version" || flag == "-V" => return Ok(ToneCommand::Version),
+        [flag] if flag == "--help" || flag == "-h" => return Ok(ToneCommand::Help),
+        [mode, rest @ ..] if mode == "beeps" => (mode, rest),
+        _ => return Err(format!("the mode comes first: beeps\n{TONE_USAGE}")),
+    };
+    debug_assert_eq!(mode, "beeps");
+    let mut config = ToneConfig {
+        hz: 2_000,
+        offset_ms: 500,
+        seconds: 60,
+        dbfs: -30.0,
+        run_tag: None,
+        log: None,
+        stop_on_stdin_eof: false,
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    let mut words = rest.iter();
+    while let Some(flag) = words.next() {
+        if seen.contains(&flag.as_str()) {
+            return Err(format!("{flag} is given twice\n{TONE_USAGE}"));
+        }
+        seen.push(flag.as_str());
+        let mut value = || {
+            words
+                .next()
+                .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value\n{TONE_USAGE}"))
+        };
+        let whole = |text: String, low: u32, high: u32| {
+            text.parse::<u32>()
+                .ok()
+                .filter(|n| (low..=high).contains(n))
+                .ok_or_else(|| {
+                    format!("{flag} takes a whole number from {low} to {high}\n{TONE_USAGE}")
+                })
+        };
+        match flag.as_str() {
+            "--hz" => config.hz = whole(value()?, 100, 20_000)?,
+            "--offset-ms" => config.offset_ms = whole(value()?, 0, 999)?,
+            "--seconds" => config.seconds = whole(value()?, 1, u32::MAX)?,
+            "--dbfs" => {
+                let text = value()?;
+                config.dbfs = text
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|d| d.is_finite() && (-90.0..=-30.0).contains(d))
+                    .ok_or_else(|| {
+                        format!("--dbfs takes a level from -90 to -30, never louder\n{TONE_USAGE}")
+                    })?;
+            }
+            "--run-tag" => config.run_tag = Some(whole(value()?, 0, 127)? as u8),
+            "--log" => config.log = Some(PathBuf::from(value()?)),
+            "--stop-on-stdin-eof" => config.stop_on_stdin_eof = true,
+            _ => return Err(format!("unknown argument\n{TONE_USAGE}")),
+        }
+    }
+    Ok(ToneCommand::Beeps(config))
 }
 
 /// A whole number from `low` to `high`.
@@ -357,7 +474,9 @@ mod tests {
         assert_eq!(c.pattern, Pattern::Full);
         assert_eq!(c.load, Load::Scroll);
         assert_eq!(c.hdr, Hdr::Auto);
+        assert!(c.beep);
         assert_eq!(c.run_tag, None);
+        assert!(!run("--monitor m --beep off").beep);
         let c = run(
             "--monitor m --mode windowed --size 640x360 --fps 90 --pace timer --seconds 20 \
              --pattern motion --load churn --hdr auto --hdr-patches --run-tag 127 --log a.log \
@@ -401,11 +520,53 @@ mod tests {
             "--monitor m --mode exclusive --pace timer",
             "--monitor m --hdr off --hdr-patches",
             "--monitor m --log x --ready x",
-            "--monitor m --beep on",
+            "--monitor m --beep loud",
             "--monitor m extra",
         ] {
             let message = parse(&args(line)).unwrap_err();
             assert!(message.contains("usage: testbed"), "{line}: {message}");
+        }
+    }
+
+    #[test]
+    fn kairo_tone_takes_beeps_and_never_louder_than_minus_30() {
+        let tone = |line: &str| match parse_tone(&args(line)) {
+            Ok(ToneCommand::Beeps(config)) => config,
+            other => panic!("{line}: {other:?}"),
+        };
+        let c = tone("beeps");
+        assert_eq!(
+            (c.hz, c.offset_ms, c.seconds, c.dbfs),
+            (2_000, 500, 60, -30.0)
+        );
+        let c = tone(
+            "beeps --hz 1500 --offset-ms 250 --seconds 20 --dbfs -40 --run-tag 7 --log t.log --stop-on-stdin-eof",
+        );
+        assert_eq!(
+            (c.hz, c.offset_ms, c.seconds, c.dbfs),
+            (1_500, 250, 20, -40.0)
+        );
+        assert_eq!(c.run_tag, Some(7));
+        assert_eq!(c.log, Some(PathBuf::from("t.log")));
+        assert!(c.stop_on_stdin_eof);
+        assert_eq!(parse_tone(&args("--version")), Ok(ToneCommand::Version));
+        for line in [
+            "",
+            "--hz 2000",
+            "soak",
+            "beeps --dbfs -29.9",
+            "beeps --dbfs 0",
+            "beeps --dbfs nan",
+            "beeps --offset-ms 1000",
+            "beeps --hz 50",
+            "beeps --seconds 0",
+            "beeps --run-tag 128",
+            "beeps --log",
+            "beeps --hz 2000 --hz 2000",
+            "beeps --loud",
+        ] {
+            let message = parse_tone(&args(line)).unwrap_err();
+            assert!(message.contains("usage: kairo-tone"), "{line}: {message}");
         }
     }
 
