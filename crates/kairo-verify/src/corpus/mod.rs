@@ -366,7 +366,7 @@ pub struct Recipe {
 pub const GOOD: &str = "good-1080p60";
 
 /// VideoToolbox's `bframes` clip also fails these: its B-frames come with an irregular `stts`,
-/// 57-frame GOPs and an audio lead that no longer matches (README §7.3 [Mac]).
+/// 57-frame GOPs and an audio lead that no longer matches (README §7.3, measured on the Mac).
 const BFRAMES_MAY_FAIL: [&str; 3] = ["video.cfr", "video.gop", "av.start_alignment"];
 
 impl Recipe {
