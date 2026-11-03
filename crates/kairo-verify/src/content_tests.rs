@@ -1841,6 +1841,60 @@ fn steps_at_testbed_misses_are_the_sources_not_the_clips() {
 }
 
 #[test]
+fn the_hold_a_late_frame_caused_is_the_sources() {
+    // Exclusive at 180 Hz: at four output frames the testbed's next frame L showed 6 vblanks
+    // late, L + 1 right after it, and L + 2 ..= L + 7 were passed over to catch up. The frame
+    // before L stayed on screen 7 vblanks, so the 60 fps capture shows it three times, then
+    // jumps to L + 8: two repeats and a jump each, which a one-frame miss couldn't explain.
+    let at = [10_u64, 40, 70, 100];
+    let content: Vec<u64> = (0..FRAMES)
+        .map(|k| match at.iter().find(|&&a| k == a + 1 || k == a + 2) {
+            Some(&a) => 1_000 + 3 * a,
+            None => 1_000 + 3 * k,
+        })
+        .collect();
+    let shown = |n: u64| LOG_BASE_HNS + ((n - 1_000) as f64 * 10_000_000.0 / 180.0).round() as i64;
+    let mut text = format!(
+        "# kairo-testbed 1\nh pattern=1 run=5 mode=exclusive pace=vsync fps=180 F=180 size=320x180 refresh_mhz=180000 hdr=0 sdr_white_nits=- max_nits=- start_hns={LOG_BASE_HNS}\n"
+    );
+    for n in 1_000..=1_400_u64 {
+        let late = at
+            .iter()
+            .map(|&a| 1_000 + 3 * a + 1)
+            .find(|&l| (l..l + 8).contains(&n));
+        let t = shown(n);
+        match late.map(|l| n - l) {
+            Some(0) => text.push_str(&format!(
+                "f {n} {t} {} {}\nm {n} vblank\n",
+                t - 20_000,
+                shown(n + 6)
+            )),
+            Some(1) => text.push_str(&format!("f {n} {t} {} {}\n", t - 20_000, shown(n + 6))),
+            Some(_) => text.push_str(&format!("m {n} vblank\n")),
+            None => text.push_str(&format!("f {n} {t} {} {t}\n", t - 20_000)),
+        }
+    }
+    let mut plan = plan_for(Profile::Engine, 60, 2, 180);
+    let blind = run_spec(
+        &Spec::good(),
+        content.clone(),
+        Damage::default(),
+        options(),
+        &plan,
+    );
+    assert_eq!(status(&blind, "cadence.drops_dups"), Status::Fail);
+    plan.testbed_log = Some(kairo_core::testbed_log::TestbedLog::parse(&text).unwrap());
+    let report = run_spec(&Spec::good(), content, Damage::default(), options(), &plan);
+    let drops = report
+        .checks
+        .iter()
+        .find(|f| f.id == "cadence.drops_dups")
+        .unwrap();
+    assert_eq!(drops.status, Status::Pass, "{}", report.to_text());
+    assert_eq!(drops.value["source_events"], 12, "{}", drops.detail);
+}
+
+#[test]
 fn another_runs_log_is_refused() {
     let mut plan = plan_for(Profile::Engine, 60, 2, 180);
     plan.testbed_log = Some(testbed_log(5_000, 5_400, &[], 0.0, 9));
@@ -1911,5 +1965,45 @@ fn a_voice_track_is_timed_against_kairo_tones_log() {
         );
         let median = voice["median_ms"].as_f64().unwrap();
         assert!((median - early * 1_000.0).abs() < 1.0, "{early}: {voice}");
+    }
+    // A Voice chat track without a single voice beep it can count, silent or too faint (about
+    // −63 dBFS, under the −60 dBFS threshold), isn't timed: av.offset leaves it to routing, as it
+    // does without the log, and the verdict doesn't turn on the log.
+    let (spec, mut plan) = four_tracks();
+    plan.testbed_log = Some(testbed_log(1_000, 1_400, &[], 0.0, 5));
+    let clock = shown_at(1_000.0) - LOG_BASE_HNS as f64 / 1e7;
+    let hns = ((shown_at(180.0 * 6.0) + 0.5 - clock) * 1e7).round() as i64;
+    let voice_log = kairo_core::testbed_log::ToneLog::parse(&format!(
+        "# kairo-tone 1\nh run=5 hz=2000 offset_ms=500 dbfs=-30\nv 0 {hns} {hns}\n"
+    ))
+    .unwrap();
+    let i = spec
+        .audio
+        .iter()
+        .position(|t| t.title == "Voice chat")
+        .unwrap();
+    for faint in [None, Some(-33.0)] {
+        let mut tracks = four_track_audio(&spec);
+        match faint {
+            Some(gain) => tracks[i].sounds.iter_mut().for_each(|s| s.2 = gain),
+            None => tracks[i].sounds.clear(),
+        }
+        let mut verdicts = Vec::new();
+        for log in [None, Some(voice_log.clone())] {
+            plan.voice_log = log;
+            let report = run_audio(&spec, &plan, tracks.clone());
+            let voice = offsets(&report)
+                .into_iter()
+                .find(|t| t["track"] == "Voice chat" || t["title"] == "Voice chat")
+                .unwrap_or_else(|| panic!("{}", report.to_text()));
+            assert_eq!(voice["measured"], false, "{faint:?}: {voice}");
+            assert!(
+                !failing(&report).contains(&"av.offset"),
+                "{faint:?}: {}",
+                report.to_text()
+            );
+            verdicts.push(report.verdict);
+        }
+        assert_eq!(verdicts[0], verdicts[1], "{faint:?}");
     }
 }

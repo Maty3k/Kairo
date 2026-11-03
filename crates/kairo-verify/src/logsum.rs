@@ -231,16 +231,21 @@ pub fn testbed(log: &TestbedLog) -> Summary {
         .filter_map(|f| Some((f.frame, f.display_hns?)))
         .collect();
     let unknown = frames.iter().filter(|f| f.display_hns.is_none()).count();
-    let untimed = has(&events, "no_frame_statistics") || has(&events, "no_vblank_timing");
-    let timed = !untimed && !shown.is_empty();
-    // Missed: m lines and frames never drawn; with vsync, also a `-` just before a frame marked
-    // late (the statistics passed over an irregular stretch). Any other `-` is unknown.
+    // The run's warm-up gave no statistics (and, with `no_vblank_timing`, no clock either); any
+    // that came later still timed their frames.
+    let untimed = ["no_frame_statistics", "no_vblank_timing"]
+        .into_iter()
+        .find(|e| has(&events, e));
+    let timed = !shown.is_empty();
+    // Missed: m lines and frames never drawn; with vsync and statistics from the start, also a
+    // `-` just before a frame marked late (the statistics passed over an irregular stretch), as
+    // `check` counts them. Any other `-` is unknown.
     let mut missed: BTreeSet<u64> = m_lines.clone();
     let drawn: BTreeSet<u64> = frames.iter().map(|f| f.frame).collect();
     if let (Some(a), Some(b)) = (first, last) {
         missed.extend((a..=b).filter(|n| !drawn.contains(n)));
     }
-    if timed && !timer {
+    if timed && untimed.is_none() && !timer {
         let mut before_late = false;
         for f in frames.iter().rev() {
             match f.display_hns {
@@ -270,28 +275,35 @@ pub fn testbed(log: &TestbedLog) -> Summary {
             part as f64 / whole as f64
         }
     };
-    let missed_share;
+    let missed_share = share_of(missed.len(), span);
+    let mut empty_vblank_share = None;
     let mut criteria = Vec::new();
     if above_refresh {
-        // Judged by what the display showed: a vblank that brought no new frame is a miss.
+        // Judged by what the display showed, a vblank that brought no new frame being a miss,
+        // and by the testbed's own slots: those with m lines or never drawn, as `check` counts
+        // them. A loop too slow for its rate still brings a new frame at every vblank.
         let total: i64 = vblank_steps.iter().sum();
         let extra: i64 = vblank_steps.iter().map(|&s| (s - 1).max(0)).sum();
-        missed_share = share_of(extra.max(0) as usize, total.max(0) as u64);
+        let empty = share_of(extra.max(0) as usize, total.max(0) as u64);
+        empty_vblank_share = Some(empty);
         criteria.push(Criterion {
             name: "missed vblanks",
-            pass: fullscreen.then_some(total > 0 && missed_share <= MISSED_SHARE_MAX),
+            pass: fullscreen.then_some(
+                total > 0 && empty <= MISSED_SHARE_MAX && missed_share <= MISSED_SHARE_MAX,
+            ),
             detail: if total == 0 {
                 "no display times to judge the vblanks by".to_owned()
             } else {
                 format!(
-                    "{extra} of {total} vblanks brought no new frame ({:.3}%; limit {:.1}%); {misses} slots missed",
+                    "{extra} of {total} vblanks brought no new frame ({:.3}%); {} of {span} slots missed ({:.3}%); limit {:.1}% each",
+                    empty * 100.0,
+                    missed.len(),
                     missed_share * 100.0,
                     MISSED_SHARE_MAX * 100.0
                 )
             },
         });
     } else {
-        missed_share = share_of(missed.len(), span);
         criteria.push(Criterion {
             name: "missed vblanks",
             pass: (fullscreen && span > 0).then_some(missed_share <= MISSED_SHARE_MAX),
@@ -321,18 +333,24 @@ pub fn testbed(log: &TestbedLog) -> Summary {
         });
     }
     let spread = Spread::of(intervals);
-    criteria.push(if !timed {
+    // Statistics that came after the warm-up gave none: said, as the frames before them lack
+    // display times.
+    let late_statistics = untimed.map_or(String::new(), |e| {
+        format!("; the statistics came only after e {e}")
+    });
+    let mut display = if !timed {
         Criterion {
             name: "display times advance at the refresh",
             pass: Some(false),
-            detail: if untimed {
+            detail: if untimed.is_some() {
                 "no display times: the swap chain gave no frame statistics".to_owned()
             } else {
                 "no display times".to_owned()
             },
         }
     } else if above_refresh {
-        // The newest frame at each vblank: about refresh/fps of the frames show, a period apart.
+        // The newest frame at each vblank: refresh/fps of the frames show, a period apart; at
+        // least 99% of that share must.
         let share = share_of(shown.len(), frames.len() as u64);
         let expected = refresh_hz / fps;
         let median = spread.map_or(0.0, |s| s.median);
@@ -372,7 +390,11 @@ pub fn testbed(log: &TestbedLog) -> Summary {
                 frame_ms
             ),
         }
-    });
+    };
+    if timed {
+        display.detail.push_str(&late_statistics);
+    }
+    criteria.push(display);
     criteria.push(beep_criterion(
         count,
         played,
@@ -411,7 +433,8 @@ pub fn testbed(log: &TestbedLog) -> Summary {
             "refresh_mhz": h.refresh_mhz, "size": [h.width, h.height], "hdr": h.hdr,
             "frames": frames.len(), "span": span, "never_drawn": span.saturating_sub(drawn.len() as u64),
             "m_lines": misses, "missed": missed.len(), "unknown_display": unknown,
-            "missed_share": missed_share, "display_interval_ms": spread, "frame_period_ms": frame_ms,
+            "missed_share": missed_share, "empty_vblank_share": empty_vblank_share,
+            "display_interval_ms": spread, "frame_period_ms": frame_ms,
             "length_s": length_s, "beeps": count, "beeps_played": played,
             "beep_error_ms": Spread::of(errors), "events": events,
         }),
@@ -549,6 +572,45 @@ mod tests {
     }
 
     #[test]
+    fn statistics_that_came_after_the_warm_up_are_judged() {
+        // `e no_frame_statistics`, then statistics before frame 0: every frame has a display
+        // time, so the run passes, and the detail says when the statistics came.
+        let s = summarize(&testbed_text(
+            3_600,
+            "borderless",
+            "e no_frame_statistics\n",
+            |_| None,
+        ))
+        .unwrap();
+        assert!(s.passed(), "{}", s.to_text());
+        assert!(
+            s.criteria[1]
+                .detail
+                .ends_with("; the statistics came only after e no_frame_statistics"),
+            "{}",
+            s.to_text()
+        );
+        // Statistics from frame 600 on leave a sixth of the frames without one: a fail, for
+        // that reason.
+        let s = summarize(&testbed_text(
+            3_600,
+            "borderless",
+            "e no_frame_statistics\n",
+            |n| {
+                let t = 10_000_000 + 55_556 * n as i64;
+                (n < 600).then(|| format!("f {n} {t} {} -\n", t - 30_000))
+            },
+        ))
+        .unwrap();
+        assert_eq!(s.criteria[1].pass, Some(false));
+        assert!(
+            s.criteria[1]
+                .detail
+                .starts_with("83.3% of frames have a display time")
+        );
+    }
+
+    #[test]
     fn windowed_runs_report_misses_without_judging_them() {
         let s = summarize(&testbed_text(1_800, "windowed", "", |n| {
             (n < 50).then(|| format!("m {n} vblank\n"))
@@ -638,6 +700,40 @@ mod tests {
         // A log with no frames at all, of a run that failed.
         let empty = timer_text(240, 0, |_| None, "e end reason=error\n");
         assert!(!summarize(&empty).unwrap().passed());
+    }
+
+    #[test]
+    fn timer_rows_above_the_refresh_count_their_own_missed_slots() {
+        // 360 fps on 180 Hz from a loop too slow for it: every sixth slot goes by undrawn, with
+        // its m line, yet every vblank still brings a new frame.
+        let text: String = timer_text(
+            360,
+            7_200,
+            |n| (n % 2 == 1).then_some((n as i64 + 1) / 2),
+            "e end reason=seconds\n",
+        )
+        .lines()
+        .map(|line| {
+            let n = line
+                .strip_prefix("f ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|n| n.parse::<u64>().ok());
+            match n {
+                Some(n) if n % 6 == 0 && n > 0 => format!("m {n} slot\n"),
+                _ => format!("{line}\n"),
+            }
+        })
+        .collect();
+        let s = summarize(&text).unwrap();
+        assert_eq!(s.criteria[0].pass, Some(false), "{}", s.to_text());
+        assert!(
+            s.criteria[0].detail.starts_with(
+                "0 of 3599 vblanks brought no new frame (0.000%); 1199 of 7200 slots missed"
+            ),
+            "{}",
+            s.to_text()
+        );
+        assert_eq!(s.criteria[1].pass, Some(true), "{}", s.to_text());
     }
 
     #[test]

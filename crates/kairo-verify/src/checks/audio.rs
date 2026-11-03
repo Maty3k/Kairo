@@ -418,10 +418,12 @@ impl<'a> Audio<'a> {
 
     /// Each track's beeps timed against the pictures (README §6.3 av.offset), with how. A track
     /// that should carry the game beep and does is timed at every flash whose beep lies inside
-    /// it, a flash without one counting as missing. A voice-only or mic-only track is timed
-    /// through the anchor, the Mix if it times the game beep, else the first track that does:
-    /// each of its beeps is the anchor's offset at the nearest flash plus the beep's distance
-    /// from the anchor's same beep.
+    /// it, a flash without one counting as missing. With `kairo-tone`'s log, a track that should
+    /// carry the voice beep and does is timed the same way at every beep the log places in it.
+    /// Otherwise a voice-only or mic-only track is timed through the anchor, the Mix if it
+    /// times the game beep, else the first track that does: each of its beeps is the anchor's
+    /// offset at the nearest flash plus the beep's distance from the anchor's same beep. A
+    /// track without a single beep of its kind is routing's to judge.
     fn offsets(&self) -> Vec<Option<(Vec<Timed>, Kind, String)>> {
         let game_detector = Detector::new(Kind::Game.hz());
         let direct: Vec<Option<Vec<Timed>>> = self
@@ -492,6 +494,9 @@ impl<'a> Audio<'a> {
                             })
                         })
                         .collect();
+                    if !timed.iter().any(|t| t.offset_ms.is_some()) {
+                        return None;
+                    }
                     return Some((
                         timed,
                         Kind::Voice,

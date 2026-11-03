@@ -165,6 +165,32 @@ impl Source {
         self.shown.get(&n).copied().flatten()
     }
 
+    /// How many frame times later than their numbers say the frames shown around the run of
+    /// misses `run` came, by the log's display times: the time from the last frame before the
+    /// run that has one to the first after it that has one, less their numbers' distance,
+    /// rounded up. A frame shown late holds the one before it on screen that much longer,
+    /// however many numbers the testbed then passes over to catch up. Those frames are looked
+    /// for only `within` the frames up to the runs on either side; 0 where none has a display
+    /// time.
+    fn late_frames(&self, run: (i64, i64), within: (i64, i64)) -> f64 {
+        let (first, last) = run;
+        let before = self
+            .shown
+            .range(within.0..first)
+            .rev()
+            .find_map(|(&n, d)| Some((n, (*d)?)));
+        let after = self
+            .shown
+            .range(last + 1..=within.1)
+            .find_map(|(&n, d)| Some((n, (*d)?)));
+        let (Some((p, dp)), Some((q, dq))) = (before, after) else {
+            return 0.0;
+        };
+        // A tenth of a frame of slack, for panels a little off their reported rate.
+        let frames = ((dq - dp) * f64::from(self.fps.max(1)) - 0.1).ceil();
+        (frames - (q - p) as f64).max(0.0)
+    }
+
     /// The clip time, in seconds, at QPC time 0 by the video: the 5th percentile of
     /// `pts_i − display(N_i)` over the readable frames after the held frame 0 whose display the
     /// log knows, so the freshest frames set it (README §6.3 `av.offset`, with logs). `pts` are
@@ -210,30 +236,58 @@ impl Source {
 }
 
 /// What the testbed's misses can excuse among a clip's steps (README §6.3), bounded by what they
-/// can do to the screen. A run of m missed frames in a row held the frame before it on screen
-/// for m more frame times, so it can account for at most ⌈(m + 1)·fps / F_s⌉ + 1 of the steps
-/// that touch it (a step from N to N′ touches the misses in N + 1 ..= N′ + 1), each off its
-/// nominal size by at most m + 1 testbed frames. The testbed's numbers never go back, so no step
-/// back in time is its. The runs that excused a step are kept, so `source.stability` counts them.
+/// can do to the screen. A run of m missed frames in a row held the screen m frame times
+/// longer, and e more where the log's display times show the frames around it came e frame
+/// times later than their numbers say (a frame shown late: [`Source::late_frames`]). So it can
+/// account for at most ⌈(m + e + 1)·fps / F_s⌉ + 1 of the steps that touch it (a step from N to
+/// N′ touches the misses in N + 1 ..= N′ + 1), each off its nominal size by at most m + e + 1
+/// testbed frames. A step is off by how much further behind its cadence the screen was at one
+/// end than at the other, so one that touches several runs (a late frame, then the numbers
+/// passed over to catch up) is off by at most the largest of their bounds, and uses up a step of
+/// the first that has one left. The testbed's numbers never go back, so no step back in time is
+/// its. The runs that excused a step are kept, so `source.stability` counts them.
 pub(crate) struct Excuses {
-    /// Each run of missed frames: first, last, and how many more steps it may excuse.
-    runs: Vec<(i64, i64, u64)>,
+    /// Each run of missed frames.
+    runs: Vec<Run>,
     /// Testbed frames per output frame.
     nominal: f64,
     /// The last missed frame of the runs that excused a step.
     used_until: Option<i64>,
 }
 
+/// A run of missed frames, and what it may still excuse.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    first: i64,
+    last: i64,
+    /// How far off its nominal size a step it explains may be, in testbed frames.
+    bound: f64,
+    /// How many more steps it may excuse.
+    left: u64,
+}
+
 impl Excuses {
     /// The excuses `source`'s misses give a clip at `fps` output frames per second.
     pub fn new(source: &Source, fps: u32) -> Excuses {
         let per_frame = f64::from(fps.max(1)) / f64::from(source.fps.max(1));
-        let runs = source
-            .miss_runs()
-            .into_iter()
-            .map(|(a, b)| {
-                let m = (b - a + 1) as f64;
-                (a, b, ((m + 1.0) * per_frame).ceil() as u64 + 1)
+        let found = source.miss_runs();
+        let runs = found
+            .iter()
+            .enumerate()
+            .map(|(i, &(first, last))| {
+                // Up to the runs on either side: another miss would change what the display
+                // times say.
+                let within = (
+                    i.checked_sub(1).map_or(i64::MIN, |j| found[j].1 + 1),
+                    found.get(i + 1).map_or(i64::MAX, |r| r.0 - 1),
+                );
+                let held = (last - first + 1) as f64 + source.late_frames((first, last), within);
+                Run {
+                    first,
+                    last,
+                    bound: held + 1.0,
+                    left: ((held + 1.0) * per_frame).ceil() as u64 + 1,
+                }
             })
             .collect();
         Excuses {
@@ -244,24 +298,29 @@ impl Excuses {
     }
 
     /// Whether the testbed's misses explain the step from testbed frame `from` to `to`; uses up
-    /// one step of the run that does.
+    /// one step of a run that does.
     pub fn excuse(&mut self, from: i64, to: i64) -> bool {
         if to < from {
             return false;
         }
         let off = ((to - from) as f64 - self.nominal).abs();
-        let first = self.runs.partition_point(|r| r.1 < from + 1);
-        for run in &mut self.runs[first..] {
-            if run.0 > to + 1 {
-                break;
-            }
-            if run.2 > 0 && off <= (run.1 - run.0 + 2) as f64 {
-                run.2 -= 1;
-                self.used_until = Some(self.used_until.map_or(run.1, |u| u.max(run.1)));
-                return true;
-            }
+        let first = self.runs.partition_point(|r| r.last < from + 1);
+        let touched = self.runs[first..]
+            .iter()
+            .take_while(|r| r.first <= to + 1)
+            .count();
+        let runs = &mut self.runs[first..first + touched];
+        let bound = runs.iter().map(|r| r.bound).fold(0.0, f64::max);
+        if off > bound {
+            return false;
         }
-        false
+        let Some(run) = runs.iter_mut().find(|r| r.left > 0) else {
+            return false;
+        };
+        run.left -= 1;
+        let last = runs.iter().map(|r| r.last).max();
+        self.used_until = self.used_until.max(last);
+        true
     }
 
     /// The last missed frame that excused a step, if any did.
@@ -356,6 +415,83 @@ mod tests {
         // At the testbed's own rate a miss shows as a repeat and the skip after it.
         let mut x = Excuses::new(&missing(|n| n == 1_500), 180);
         assert!(x.excuse(1_499, 1_499) && x.excuse(1_499, 1_501));
+    }
+
+    /// A vsync log at `fps` on 180 Hz of frames `frames`, each `Some(vblank)` it showed at or
+    /// `None` never drawn, with an m line for each never drawn and each in `late`.
+    fn shown_at(fps: u32, frames: &[(i64, Option<i64>)], late: &[i64]) -> Source {
+        let lines: String = frames
+            .iter()
+            .map(|&(n, v)| match v {
+                Some(v) => {
+                    let t = (v as f64 * 10_000_000.0 / 180.0).round() as i64;
+                    let m = if late.contains(&n) {
+                        format!("m {n} vblank\n")
+                    } else {
+                        String::new()
+                    };
+                    format!("f {n} {t} {t} {t}\n{m}")
+                }
+                None => format!("m {n} vblank\n"),
+            })
+            .collect();
+        Source::new(&log(&lines, fps, "vsync"))
+    }
+
+    #[test]
+    fn a_late_frame_excuses_the_hold_it_caused() {
+        // Exclusive at 180: frame 3600 showed 6 vblanks late, 3601 after it, and the testbed
+        // passed over 3602–3607 to catch up. 3599 stayed on screen 7 vblanks, so a 60 fps
+        // capture shows it three times, then jumps to 3608.
+        let frames: Vec<(i64, Option<i64>)> = (3_590..3_620)
+            .map(|n| match n {
+                3_600 => (n, Some(3_606)),
+                3_601 => (n, Some(3_607)),
+                3_602..=3_607 => (n, None),
+                _ => (n, Some(n)),
+            })
+            .collect();
+        let s = shown_at(180, &frames, &[3_600]);
+        assert_eq!(s.late_frames((3_600, 3_600), (i64::MIN, 3_601)), 6.0);
+        assert_eq!(s.late_frames((3_602, 3_607), (3_601, i64::MAX)), 0.0);
+        let mut x = Excuses::new(&s, 60);
+        assert!(x.excuse(3_599, 3_599) && x.excuse(3_599, 3_599));
+        assert!(x.excuse(3_599, 3_608));
+        // A capture that dropped the frame after the jump too is still blamed.
+        let mut x = Excuses::new(&s, 60);
+        assert!(!x.excuse(3_599, 3_611));
+        // Borderless 90 (k = 2, composed): frame 1800 showed 4 vblanks late, the testbed
+        // passed over 1801 and 1803 to catch up, and a 60 fps capture reads 1798, 1799, 1799,
+        // 1800, 1804: every step touches the late frame's run, the last one 1803's too.
+        let frames: Vec<(i64, Option<i64>)> = (1_790..1_810)
+            .map(|n| match n {
+                1_800 => (n, Some(3_605)),
+                1_801 | 1_803 => (n, None),
+                1_802 => (n, Some(3_607)),
+                _ => (n, Some(2 * n + 1)),
+            })
+            .collect();
+        let s = shown_at(90, &frames, &[1_800]);
+        assert_eq!(s.late_frames((1_800, 1_801), (i64::MIN, 1_802)), 1.0);
+        let mut x = Excuses::new(&s, 60);
+        for (from, to) in [
+            (1_798, 1_799),
+            (1_799, 1_799),
+            (1_799, 1_800),
+            (1_800, 1_804),
+        ] {
+            assert!(x.excuse(from, to), "{from} → {to}");
+        }
+        // Without display times, the runs are sized by their misses alone.
+        let s = shown_at(
+            90,
+            &frames
+                .iter()
+                .map(|&(n, v)| (n, v.filter(|_| n == 1_800)))
+                .collect::<Vec<_>>(),
+            &[1_800],
+        );
+        assert_eq!(s.late_frames((1_800, 1_801), (i64::MIN, 1_802)), 0.0);
     }
 
     #[test]
