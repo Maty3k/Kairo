@@ -360,7 +360,7 @@ kairo_core::testsig (pattern v1: Scene(N) = solid rects + 1-D bands + texture ba
 - **Device.** WASAPI shared, event-driven, 48 kHz f32 stereo, on the console-role default device. It never switches devices (M1:41).
 - **It plays in the testbed's own process,** so an include-tree on the testbed's PID captures it as "Game" in M3 (CB:1192).
 - **Aiming.** Beep m targets the predicted display time of flash frame N_f = F·m: the last known vblank plus whole refresh periods. The sample index is computed from `AudioClock::get_position() → (pos, qpc)` (wasapi 0.26.0 api.rs:1999) at least 200 ms ahead.
-- **Logging.** The target time, the played time (mapped from the device position) and the flash frame's display time all go to the log.
+- **Logging.** The target time, the played time (mapped from the device position) and the flash frame's display time all go to the log. Every beep handed to the stream gets its `b` line, `-` if it never played. None is aimed to end past the run's end, and a stop leaves out the beeps whose targets it came before, so a `-` is a beep that was due and didn't play.
 - **Audio failure** (no device) logs `e audio_failed` and the video carries on.
 - **[Unverified]** How IAudioClock's play time relates to the timestamps process loopback puts on the same samples. M3 task 9 measures that constant (CB:1193).
 
@@ -444,7 +444,7 @@ kairo-tone.exe beeps [--hz 2000] [--offset-ms 500] [--seconds S] [--dbfs -30] [-
   - On the half-second grid, even 2nd-harmonic distortion of the 1 kHz beep (measured −87 to −107 dB [Mac]) lands at game-beep times, never voice times.
 - **Device.** WASAPI shared render only, console default device, the same `audio` module as the testbed.
 - **Own image and PID** (M1:55). It exits at `--seconds`, or at EOF on stdin with `--stop-on-stdin-eof` (§4.10).
-- **Log** (`tone.log`): `# kairo-tone 1`, an `h` header line, then `v <k> <target_hns> <played_hns|->`, plus `e` lines.
+- **Log** (`tone.log`): `# kairo-tone 1`, an `h` header line, then `v <k> <target_hns> <played_hns|->`, plus `e` lines. At `--seconds` it stops once its last beep has played to its end; at EOF it leaves out the beeps not yet due, as the testbed does (§4.7).
 - **Process tree: always a sibling of the testbed, never its child.** The harness starts both. An include-tree on the testbed's PID would otherwise capture the voice tone as Game (PLAN:185, CB:1192).
 - **M3 contract items** for the engine harness:
   1. The game-root walk-up "within the install folder" (PLAN:185, CB:772–773) would climb from `testbed.exe` to `kairo-harness.exe`, which sits in the same folder, and from there include `kairo-tone`. The harness hands the engine the testbed's PID explicitly.
