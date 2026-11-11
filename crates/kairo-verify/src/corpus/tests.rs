@@ -360,7 +360,8 @@ fn logs_show_the_encoder_and_its_colour() {
         ["no \"Selecting d3d11va adapter 0\""]
     );
     // CI's stream copy.
-    let copy = "  Stream #0:0 -> #0:0 (copy)
+    let copy = "Stream mapping:
+  Stream #0:0 -> #0:0 (copy)
 Output #0, mp4, to 'v-good.mp4':
   Stream #0:0: Video: h264 (High), 1 reference frame (avc1 / 0x31637661), yuv420p(tv, bt709, progressive, left), 480x270
 ";
