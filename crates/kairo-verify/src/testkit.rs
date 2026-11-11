@@ -394,6 +394,10 @@ pub struct Spec {
     pub x264_at: Option<usize>,
     pub recovery_at: Option<usize>,
     pub inband_sps_at: Option<(usize, Vec<u8>)>,
+    /// An SPS and a PPS before the slices of every IDR sample, as AMF's `header_spacing` writes.
+    pub params_at_idr: bool,
+    /// A filler data unit in this sample.
+    pub filler_at: Option<usize>,
     pub nal_overrun_at: Option<usize>,
     pub video_sample_bytes: usize,
     pub video_chunk: usize,
@@ -465,6 +469,8 @@ impl Spec {
             x264_at: None,
             recovery_at: None,
             inband_sps_at: None,
+            params_at_idr: false,
+            filler_at: None,
             nal_overrun_at: None,
             video_sample_bytes: 40,
             video_chunk: 50,
@@ -530,6 +536,13 @@ impl Spec {
                 && *at == i
             {
                 nals.push(raw.clone());
+            }
+            if self.params_at_idr && *pic == Pic::Idr {
+                nals.push(self.raw_sps.clone().unwrap_or_else(|| sps(&self.sps)));
+                nals.push(pps(0, 0, self.cabac));
+            }
+            if self.filler_at == Some(i) {
+                nals.push(vec![0x0C, 0xFF, 0xFF, 0x80]);
             }
             if *pic == Pic::Idr {
                 poc = 0;

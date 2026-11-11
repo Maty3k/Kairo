@@ -36,6 +36,8 @@
 
 pub mod aac;
 pub mod analyze;
+#[cfg(test)]
+mod bitstream_tests;
 pub mod boxes;
 pub mod checks;
 pub mod cli;

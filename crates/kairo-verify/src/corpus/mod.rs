@@ -327,8 +327,8 @@ impl Video {
     /// Its kbps on a lossy encoder: Recommended's 25/40 Mbps, or High's 36/50 for 1440p.
     pub fn rates(self) -> (&'static str, &'static str) {
         match self {
-            Self::High => ("36M", "50M"),
-            _ => ("25M", "40M"),
+            Self::High => kairo_core::ffmpeg_cli::HIGH_RATES,
+            _ => kairo_core::ffmpeg_cli::RECOMMENDED_RATES,
         }
     }
 }

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 mod platform;
 
 #[cfg(windows)]
-pub use platform::{adapter_for_luid, adapters, make_dpi_aware, targets};
+pub use platform::{adapter_for_luid, adapters, make_dpi_aware, output_index, targets};
 
 /// An adapter's locally unique id, as DXGI and the display configuration API report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -215,6 +215,8 @@ pub enum DisplayError {
     NoSuchMonitor,
     /// No adapter has this LUID.
     NoSuchAdapter(Luid),
+    /// The adapter has no output for the monitor.
+    NoSuchOutput,
 }
 
 impl fmt::Display for DisplayError {
@@ -228,6 +230,7 @@ impl fmt::Display for DisplayError {
             // The path itself is a PC detail: it isn't repeated here.
             Self::NoSuchMonitor => write!(f, "no active monitor has that device path"),
             Self::NoSuchAdapter(luid) => write!(f, "no adapter has LUID {luid}"),
+            Self::NoSuchOutput => write!(f, "the adapter has no output for that monitor"),
         }
     }
 }
@@ -392,5 +395,18 @@ mod tests {
         let text = serde_json::to_string(&displays).unwrap();
         assert!(text.starts_with(r#"{"kairo_displays":1,"targets":[{"device_path":"p","#));
         assert_eq!(serde_json::from_str::<Displays>(&text).unwrap(), displays);
+    }
+
+    /// On a Windows machine (CI or the PC), a display that DXGI lists among its adapter's
+    /// outputs has an index there; one it doesn't list (an indirect display) has none.
+    #[cfg(windows)]
+    #[test]
+    fn displays_have_their_dxgi_output_index() {
+        for target in crate::targets().unwrap() {
+            match crate::output_index(target.adapter_luid, target.hmonitor) {
+                Ok(index) => assert!(index < 16, "{index}"),
+                Err(e) => assert!(matches!(e, DisplayError::NoSuchOutput), "{e}"),
+            }
+        }
     }
 }

@@ -96,8 +96,12 @@ pub fn main(layout: &Layout, job_file: &str) -> ExitCode {
         }
     };
     let message = format!(
-        "job {} starts: {:?} (max {} s, abort on input: {})",
-        job.id, job.cmd, job.max_seconds, job.abort_on_input
+        "job {} starts: {} with {} arguments (max {} s, abort on input: {})",
+        job.id,
+        program_name(&job.cmd),
+        job.cmd.len().saturating_sub(1),
+        job.max_seconds,
+        job.abort_on_input
     );
     devlog::event(layout, "run", &message);
     let result = execute(layout, &job);
@@ -109,14 +113,30 @@ pub fn main(layout: &Layout, job_file: &str) -> ExitCode {
     finish(layout, &result)
 }
 
-/// Jobs whose old logs are pruned, by id prefix, with how many earlier ones to keep: builds and
-/// `pc cli` calls (tools/mac/remote/build.ps1 and cli.ps1 name them `<prefix><UTC>`, so their
-/// ids sort by time). The elevated side never deletes anything in the logs folder, which the
-/// owner's account can write (M1 contract, Builds), so this owner-side process does.
-const PRUNED: [(&str, usize); 2] = [("build-", 10), ("cli-", 3)];
+/// The program's file name only: a job's arguments, and the folder of its program, can name the
+/// owner's account or a monitor (CLAUDE.md), so the devrun log never holds them.
+fn program_name(cmd: &[String]) -> &str {
+    cmd.first()
+        .and_then(|program| program.rsplit(['\\', '/']).next())
+        .unwrap_or("")
+}
 
-/// Deletes the result and output logs of all but the newest `keep` jobs whose ids start with
-/// `prefix`.
+/// Jobs whose old logs are pruned, by id prefix, with how many earlier ones to keep: builds,
+/// `pc cli` calls and harness runs (tools/mac/remote/build.ps1, cli.ps1 and `pc harness` name
+/// them `<prefix><UTC>`, so their ids sort by time). Only ids with a digit after the prefix
+/// count, so `harness-displays` is never pruned. The elevated side never deletes anything in the
+/// logs folder, which the owner's account can write (M1 contract, Builds), so this owner-side
+/// process does.
+const PRUNED: [(&str, usize); 3] = [("build-", 10), ("cli-", 3), ("harness-", 5)];
+
+/// Whether `id` is one of the timed jobs named `prefix` and a UTC stamp.
+fn timed(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix)
+        .is_some_and(|stamp| stamp.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Deletes the result and output logs of all but the newest `keep` jobs whose ids are `prefix`
+/// and a UTC stamp.
 fn prune_logs(layout: &Layout, prefix: &str, keep: usize) {
     let Ok(entries) = fs::read_dir(layout.logs_dir()) else {
         return;
@@ -128,7 +148,7 @@ fn prune_logs(layout: &Layout, prefix: &str, keep: usize) {
                 .iter()
                 .find_map(|suffix| name.strip_suffix(suffix).map(str::to_owned))
         })
-        .filter(|id| id.starts_with(prefix))
+        .filter(|id| timed(id, prefix))
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -151,7 +171,7 @@ pub fn execute(layout: &Layout, job: &JobFile) -> JobResult {
     let _ = fs::create_dir_all(layout.logs_dir());
     let _ = fs::remove_file(layout.job_result_file(&job.id));
     for (prefix, keep) in PRUNED {
-        if job.id.starts_with(prefix) {
+        if timed(&job.id, prefix) {
             prune_logs(layout, prefix, keep);
         }
     }
@@ -364,12 +384,23 @@ mod tests {
     }
 
     #[test]
-    fn prunes_all_but_the_newest_build_and_cli_logs() {
+    fn the_log_names_the_program_only() {
+        let cmd = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let cargo = cmd(&[r"C:\Users\someone\.cargo\bin\cargo.exe", "build"]);
+        assert_eq!(program_name(&cargo), "cargo.exe");
+        assert_eq!(program_name(&cmd(&["cmd", "/c", "echo"])), "cmd");
+        assert_eq!(program_name(&[]), "");
+    }
+
+    #[test]
+    fn prunes_all_but_the_newest_build_cli_and_harness_logs() {
         let layout = layout("prune");
+        fs::write(layout.job_result_file("harness-displays"), "x").unwrap();
         for n in 0..14 {
             for path in [
                 layout.job_result_file(&format!("build-2026110{}-0000{n:02}", n % 2)),
                 layout.job_stdout_file(&format!("cli-20261101-0000{n:02}")),
+                layout.job_result_file(&format!("harness-20261101-0000{n:02}")),
                 layout.job_stdout_file(&format!("hello{n}")),
             ] {
                 fs::write(path, "x").unwrap();
@@ -377,6 +408,7 @@ mod tests {
         }
         prune_logs(&layout, "build-", 10);
         prune_logs(&layout, "cli-", 3);
+        prune_logs(&layout, "harness-", 5);
         let mut left: Vec<String> = fs::read_dir(layout.logs_dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -393,6 +425,13 @@ mod tests {
                 "cli-20261101-000013.out.log"
             ]
         );
+        // Five harness runs are kept, and `pc harness displays`'s job is never pruned.
+        let harness = left
+            .iter()
+            .filter(|n| n.starts_with("harness-2026"))
+            .count();
+        assert_eq!(harness, 5);
+        assert!(left.contains(&"harness-displays.result.json".to_owned()));
         // Other jobs' logs are never touched.
         assert_eq!(left.iter().filter(|n| n.starts_with("hello")).count(), 14);
         // The newest builds by id are the ones kept.

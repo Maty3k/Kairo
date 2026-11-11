@@ -38,6 +38,10 @@ pub struct Frame {
     pub poc: Option<i64>,
     /// Whether it carries a recovery-point SEI (payload type 6).
     pub recovery_point: bool,
+    /// Whether it carries an in-band SPS (type 7).
+    pub sps: bool,
+    /// Whether it carries an in-band PPS (type 8).
+    pub pps: bool,
 }
 
 /// `slice_types` bit for B slices.
@@ -68,6 +72,8 @@ pub struct Scan {
     pub inband_sps: usize,
     /// In-band PPS units.
     pub inband_pps: usize,
+    /// Filler data units (type 12): padding an encoder adds to hold a constant rate.
+    pub filler_nals: usize,
     /// In-band SPS units whose bytes differ from the `avcC` SPS with the same id, as (sample
     /// index from 0, bytes); the first [`MAX_EXAMPLES`] distinct ones.
     pub differing_sps: Vec<(usize, Vec<u8>)>,
@@ -212,6 +218,7 @@ impl Scanner {
             }
             7 => {
                 self.out.inband_sps += 1;
+                frame.sps = true;
                 if len > PARAM_BYTES {
                     self.problem(format!(
                         "sample {}: SPS longer than {PARAM_BYTES} bytes",
@@ -230,8 +237,10 @@ impl Scanner {
             }
             8 => {
                 self.out.inband_pps += 1;
+                frame.pps = true;
                 self.params.add_pps(nal);
             }
+            12 => self.out.filler_nals += 1,
             _ => {}
         }
     }
