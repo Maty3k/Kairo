@@ -2245,7 +2245,7 @@ mod tests {
         };
         assert_eq!(frame, 0);
         // Presented before vblank 0, so DXGI can take it there.
-        pacer.presented(0, target_hns, 1, -1);
+        pacer.presented(0, target_hns, 1, -1, -1);
         // Frame 0 at vblank 0, so frame 180 at vblank 360; frame 0 itself, drawn, at 0.
         assert!(near(pacer.predict(180).unwrap(), HZ180.times(360)));
         assert!(near(pacer.predict(0).unwrap(), 0));
@@ -2266,7 +2266,7 @@ mod tests {
             panic!("warm-up")
         };
         assert_eq!((frame, near(target_hns, HZ180.times(2))), (1, true));
-        pacer.presented(1, target_hns, 2, HZ180.times(1) + 2);
+        pacer.presented(1, target_hns, 2, HZ180.times(1) + 2, HZ180.times(1) + 2);
         pacer.on_stats(Stats {
             present_count: 2,
             present_refresh: 4,
