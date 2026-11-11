@@ -626,7 +626,9 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
             continue;
         }
         pacer.woke(platform::now_hns());
-        ctx.fullscreen_lost()?;
+        if ctx.fullscreen_lost()? {
+            pacer.fullscreen_lost();
+        }
         // The clock, once started, lives until the loop ends: stopping it waits for a vblank.
         if ctx.statistics(pacer.shown(), Miss::Vblank) {
             statistics = true;
