@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use kairo_core::ffmpeg_cli::{self, UNUSED_OPTION};
+pub use kairo_core::ffmpeg_cli::{H264_METADATA, adapter_device};
 use serde_json::Value;
 
 use super::{
@@ -38,18 +40,7 @@ pub const SPACING: Duration = Duration::from_millis(1_500);
 
 /// The colour every encoder's input frames are tagged with: BT.709 limited (README §7.2's
 /// `SETPARAMS`), so FFmpeg converts nothing and the encoder and `colr` say BT.709.
-const SETPARAMS: [&str; 2] = [
-    "-vf",
-    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
-];
-
-/// README §7.2's colour fix for an encoder whose VUI lacks BT.709 limited (`--finishing
-/// h264_metadata`): an LGPL bitstream filter, applied to every encode and recorded in the
-/// manifest's `finishing`.
-pub const H264_METADATA: &str = "h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1";
-
-/// What FFmpeg prints for an option no stream used (EXP-8: a warning, exit 0).
-const UNUSED: &str = "has not been used for any stream";
+const SETPARAMS: [&str; 2] = ["-vf", ffmpeg_cli::SETPARAMS_FILTER];
 
 /// Why a build stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,62 +137,17 @@ pub fn encode_args(
         ),
     }
     let (rate, peak) = video.rates();
-    let gop = match video {
+    let gop_frames = match video {
         Video::Gop2s => 2 * format.fps,
         _ => format.fps,
-    }
-    .to_string();
-    let bf = if video == Video::Bframes { "2" } else { "0" };
+    };
+    let gop = gop_frames.to_string();
+    let bframes = if video == Video::Bframes { 2 } else { 0 };
+    let bf = if bframes > 0 { "2" } else { "0" };
     match encoder {
         Encoder::Amf => {
             push(&mut args, &SETPARAMS);
-            push(
-                &mut args,
-                &[
-                    "-pix_fmt",
-                    "nv12",
-                    "-c:v",
-                    "h264_amf",
-                    "-usage",
-                    "transcoding",
-                    "-quality",
-                    "balanced",
-                    "-rc",
-                    "vbr_peak",
-                    "-b:v",
-                    rate,
-                    "-maxrate",
-                    peak,
-                    "-bufsize",
-                    peak,
-                    "-g",
-                    &gop,
-                    "-vbaq",
-                    "1",
-                    "-preanalysis",
-                    "0",
-                    "-high_motion_quality_boost_enable",
-                    "0",
-                    "-preencode",
-                    "0",
-                    "-bf",
-                    bf,
-                    "-max_b_frames",
-                    bf,
-                    "-frame_skipping",
-                    "0",
-                    "-filler_data",
-                    "0",
-                    "-coder",
-                    "cabac",
-                    "-profile:v",
-                    "high",
-                    "-header_spacing",
-                    &gop,
-                    "-async_depth",
-                    "4",
-                ],
-            );
+            args.extend(ffmpeg_cli::amf_h264(rate, peak, gop_frames, bframes));
         }
         Encoder::Mf => {
             // h264_mf has no named profiles, so High is its number, 100; without it, Media
@@ -348,20 +294,6 @@ pub fn mux_args(recipe: &Recipe, video: Video, audio: Option<Defect>) -> Vec<Str
     args
 }
 
-/// The vendor:device of the d3d11va adapter FFmpeg opened, from its `Using device vvvv:dddd (…)`
-/// line (hwcontext_d3d11va.c), lowercase. The encoder's own `Using device kd (type d3d11va)`
-/// line doesn't match: only four hex digits, a colon and four more do.
-pub fn adapter_device(log: &str) -> Option<String> {
-    log.match_indices("Using device ").find_map(|(at, word)| {
-        let rest = log.get(at + word.len()..)?;
-        let pair = rest.get(..9)?;
-        let hex = |s: &str| s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit());
-        let (vendor, device) = pair.split_once(':')?;
-        (hex(vendor) && hex(device) && rest.get(9..11) == Some(" ("))
-            .then(|| pair.to_ascii_lowercase())
-    })
-}
-
 /// What's wrong with an encoder session's log (README §7.2): an option no stream used, no
 /// mapping to the encoder, an output that isn't BT.709 limited, and for AMF the device lines, the
 /// adapter asked for and the vendor:device FFmpeg opened, which must be `hw_device` when given.
@@ -374,56 +306,28 @@ pub fn encode_log_problems(
     hw_device: Option<&str>,
 ) -> Vec<String> {
     let mut problems = Vec::new();
-    if log.contains(UNUSED) {
+    if log.contains(UNUSED_OPTION) {
         problems.push("an option no stream used".to_owned());
     }
-    let mapping = match encoder {
-        Encoder::Amf => "-> h264 (h264_amf)",
-        Encoder::Mf => "-> h264 (h264_mf)",
-        Encoder::VideoToolbox => "-> h264 (h264_videotoolbox)",
-        Encoder::Ipcm => "-> #0:0 (copy)",
+    let (codec, mapping) = match encoder {
+        Encoder::Amf => ("h264_amf", "-> h264 (h264_amf)"),
+        Encoder::Mf => ("h264_mf", "-> h264 (h264_mf)"),
+        Encoder::VideoToolbox => ("h264_videotoolbox", "-> h264 (h264_videotoolbox)"),
+        Encoder::Ipcm => ("copy", "-> #0:0 (copy)"),
     };
-    if !log.contains(mapping) {
+    if !ffmpeg_cli::mapped_to(log, codec) {
         problems.push(format!("no \"{mapping}\" mapping"));
     }
-    // The output's video stream line, under `Output #0`.
-    let output = log
-        .split("Output #0")
-        .nth(1)
-        .and_then(|rest| rest.lines().find(|l| l.contains("Video: h264")));
     let pixels = if encoder == Encoder::Ipcm {
         "(tv, bt709"
     } else {
         "nv12(tv, bt709"
     };
-    if !output.is_some_and(|line| line.contains(pixels)) {
+    if !ffmpeg_cli::output_video_line(log).is_some_and(|line| line.contains(pixels)) {
         problems.push(format!("the output's video isn't \"{pixels}\""));
     }
     if encoder == Encoder::Amf {
-        for line in [
-            "Using device kd (type d3d11va) with h264_amf encoder.",
-            "AMF via D3D11.",
-        ] {
-            if !log.contains(line) {
-                problems.push(format!("no \"{line}\""));
-            }
-        }
-        match hw_index {
-            Some(n) if !log.contains(&format!("Selecting d3d11va adapter {n}")) => {
-                problems.push(format!("no \"Selecting d3d11va adapter {n}\""));
-            }
-            Some(_) => {}
-            None => problems.push("no adapter asked for (--hw-index)".to_owned()),
-        }
-        match (adapter_device(log), hw_device) {
-            (None, _) => problems.push(
-                "no \"Using device vvvv:dddd\": the adapter wasn't found, and FFmpeg fell back to the default one".to_owned(),
-            ),
-            (Some(found), Some(want)) if !found.eq_ignore_ascii_case(want) => {
-                problems.push(format!("the adapter is {found}, not {want}"));
-            }
-            _ => {}
-        }
+        problems.extend(ffmpeg_cli::amf_device_problems(log, hw_index, hw_device));
     }
     problems
 }
@@ -432,7 +336,7 @@ pub fn encode_log_problems(
 /// or a track that isn't AAC from FFmpeg's own encoder.
 pub fn mux_log_problems(log: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    if log.contains(UNUSED) {
+    if log.contains(UNUSED_OPTION) {
         problems.push("an option no stream used".to_owned());
     }
     if !log.contains("Stream #0:0 -> #0:0 (copy)") {
