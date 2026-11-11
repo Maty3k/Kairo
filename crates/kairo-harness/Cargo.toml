@@ -1,6 +1,6 @@
 [package]
 name = "kairo-harness"
-description = "M1's Windows orchestrator behind pc harness: displays now; run, corpus and probe later (research 16)."
+description = "M1's Windows orchestrator behind pc harness: displays, and gate 2's capture (research 16 §8)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,20 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kairo-core = { workspace = true }
 kairo-display = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",                 # handles, BOOL
+    "Win32_Storage_FileSystem",         # GetDiskFreeSpaceExW
+    "Win32_System_Diagnostics_Debug",   # SetErrorMode
+    "Win32_System_Diagnostics_ToolHelp", # process snapshots, by name only
+    "Win32_System_Power",               # ES_DISPLAY_REQUIRED
+    "Win32_System_Threading",           # CREATE_NO_WINDOW
+] }
 
 [lints]
 workspace = true

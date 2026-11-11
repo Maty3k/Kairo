@@ -780,10 +780,13 @@ Structure checks without a real-file extra are covered by the in-code builder (�
 ### 8.2 The job (`.dogfood/jobs/`, since it names a monitor; M1:73)
 
 ```json
-{"id":"harness-<stamp>","cmd":["C:\\kairo\\bin\\current\\kairo-harness.exe","run","--monitor","<180 Hz device path>",
- "--testbed-fps","180","--mode","borderless","--output","1920x1080@60","--seconds","30","--profile","capture"],
+{"id":"harness-<stamp>","cmd":["C:\\kairo\\bin\\current\\kairo-harness.exe","run","--run-id","harness-<stamp>",
+ "--monitor","<180 Hz device path>","--testbed-fps","180","--mode","borderless","--output","1920x1080@60",
+ "--seconds","30","--profile","capture","--capture","gfxcapture","--loglevel","debug"],
  "cwd":"C:\\kairo\\logs","max_seconds":240,"abort_on_input":true,"window":"hidden"}
 ```
+
+`<stamp>` is `yyyyMMdd-HHmmss` UTC, and `--run-id` repeats the job's id, which names the run folder: the harness refuses any other form, and a folder that exists already (exit 2). `--seconds` takes 5 to 60, and `max_seconds` is S + 210. This version runs `--mode borderless` only: exclusive needs `--activate`'s idle wait of at least 205 s, and a windowed capture of the window frame is unverified; gate 2 needs neither.
 
 The schema is M0's (M0:72, core/job.rs:37). devrun stops the whole job tree on owner input or on time (devrun/run.rs:187–203). It waits for every process of the job to exit, so the harness kills any leftover child before it exits.
 
@@ -791,28 +794,28 @@ The schema is M0's (M0:72, core/job.rs:37). devrun stops the whole job tree on o
 
 | Phase | What | Limit | Typical [Estimate] |
 |---|---|---|---|
-| 0 setup | Hold `ES_DISPLAY_REQUIRED`; run folder `harness-<stamp>\`; prune to the newest 5; ≥2 GB free (`GetDiskFreeSpaceExW`); refuse if any process named `ffmpeg.exe` is running (a Toolhelp snapshot by name; one session at a time, M1:94); resolve device path → rect, refresh, HDR (exit 3 if HDR), LUID → DXGI index and vendor:device; pick a run tag | 5 s | <1 s |
-| 1 testbed | `testbed.exe --monitor … --mode borderless --fps 180 --seconds 150 --stop-on-stdin-eof --run-tag T --log testbed.log --ready ready.json` (stdin piped); wait for `ready.json`. 150 s outlasts phases 1–3 (≤78 s) | 15 s | 1–2 s |
-| 2 warm-up | Steady presents, and display times (or the DWM composition grid where those are unavailable, risk 7) advancing at the refresh ±1% (else exit 3, "display off") | 3 s | 3 s |
-| 3 capture | §8.4, `-t 30`, killed 30 s after the expected end | 60 s | 32 s |
+| 0 setup | Run folder `harness-<stamp>\` first, so every later way out leaves `harness.json`; no error dialogs for the children (`SetErrorMode`); hold `ES_DISPLAY_REQUIRED`; prune to the newest 5; ≥2 GB free (`GetDiskFreeSpaceExW`); refuse if any process named `ffmpeg.exe` is running (a Toolhelp snapshot by name; one session at a time, M1:94); FFmpeg, its pin file, the testbed and kairo-verify present; resolve device path → rect, refresh, HDR (exit 3 if HDR), LUID → DXGI index and vendor:device (and, for `ddagrab`, the DXGI output index); pick a run tag; write `expect.json` | 5 s | <1 s |
+| 1 testbed | `testbed.exe --monitor … --mode borderless --fps 180 --seconds S+120 --stop-on-stdin-eof --run-tag T --log testbed.log --ready ready.json --beep off` (stdin piped; `--beep on` and `kairo-tone` beside it with `--voice`); wait for `ready.json`, check it (its pid, the LUID, BGRA, the refresh, the mode and rate) and the log's header. S + 120 s outlasts phases 1–4 | 15 s | 1–2 s |
+| 2 warm-up | A fixed 3 s, then one judgement from the log over the last second of frames: no `e no_vblank_timing`; ≤1% of them missed; presents a frame period apart ±1% (median); and, without `e no_frame_statistics`, display times on ≥90% of them a frame period apart ±1%. Else exit 3, "display off" | 3 s | 3 s |
+| 3 capture | §8.4, `-t S`, killed 30 s after the expected end | S + 30 s | 32 s |
 | 4 stop | Close the testbed's stdin, wait for `e end`, kill after 5 s | 5 s | <1 s |
 | 5 verify | `kairo-verify check capture.mp4 --profile capture\|smoke --expect expect.json --testbed-log testbed.log --json verify.json --summary verify.txt` | 120 s | 10–15 s |
 | 6 report | `harness.json`: phase times, exit codes, the adapter check, the read-back table (§8.5), the FFmpeg pin from `KAIRO-PIN.json` and its licence, verify's verdict; the summary on stdout (the job's `out.log`) | — | <1 s |
 
-- The harness exits **0 whenever a report exists**: gate 2's check is the report, not a pass (M1:27).
+- The harness exits **0 whenever a report exists**: gate 2's check is the report, not a pass (M1:27). kairo-verify's exit 3 with a report whose verdict is `error` is a report too.
 - **Other exit codes:** 1 a component failed or timed out · 2 usage · 3 environment refused (monitor not found, OLED, HDR, disk, another ffmpeg, display off) · 4 encoder read-back failed (adapter mismatch, a missing device, AMF or NV12 line, an unused option) · 5 internal.
 
 ### 8.4 Capture command
 
 ```
-ffmpeg.exe -hide_banner -nostdin -loglevel debug -y
+ffmpeg.exe -hide_banner -nostdin -loglevel debug -n
   -init_hw_device d3d11va=kd:<index from the LUID> -filter_hw_device kd
   -filter_complex "gfxcapture=hwnd=<from ready.json>:max_framerate=360:capture_cursor=0:display_border=0,
      fps=60,hwdownload,format=bgra,
      scale=w=1920:h=1080:flags=bicubic+accurate_rnd+full_chroma_int+full_chroma_inp:out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,
      format=nv12,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv[v]"
   -map "[v]" -t 30 -fps_mode cfr -r 60
-  -pix_fmt nv12 -c:v h264_amf <the §7.2 AMF options, -usage … -async_depth 4> -b:v 25M -maxrate 40M -bufsize 40M -g 60
+  -pix_fmt nv12 -c:v h264_amf <the §7.2 AMF options, -usage … -async_depth 4, with -b:v 25M -maxrate 40M -bufsize 40M -g 60>
   -movflags +faststart -use_editlist 0 capture.mp4
 ```
 
@@ -823,7 +826,7 @@ ffmpeg.exe -hide_banner -nostdin -loglevel debug -y
 | One D3D11VA device | Without it, `gfxcapture` creates its device on the default adapter (winrt.cpp:1221) and the encoder on another. The CLI hands h264_amf the single d3d11va device (ff: ffmpeg_enc.c `hw_device_setup_for_encode`; ffmpeg_hw.c returns none if there are two). The log must show gfxcapture's `Using provided hw_device_ctx` (winrt.cpp:1219; otherwise `Created internal hw_device_ctx`, :1229) and `AMF via D3D11.`. The PC has an iGPU and a dGPU (M1:63) |
 | swscale BT.709 limited, left-sited chroma, then NV12 | AMF gets NV12 only (CL:31). `scale_d3d11` sets no colour space, and D3D11 then defaults to BT.601 (architecture.md §2.6); the `content.colour_matrix` check would catch that. `colormatrix` is GPL-only (never used). `full_chroma_inp` + `out_chroma_loc=left` match the reference's chroma siting: Cb 60.2 / Cr 58.9 dB before encoding, against 50.5 / 51.8 dB without, with a 30.9 dB colour-matrix margin and the same speed [Mac: crit swscale_chain_results.json] |
 | `setparams`, `-pix_fmt nv12` | §2 item 5: the only way the CLI tags primaries and transfer on 9.0.2; NV12 stated, not negotiated |
-| `-use_editlist 0 +faststart -bf 0 -g 60`, every AMF option listed | PLAN:166, PLAN:179, CB:483–488; peak 40 Mbps ≤ 50 (CL:31) |
+| `-use_editlist 0 +faststart -bf 0 -g 60`, every AMF option listed | PLAN:166, PLAN:179, CB:483–488; peak 40 Mbps ≤ 50 (CL:31). The AMF options and the conversion come from `kairo_core::ffmpeg_cli`, which `corpus build` uses too, so the PC corpus and the capture give AMF the same; `-n`, since the folder is new |
 | Video only | Stereo Mix stays off (M1:187) |
 | `ddagrab` fallback (risk 14) | `ddagrab=output_idx=<from kairo-display>:framerate=360:draw_mouse=0:offset_x=…:offset_y=…:video_size=<testbed client rect>`. Its defaults are 30 fps with the cursor drawn, its pts are arrival times (vsrc_ddagrab.c:112–117, :1161, :1232), and the crop keeps the rest of the owner's screen out of the clip (PLAN:154, CL:16). The harness refuses `ddagrab` without the crop |
 
@@ -833,10 +836,12 @@ ffmpeg.exe -hide_banner -nostdin -loglevel debug -y
 ### 8.5 Read-back (M1:27, "every option set and read back")
 
 The CLI can't call `av_opt_get` (CB:534), and `h264_amf` ignores the result of almost every property it sets (amfenc_h264.c:268–296, :548–590). A quiet log therefore proves little. The gate report lists each option as verified or "set, not read back":
-1. **From the bitstream** (`kairo-verify`): profile High; CABAC; IDR every 60 (`-g`); no B slices (`bf`, `max_b_frames`); SPS/PPS in band at each IDR (`header_spacing`); no filler NAL units (`filler_data`); one sample per output tick (`frame_skipping`); VUI colour and `colr` 1/1/1/0; the measured 1 s peak (`rc`, `maxrate`, indirectly).
+1. **From the bitstream** (`kairo-verify`): profile High; CABAC; IDR every 60 (`-g`); no B slices (`bf`, `max_b_frames`); SPS/PPS in band at each IDR (`header_spacing`: `video.gop`'s `idr_with_params` equals its `idr`); no filler NAL units (`filler_data`: `video.params`' `filler_nals` is 0); one sample per output tick (`frame_skipping`); VUI colour and `colr` 1/1/1/0; the measured 1 s peak (`rc`, `maxrate`, indirectly: verified at ≤50 Mbps, unknown above, never failed).
 2. **From the log:** NV12 into `h264_amf` (the `Output #0` line); the single d3d11va device on the LUID-matched adapter (`Using device vvvv:dddd`, `Using provided hw_device_ctx`, `Using device kd (type d3d11va) with h264_amf encoder.`, `AMF via D3D11.`); no `has not been used for any stream`.
 3. **AMF's own trace.** PC encodes run at `-loglevel debug`, the least verbose level at which FFmpeg prints AMF's trace (it logs it at `AV_LOG_DEBUG`, hwcontext_amf.c:73–75, :644–685). If the trace prints the applied properties, the harness parses them [Unverified; the first attended AMF session checks]. If debug logging changes the capture's cadence in the rehearsal, gate 2 runs at `verbose` and the corpus encode's trace (same build, options and driver) stands in.
-4. **Set, not read back** until M3 task 6's `av_opt_get` (CB:1190): `usage`, `quality`, `vbaq`, `preanalysis`, `high_motion_quality_boost_enable`, `preencode`, `async_depth`, unless step 3 shows them.
+4. **Set, not read back** until M3 task 6's `av_opt_get` (CB:1190): `b:v` (the average is reported, but isn't proof of the target), `bufsize`, `usage`, `quality`, `vbaq`, `preanalysis`, `high_motion_quality_boost_enable`, `preencode`, `async_depth`, unless step 3 shows them. With `ddagrab`, `-filter_hw_device` too: no log line proves it.
+
+A log line missing from step 2 stops the run before the clip is judged (exit 4). If the verbose rehearsal lacks one that debug prints, gate 2 runs at debug: no check is relaxed.
 
 B-frame capability warnings are recorded but never fatal at `bf=0` (§7.2).
 
@@ -850,9 +855,10 @@ B-frame capability warnings are recorded but never fatal at `bf=0` (§7.2).
 ### 8.7 `tools/mac/pc harness`
 
 ```
-pc harness capture [--monitor 180hz] [--seconds 30] [--testbed-fps 180] [--mode borderless|windowed|exclusive]
-                   [--capture gfxcapture|ddagrab] [--capture-rate 90] [--output 1080p60|1440p60] [--voice]
-                   [--smoke] [--fetch-clip] [--force]
+pc harness capture [--monitor 180hz] [--seconds 30 | --smoke] [--testbed-fps 180] [--mode borderless]
+                   [--capture gfxcapture|ddagrab] [--capture-rate 90] [--output 1080p60|1440p60]
+                   [--loglevel debug|verbose] [--finishing] [--voice] [--fetch-clip] [--force]
+pc harness events
 pc harness corpus  [--presets 1080p60,1440p60] [--force]
 pc harness probe   --monitor 180hz|oled --seconds N [--force] -- <probe args>      (gate 3)
 pc harness displays
@@ -860,14 +866,14 @@ pc harness displays
 
 - It maps aliases to device paths through `.dogfood/pc/monitors.json`, which `displays` fills (M1:38). It refuses `oled` for `capture` and `corpus`; for `probe` on `oled` it forces `--pattern motion`, caps the run at 600 s and passes `--oled` (§4.11).
 - **`probe`** writes one job of `kairo-harness probe --monitor <path> --pattern motion --seconds N -- <program args>`: start the testbed, wait for `ready.json`, run the probe from `C:\kairo\bin\current`, stop both (M1:28; a job holds one program, M0:72). Launcher work then never falls on counted `wgc-probe` days (M1:104).
-- It writes the job and reuses `cmd_run`'s refusals and wait (tools/mac/pc:641).
+- It writes the job into `.dogfood/jobs/harness-<stamp>.json` and reuses `run`'s refusals and wait, plus one more: a fullscreen window in front refuses even with `--force`. The reports come back into `.dogfood/harness/<stamp>/`.
 - It fetches reports with a new read-only `remote/harness-fetch.ps1` (Base64 between markers); the clip only with `--fetch-clip`.
 - **Instant Replay.** Before each job it records, read-only: `encoder-usage.ps1 -Seconds 3` (once it exists, M1:17, M1:80) and CB:1066's registry hints, shown next to the verdict. It never toggles AMD's settings (CB:1066, M0:40, R08:776).
-- It reads System events 4101 and 41 since the job started (read-only). Any of them is a P0: exit 7, stop and report (M1:204).
+- It reads System events 4101 and 41 since the job started (read-only, `remote/harness-events.ps1`). Any of them is a P0: exit 7, stop and report (M1:204). The check never refuses, and until it has run, the next capture won't start (`pc harness events` runs a pending one alone).
 - It prints the verdict, the failing checks and **start → report seconds**, gate 2's timing.
 - **Exit codes:** those of `pc run` (tools/mac/pc:317–319), plus 7 for a TDR.
 - **`--smoke`** is a 10 s capture under `--profile smoke`: the "green harness smoke" (CL:34, M1:194) and the "short recording test with AMD Software back" (M1:155).
-  - **Green** = harness exit 0 and a `pass` verdict. `smoke` requires the structure checks (structure, faststart, no_editlist, colr, params, idr_start, no_reorder, gop), barcode ≥99.9%, bars, colour_matrix and levels. It reports drops, judder and source stability as warnings while the capture is the FFmpeg CLI: gfxcapture's rate isn't stable (M1:27), and one 50 ms stall in 10 s is already 0.5%. In M3 the smoke becomes a 30 s engine save under `engine`, where cadence is required.
+  - **Green** = harness exit 0 and a `pass` verdict. `smoke` requires every structure check, `decode.clean`, `build.lgpl`, barcode ≥99.9%, bars, colour_matrix and levels. It reports drops, judder and source stability as warnings while the capture is the FFmpeg CLI: gfxcapture's rate isn't stable (M1:27), and one 50 ms stall in 10 s is already 0.5%. In M3 the smoke becomes a 30 s engine save under `engine`, where cadence is required.
   - **Media PRs** (M1:194): until PR 9 merges, each `wgc-probe` or `audio-soak` PR carries its own short `\Kairo\Run` smoke, the testbed plus that probe for 10 s on the 180 Hz monitor with the trace replayed through the pacer. After PR 9, a media PR's smoke is `--smoke` plus the PR's own probe run. M3's engine mode replaces both. This definition goes into M1's contract.
 
 ### 8.8 Time budget
@@ -933,7 +939,7 @@ Branches follow `m1/<slug>`; Conventional Commits with DCO; squash after CI (CL:
 | 6 | `m1/verify-ffmpeg` | the linked backend (quiet log, whitelists, `err_detect`) and the three-library licence guard; `dev-tools` feature; ADR-0002 and deny.toml (WTFPL exceptions, `sysinfo` ban); `ffmpeg-sys-next` with `avcodec` + `avformat` only; Windows CI download, cache and the I_PCM corpus; `cargo xwin check` on the Mac (**settles M1:181**; CB:1181); `pc deploy` copies the imported DLLs after a pin check. Built as 6a (the linked decoder, the guard, ADR-0002, Windows CI and its lossless corpus) and 6b (`pc deploy`'s DLLs and the PC job, once the PC is free) | M ~650 + CI/ps1 | Mac (xwin), Windows CI; PC: one hidden `check` job on a copied I_PCM clip | First Claude re-pins the PC's FFmpeg between sessions (M1:156); the job runs when `pc status` is IDLE |
 | 7 | `m1/display` | `kairo-display`; `kairo-harness displays`; `pc harness displays` → `.dogfood/pc/displays.json` and `monitors.json` | M ~700 | Mac (pure parts), Windows CI; PC: one hidden job | PC idle |
 | 8 | `m1/testbed` | `testbed.exe` (modes, `--activate`, exclusive with `ResizeBuffers` and checks, pacing, renderer, HDR, motion scroll and SDR cap, `ES_DISPLAY_REQUIRED`, `--stop-on-stdin-eof`, log, ready file, beep) and `kairo-tone.exe beeps`; the WARP test; `kairo-verify --testbed-log`, `--voice-log` and `source.stability` (assigned here in PR 4b's and 5's reviews: no PR named them, and exact A/V needs both logs) | L ~2,300 | Mac (pure parts), Windows CI; PC attended (§4.12) | **Owner home, says "go", hands-off**; patterns on the 180 Hz monitor; beeps audible at −30 dBFS; settles risks 22–23 (about 15 min) |
-| 9 | `m1/harness` | `kairo-harness run`, `corpus` and `probe`, its `platform` module, the read-back table, pruning; `pc harness` (capture, corpus, probe, fetch, TDR check, `--smoke`, the OLED guard, the Instant Replay record); `corpus check --ffprobe`, the PC's cross-check of the parser (assigned here in PR 5's corpus work, since only the PC needs it) | M ~1,700 | Windows CI; PC | One attended session: the first AMF CLI session (M1:130) → the **PC corpus** (gate-1 confirmation, about 6–10 min) → harness rehearsals (one at `verbose`, one at `debug`) → **gate 2** with the owner hands-off. Later, gate 2 again while the owner is away, once the safety stops land and test days are agreed |
+| 9 | `m1/harness` | `kairo-harness run`, `corpus` and `probe`, its `platform` module, the read-back table, pruning; `pc harness` (capture, corpus, probe, fetch, TDR check, `--smoke`, the OLED guard, the Instant Replay record); `corpus check --ffprobe`, the PC's cross-check of the parser (assigned here in PR 5's corpus work, since only the PC needs it). Built as 9a (the groundwork in `kairo-core`, `kairo-verify`, `kairo-display` and `kairo-devrun`, then `run` with `pc harness capture` and `events`), 9b (`corpus`, `pc harness corpus`, `corpus check --ffprobe`) and 9c (`probe`, `pc harness probe`, `encoder-usage.ps1`) | M ~1,700 | Windows CI; PC | One attended session: the first AMF CLI session (M1:130) → the **PC corpus** (gate-1 confirmation, about 6–10 min) → harness rehearsals (one at `verbose`, one at `debug`) → **gate 2** with the owner hands-off. Later, gate 2 again while the owner is away, once the safety stops land and test days are agreed |
 
 - **Dependencies.** 1 → 2 → 3 → 4 → 5 → 6. PRs 7 and 8 need only PR 1, so they can run alongside 2–6 as PC time allows. PR 9 needs 5–8.
 - **The devrun safety stops** (M1:97, M1:129) are a separate M1 PR; only runs while the owner is away depend on them.

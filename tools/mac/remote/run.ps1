@@ -5,11 +5,13 @@
 # Exit code: 0 ok, 1 the job failed or could not run, 2 bad job, 3/4 refused, 5 still running
 # when the wait ended, 6 kairo-devrun stopped the job (time limit or owner input).
 
-Assert-PcIdle 'run'
+Assert-PcIdle 'run' ([bool]$Pc['FullscreenRefuses'])
 
 $jobText = $Utf8NoBom.GetString([Convert]::FromBase64String([string]$Pc['JobB64']))
 $run = Start-KairoJob $jobText
 $job = $run.Job
+# When the job was handed over: pc harness capture looks for display-driver resets from then.
+Send-KV 'started' $run.Started.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
 $abortText = 'no'
 if ($job.AbortOnInput) { $abortText = 'yes' }
 Say ('started job ' + $job.Id + ': ' + $job.Program + ' (window ' + $job.Window + ', priority ' + $job.Priority + ', at most ' + $job.MaxSeconds + ' s, stops on owner input: ' + $abortText + ')')

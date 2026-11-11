@@ -198,8 +198,11 @@ dependencies = [
 name = "kairo-harness"
 version = "0.1.0"
 dependencies = [
+ "kairo-core",
  "kairo-display",
+ "serde",
  "serde_json",
+ "windows",
 ]
 
 [[package]]
