@@ -237,15 +237,16 @@ pub fn testbed(log: &TestbedLog) -> Summary {
         .into_iter()
         .find(|e| has(&events, e));
     let timed = !shown.is_empty();
-    // Missed: m lines and frames never drawn; with vsync and statistics from the start, also a
-    // `-` just before a frame marked late (the statistics passed over an irregular stretch), as
-    // `check` counts them. Any other `-` is unknown.
+    // Missed: m lines and frames never drawn; with vsync, also a `-` just before a frame marked
+    // late (the statistics passed over an irregular stretch), as `check` counts them. Any other
+    // `-` is unknown: the first frame the statistics report is never marked late, so frames before
+    // statistics that came late are never read as misses.
     let mut missed: BTreeSet<u64> = m_lines.clone();
     let drawn: BTreeSet<u64> = frames.iter().map(|f| f.frame).collect();
     if let (Some(a), Some(b)) = (first, last) {
         missed.extend((a..=b).filter(|n| !drawn.contains(n)));
     }
-    if timed && untimed.is_none() && !timer {
+    if timed && !timer {
         let mut before_late = false;
         for f in frames.iter().rev() {
             match f.display_hns {

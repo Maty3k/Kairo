@@ -97,17 +97,18 @@ fn share(count: f64, steps: usize) -> f64 {
 /// run of readable frames, at `source_fps` testbed frames per second and `fps` output frames
 /// per second.
 pub fn count(numbers: &[Option<i64>], source_fps: u32, fps: u32) -> Option<Counts> {
-    count_excluding(numbers, source_fps, fps, |_, _| false)
+    count_excluding(numbers, source_fps, fps, |_, _, _| false)
 }
 
 /// [`count`], leaving out (into [`Counts::source_events`]) each repeat, skip, backward or judder
-/// step from testbed frame `from` to `to`, in order, for which `source(from, to)` holds: an event
-/// the testbed's own miss explains. A step on cadence needs no excuse and always counts.
+/// step from testbed frame `from` to `to`, in order, for which `source(at, from, to)` holds, `at`
+/// being `to`'s output frame: an event the testbed's own miss explains. A step on cadence needs
+/// no excuse and always counts.
 pub fn count_excluding(
     numbers: &[Option<i64>],
     source_fps: u32,
     fps: u32,
-    mut source: impl FnMut(i64, i64) -> bool,
+    mut source: impl FnMut(usize, i64, i64) -> bool,
 ) -> Option<Counts> {
     let mut counts = Counts {
         longest_hold: 1,
@@ -129,7 +130,7 @@ pub fn count_excluding(
             let (from, to) = (run[step.index], run[step.index + 1]);
             let frame = start + step.index + 1;
             let event = step.delta <= 0 || step.ticks >= 2 || step.is_judder();
-            if event && source(from, to) {
+            if event && source(frame, from, to) {
                 counts.source_events.push(Event { frame, from, to });
                 hold = 1;
                 continue;
@@ -236,7 +237,7 @@ mod tests {
         let n = numbers(&[0, 3, 6, 9, 9, 15, 18, 21]);
         let blind = count(&n, 180, 60).unwrap();
         assert_eq!((blind.repeats, blind.skipped), (1, 1));
-        let counts = count_excluding(&n, 180, 60, |from, to| {
+        let counts = count_excluding(&n, 180, 60, |_, from, to| {
             let (low, high) = (from.min(to), from.max(to));
             (low + 1..=high + 1).contains(&10)
         })

@@ -14,7 +14,7 @@ use std::ops::ControlFlow;
 
 use serde_json::json;
 
-use super::source::{Excuses, Source};
+use super::source::{Excuses, Screen, Source};
 use super::{Ctx, Finding, Outcome, Status, audio, skipped, weigh};
 use crate::analyze::bars::{self, BandSums, Bands, FrameBars};
 use crate::analyze::cadence::{self, Counts, Event, Shows};
@@ -379,13 +379,23 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         .measured
         .and_then(|m| (m.fps.1 == 1).then_some(m.fps.0))
         .and_then(|f| u32::try_from(f).ok());
-    // Steps the testbed's misses explain are the source's (README §6.3).
+    // Steps the testbed's misses explain are the source's (README §6.3): where the log's display
+    // times say what the screen showed, by them, the output frames placed on the testbed's clock
+    // by the clip clock.
     let mut excused_until = None;
     let counts = source_fps.zip(fps).and_then(|(fs, f)| match &source {
         Some(s) => {
-            let mut excuses = Excuses::new(s, f);
-            let counts =
-                cadence::count_excluding(&numbers, fs, f, |from, to| excuses.excuse(from, to));
+            let screen = s.clip_clock(&numbers, &pts, timescale).map(|clock| Screen {
+                times: pts
+                    .iter()
+                    .map(|&p| p as f64 / timescale as f64 - clock)
+                    .collect(),
+                slack: 1.0 / s.refresh_hz.max(1.0),
+            });
+            let mut excuses = Excuses::new(s, f, screen);
+            let counts = cadence::count_excluding(&numbers, fs, f, |at, from, to| {
+                excuses.excuse(at, from, to)
+            });
             excused_until = excuses.used_until();
             counts
         }
@@ -418,7 +428,13 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         }),
     };
     let p99_step_error_hns = match (&source, &line, fps) {
-        (Some(s), _, Some(fps)) if s.timed => display_step_error_p99(s, &numbers, fps),
+        (Some(s), line, Some(fps)) if s.timed => {
+            display_step_error_p99(s, &numbers, fps).or_else(|| {
+                line.as_ref()
+                    .ok()
+                    .and_then(|l| step_error_p99(l, &numbers, timescale, fps))
+            })
+        }
         (_, Ok(line), Some(fps)) => step_error_p99(line, &numbers, timescale, fps),
         _ => None,
     };

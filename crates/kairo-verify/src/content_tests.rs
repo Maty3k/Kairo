@@ -1892,6 +1892,90 @@ fn the_hold_a_late_frame_caused_is_the_sources() {
         .unwrap();
     assert_eq!(drops.status, Status::Pass, "{}", report.to_text());
     assert_eq!(drops.value["source_events"], 12, "{}", drops.detail);
+    // A capture that froze on the held frame one output frame longer, after the screen had
+    // moved on: the log shows the screen didn't hold it then, so the freeze is the capture's.
+    let frozen: Vec<u64> = (0..FRAMES)
+        .map(
+            |k| match at.iter().find(|&&a| (a + 1..=a + 3).contains(&k)) {
+                Some(&a) if a == 40 => 1_000 + 3 * a,
+                _ => content_at(&at, k),
+            },
+        )
+        .collect();
+    let report = run_spec(&Spec::good(), frozen, Damage::default(), options(), &plan);
+    assert_eq!(
+        status(&report, "cadence.drops_dups"),
+        Status::Fail,
+        "{}",
+        report.to_text()
+    );
+}
+
+/// The content of the capture in [`the_hold_a_late_frame_caused_is_the_sources`] at output frame
+/// `k`.
+fn content_at(at: &[u64], k: u64) -> u64 {
+    match at.iter().find(|&&a| k == a + 1 || k == a + 2) {
+        Some(&a) => 1_000 + 3 * a,
+        None => 1_000 + 3 * k,
+    }
+}
+
+#[test]
+fn lateness_carried_through_a_gpu_bound_stretch_is_the_sources() {
+    // Borderless 180: at two output frames the GPU turns 3 vblanks slow for 12 frames. L shows
+    // 3 vblanks late (its m line); L + 4 and L + 8, drawn for the group after their late
+    // predecessor, keep its cadence and get no m line; the numbers between are passed over;
+    // L + 12 shows on time. The screen stays 3 vblanks behind until then, which no run's size
+    // alone says; the log's display times do.
+    let at = [20_u64, 70];
+    let content: Vec<u64> = (0..FRAMES)
+        .map(|k| match at.iter().find(|&&a| (a..=a + 4).contains(&k)) {
+            Some(&a) => {
+                let base = 1_000 + 3 * a;
+                [base, base, base + 1, base + 5, base + 9][(k - a) as usize]
+            }
+            None => 1_000 + 3 * k,
+        })
+        .collect();
+    let shown = |v: u64| LOG_BASE_HNS + (v as f64 * 10_000_000.0 / 180.0).round() as i64;
+    let mut text = format!(
+        "# kairo-testbed 1\nh pattern=1 run=5 mode=borderless pace=vsync fps=180 F=180 size=320x180 refresh_mhz=180000 hdr=0 sdr_white_nits=- max_nits=- start_hns={LOG_BASE_HNS}\n"
+    );
+    for n in 1_000..=1_400_u64 {
+        let v = n - 1_000;
+        let t = shown(v);
+        let late = at
+            .iter()
+            .map(|&a| 1_000 + 3 * a + 1)
+            .find(|&l| (l..l + 12).contains(&n));
+        match late.map(|l| n - l) {
+            Some(0) => text.push_str(&format!(
+                "f {n} {t} {} {}\nm {n} vblank\n",
+                t - 20_000,
+                shown(v + 3)
+            )),
+            Some(4 | 8) => text.push_str(&format!("f {n} {t} {} {}\n", t - 20_000, shown(v + 3))),
+            Some(_) => text.push_str(&format!("m {n} vblank\n")),
+            None => text.push_str(&format!("f {n} {t} {} {t}\n", t - 20_000)),
+        }
+    }
+    let mut plan = plan_for(Profile::Engine, 60, 2, 180);
+    let blind = run_spec(
+        &Spec::good(),
+        content.clone(),
+        Damage::default(),
+        options(),
+        &plan,
+    );
+    assert_eq!(status(&blind, "cadence.drops_dups"), Status::Fail);
+    plan.testbed_log = Some(kairo_core::testbed_log::TestbedLog::parse(&text).unwrap());
+    let report = run_spec(&Spec::good(), content, Damage::default(), options(), &plan);
+    assert_eq!(
+        status(&report, "cadence.drops_dups"),
+        Status::Pass,
+        "{}",
+        report.to_text()
+    );
 }
 
 #[test]
