@@ -625,6 +625,7 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
         if !ctx.chain.wait(1_000) {
             continue;
         }
+        pacer.woke(platform::now_hns());
         ctx.fullscreen_lost()?;
         // The clock, once started, lives until the loop ends: stopping it waits for a vblank.
         if ctx.statistics(pacer.shown(), Miss::Vblank) {
@@ -666,13 +667,14 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
                 }
                 let plan = ctx.plan(frame)?;
                 ctx.chain.draw(&plan);
+                let queued_hns = platform::now_hns();
                 if !ctx.present(pacer.interval())? {
                     ctx.log.missed(frame, Miss::Vblank);
                     continue;
                 }
                 let present_hns = platform::now_hns();
                 let id = ctx.chain.present_count().unwrap_or(0);
-                pacer.presented(frame, target_hns, id, present_hns);
+                pacer.presented(frame, target_hns, id, queued_hns, present_hns);
                 if end.is_none() {
                     // Frame 0's time, even when a late start skipped it.
                     let start = pacer.anchor().unwrap_or(target_hns);
@@ -739,6 +741,7 @@ fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) ->
                 }
             }
         }
+        let queued_hns = platform::now_hns();
         if !ctx.present(0)? {
             ctx.log.missed(frame, Miss::Slot);
             continue;
@@ -746,7 +749,15 @@ fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) ->
         let present_hns = platform::now_hns();
         let id = ctx.chain.present_count().unwrap_or(0);
         let missed = pacer.missed(frame, present_hns);
-        shown.presented(frame, target_hns, id, present_hns, missed, false);
+        shown.presented(
+            frame,
+            target_hns,
+            id,
+            queued_hns,
+            present_hns,
+            missed,
+            false,
+        );
         if !started {
             started = true;
             ctx.started(start)?;

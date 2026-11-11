@@ -22,21 +22,27 @@
 //! the first vblank still reachable when that one has gone by, and is numbered by the vblank
 //! group its target falls in. The vblanks are counted step by step from frame to frame, so a
 //! panel a little off its reported rate doesn't drift the count. When the previous frame was
-//! taken comes from the newest frame the statistics report, kept in DXGI's vblank count: a
-//! frame aimed at the first vblank it could reach after a stall was taken at its target, any
-//! other as many vblanks after its predecessor as DXGI counts between their displays, which a
-//! composed window's latency (a frame shows a vblank after it is taken) doesn't change while it
-//! stays the same; the frames presented since follow the flip model's rule. A window that moves
-//! from independent flip to composition looks like a late frame, which may cost one number. Without a frame-latency waitable object (exclusive
-//! fullscreen) the loop plans while the frame it just presented is still queued, and the pacer
-//! counts that frame's vblank as taken.
+//! taken comes from the newest frame the statistics report, kept in DXGI's vblank count, and
+//! is bounded by two times the loop knows: not before the first vblank after `Present` was
+//! called, and not after the loop next resumed, which it does only once the frame is taken
+//! (the waitable object signals, or a blocking `Present` returns). Within those bounds, a frame
+//! aimed at the first vblank it could reach after a stall, whose loop resumed before the
+//! vblank after its target, was taken at its target; any other as many vblanks after its
+//! predecessor as DXGI counts between their displays, which a composed window's latency (a
+//! frame shows a vblank after it is taken) doesn't change while it stays the same, and which
+//! the resume bound pulls back when the window moves to composition. The frames presented since
+//! follow the flip model's rule. Without a frame-latency waitable object (exclusive fullscreen)
+//! the loop plans while the frame it just presented is still queued, and the pacer counts that
+//! frame's vblank as taken.
 //!
 //! Statistics report only the newest frame on screen and the vblank it first appeared at
 //! ([`Shown`]). A frame shown later than k vblanks after the frame before it, by DXGI's own
-//! vblank counts, missed its vblank. A frame the statistics never reported is filled in from its
-//! neighbours when the two of them were exactly on cadence, since each frame stays at least k
-//! vblanks; otherwise its display time is unknown (`-`) and the next frame shown is the late
-//! one.
+//! vblank counts, missed its vblank; one shown sooner (a window that moves to independent flip)
+//! didn't. A frame the statistics never reported is filled in from its neighbours when the two
+//! of them were exactly on cadence with no number skipped between them, since each frame stays
+//! at least k vblanks; otherwise its display time is unknown (`-`) and the next frame shown is
+//! the late one. Frames the statistics haven't reported a second after their present get `-`
+//! too, and until a reading comes the pacer aims from its own targets.
 //!
 //! **Timer.** [`TimerPacer`] presents frame N at slot N's time, `start + ⌈N × 10⁷ / fps⌉`
 //! (`kairo_core::timeline::deadline_hns`'s rounding, at any rate). A frame whose `Present`
@@ -51,6 +57,10 @@ use kairo_core::timeline::HNS_PER_SECOND;
 /// The longest stall, in seconds, before the pacer takes its clock for lost: a real stall that
 /// long is a run to redo, not hundreds of thousands of `m` lines.
 pub const LOST_AFTER_S: i64 = 3_600;
+
+/// The most vblanks a frame shows after it is taken: a composed window shows it at the vblank
+/// after the one the compositor took it at.
+const COMPOSED_LATENCY: i64 = 1;
 
 /// The QPC time, in 100 ns, of the first whole second at or after `now_hns`.
 pub fn next_whole_second(now_hns: i64) -> i64 {
@@ -170,6 +180,11 @@ impl Grid {
         self.next_after(t_hns.saturating_sub(1))
     }
 
+    /// The last vblank at or before `t_hns`.
+    pub fn at_or_before(&self, t_hns: i64) -> i64 {
+        self.next_after(t_hns) - 1
+    }
+
     /// The time of the vblank nearest `t_hns`.
     pub fn snap(&self, t_hns: i64) -> i64 {
         let half = self.period.times(1) / 2;
@@ -223,7 +238,14 @@ struct Pending {
     frame: u64,
     present_id: i64,
     target_hns: i64,
+    /// Just before `Present` was called: the frame can't be taken before the first vblank
+    /// after it.
+    queued_hns: i64,
+    /// When `Present` returned, for the log.
     present_hns: i64,
+    /// When the loop next resumed, which it does only once the frame is taken: the frame was
+    /// taken at the last vblank at or before it, or earlier.
+    taken_by: Option<i64>,
     /// Already known to have missed (a timer slot that ended before `Present` returned).
     missed: bool,
     /// Aimed at the first vblank it could still reach (past a stall), so it is taken at its
@@ -263,6 +285,11 @@ pub struct Shown {
     unseen: Vec<Pending>,
     /// The last frame reported on screen.
     last_shown: Option<Reported>,
+    /// The frames [`Shown::expire`] gave up on since the last report.
+    expired: u64,
+    /// Whether [`Shown::expire`] gave up on frames presented after the last report, so it no
+    /// longer says when the newest frame was taken.
+    stale: bool,
     presents: Widen,
     shown_vblanks: Widen,
     sync_vblanks: Widen,
@@ -278,6 +305,8 @@ impl Shown {
             pending: VecDeque::new(),
             unseen: Vec::new(),
             last_shown: None,
+            expired: 0,
+            stale: false,
             presents: Widen::default(),
             shown_vblanks: Widen::default(),
             sync_vblanks: Widen::default(),
@@ -300,19 +329,23 @@ impl Shown {
     /// the next reading replaces it.
     pub fn disjoint(&mut self) {
         self.last_shown = None;
+        self.expired = 0;
+        self.stale = false;
         self.shown_vblanks = Widen::default();
         self.sync_vblanks = Widen::default();
     }
 
     /// Frame `frame` (drawn for `target_hns`) was presented as present `present_id`
-    /// (`GetLastPresentCount`), and `Present` returned at `present_hns`; `missed` if it is
-    /// already known to have missed its slot, `anchored` if it was aimed at the first vblank it
-    /// could still reach.
+    /// (`GetLastPresentCount`): `Present` was called at `queued_hns` and returned at
+    /// `present_hns`. `missed` if it is already known to have missed its slot, `anchored` if it
+    /// was aimed at the first vblank it could still reach.
+    #[allow(clippy::too_many_arguments)]
     pub fn presented(
         &mut self,
         frame: u64,
         target_hns: i64,
         present_id: u32,
+        queued_hns: i64,
         present_hns: i64,
         missed: bool,
         anchored: bool,
@@ -322,10 +355,24 @@ impl Shown {
             frame,
             present_id,
             target_hns,
+            queued_hns,
             present_hns,
+            taken_by: None,
             missed,
             anchored,
         });
+    }
+
+    /// The loop resumed at `t_hns`, which it does only once every frame presented so far has
+    /// been taken: the waitable object signalled, or a blocking `Present` returned (then before
+    /// its own frame is added).
+    pub fn taken_by(&mut self, t_hns: i64) {
+        for p in self.pending.iter_mut().rev() {
+            if p.taken_by.is_some() {
+                break;
+            }
+            p.taken_by = Some(t_hns);
+        }
     }
 
     /// Whether frames still wait for statistics.
@@ -335,14 +382,23 @@ impl Shown {
 
     /// The newest frame presented and the vblank it was taken at, by the flip model's rule:
     /// from the newest frame reported, each frame presented after it was taken k vblanks after
-    /// the one before it, or at the first vblank after its present if that is later. Kept in
-    /// DXGI's vblank count and placed with the latest reading's grid, so nothing adds up over a
-    /// run. `None` before any report.
+    /// the one before it, but no later than the loop resumed after it, nor before the first
+    /// vblank after its `Present` was called. Kept in DXGI's vblank count and placed with the
+    /// latest reading's grid, so nothing adds up over a run. `None` before any report, and once
+    /// the statistics have been silent so long that frames presented after the last report were
+    /// given up on.
     pub fn newest_taken(&self, k: i64) -> Option<(u64, i64)> {
         let (r, grid) = (self.last_shown?, self.grid?);
+        if self.stale {
+            return None;
+        }
         let mut taken = (r.frame, r.taken_v);
         for p in &self.pending {
-            taken = (p.frame, (taken.1 + k).max(grid.next_after(p.present_hns)));
+            let mut v = taken.1 + k;
+            if let Some(t) = p.taken_by {
+                v = v.min(grid.at_or_before(t));
+            }
+            taken = (p.frame, v.max(grid.next_after(p.queued_hns)));
         }
         Some((taken.0, grid.time_of(taken.1)))
     }
@@ -372,40 +428,60 @@ impl Shown {
             }
             // Frame p is on screen and first appeared at vblank shown_v.
             let shown_t = grid.time_of(shown_v);
+            let at_target = grid.at_or_after(p.target_hns - self.period.times(1) / 2);
             let mut late = false;
             let unseen = std::mem::take(&mut self.unseen);
             match (self.k, self.last_shown) {
                 (Some(k), Some(r)) => {
                     let cadence = k * (p.frame - r.frame) as i64;
+                    let span = shown_v - r.vblank;
                     // Every number between them was drawn: none was skipped for a stall, which
-                    // the counts couldn't tell from a frame that showed late.
-                    let consecutive = p.frame - r.frame == unseen.len() as u64 + 1;
-                    if shown_v - r.vblank == cadence && (consecutive || unseen.is_empty()) {
+                    // the counts couldn't tell from a frame that showed late. The frames given
+                    // up on for want of statistics were drawn.
+                    let consecutive = p.frame - r.frame == unseen.len() as u64 + self.expired + 1;
+                    if span == cadence && (consecutive || unseen.is_empty()) {
                         // Every frame between them stayed exactly k vblanks.
                         for u in unseen {
                             let at = r.vblank + k * (u.frame - r.frame) as i64;
                             out.push(resolved(u, Some(grid.time_of(at)), false));
                         }
                     } else {
-                        late = shown_v - r.vblank > cadence || !unseen.is_empty();
+                        // Later than the cadence, or on it across a skipped number with frames
+                        // the statistics passed over: it, or one of them, missed a vblank.
+                        // Sooner is no miss: a window that moves to independent flip shows its
+                        // frames a vblank sooner.
+                        late = span >= cadence;
                         out.extend(unseen.into_iter().map(|u| resolved(u, None, false)));
                     }
                 }
-                _ => out.extend(unseen.into_iter().map(|u| resolved(u, None, false))),
+                // The first report, or the first since DISJOINT: shown later after its target
+                // than a composed window's latency, it missed its vblank.
+                (Some(_), None) => {
+                    late = shown_v - at_target > COMPOSED_LATENCY;
+                    out.extend(unseen.into_iter().map(|u| resolved(u, None, false)));
+                }
+                (None, _) => out.extend(unseen.into_iter().map(|u| resolved(u, None, false))),
             }
-            // The vblank it was taken at, in DXGI's count: a frame aimed at the first vblank it
-            // could still reach, and not shown late, was taken at its target; any other as many
+            // The vblank it was taken at, in DXGI's count. Never before the first vblank after
+            // `Present` was called, nor after its display or the loop resuming after it. Within
+            // that: a frame aimed at the first vblank it could still reach (past a stall), whose
+            // loop resumed before the next vblank, was taken at its target; any other as many
             // vblanks after its predecessor as it showed after it, which a composed window's
-            // latency doesn't change while it stays the same; the first one reported at its
-            // target. Never before the first vblank after its present, nor after its display.
-            let at_target = grid.at_or_after(p.target_hns - self.period.times(1) / 2);
-            let taken_v = match self.last_shown {
-                _ if p.anchored && !late => at_target,
+            // latency doesn't change while it stays the same (when the window moves to
+            // composition, the resume bound pulls it back); the first one reported at its
+            // target, or a composed window's latency before its display if that is later.
+            let ceiling = p
+                .taken_by
+                .map_or(shown_v, |t| grid.at_or_before(t).min(shown_v));
+            let estimate = match self.last_shown {
+                _ if p.anchored && ceiling <= at_target => at_target,
                 Some(r) => r.taken_v + (shown_v - r.vblank),
-                None => at_target,
-            }
-            .max(grid.next_after(p.present_hns))
-            .min(shown_v);
+                None => at_target.max(shown_v - COMPOSED_LATENCY),
+            };
+            let taken_v = estimate
+                .min(ceiling)
+                .max(grid.next_after(p.queued_hns))
+                .min(shown_v);
             out.push(resolved(p, Some(shown_t), late));
             self.last_shown = Some(Reported {
                 frame: p.frame,
@@ -415,6 +491,8 @@ impl Shown {
                 present_hns: p.present_hns,
                 target_hns: p.target_hns,
             });
+            self.expired = 0;
+            self.stale = false;
         }
         out
     }
@@ -436,8 +514,12 @@ impl Shown {
         if self.unseen.is_empty() {
             while let Some(p) = self.pending.pop_front_if(|p| p.present_hns < cutoff) {
                 out.push(resolved(p, None, false));
+                // Presented after the last report: the walk from it in `newest_taken` would
+                // now miss a frame.
+                self.stale = true;
             }
         }
+        self.expired += out.len() as u64;
         out
     }
 
@@ -638,15 +720,40 @@ impl VsyncPacer {
         }
     }
 
+    /// The waitable object woke the loop at `t_hns`: every frame presented so far has been
+    /// taken. A blocking loop learns that from `Present` returning instead ([`Self::presented`]).
+    pub fn woke(&mut self, t_hns: i64) {
+        if !self.blocking {
+            self.shown.taken_by(t_hns);
+        }
+    }
+
     /// Frame `frame` (drawn for `target_hns`) was presented as present `present_id`
-    /// (`GetLastPresentCount`), and `Present` returned at `present_hns`.
-    pub fn presented(&mut self, frame: u64, target_hns: i64, present_id: u32, present_hns: i64) {
+    /// (`GetLastPresentCount`): `Present` was called at `queued_hns` and returned at
+    /// `present_hns`.
+    pub fn presented(
+        &mut self,
+        frame: u64,
+        target_hns: i64,
+        present_id: u32,
+        queued_hns: i64,
+        present_hns: i64,
+    ) {
         if self.blocking {
+            // A blocking `Present` returns once the frame before it has been taken.
+            self.shown.taken_by(present_hns);
             self.queued = Some(Queued::Frame(target_hns + self.period.times(self.k)));
         }
         let anchored = self.last.is_some_and(|d| d.frame == frame && d.anchored);
-        self.shown
-            .presented(frame, target_hns, present_id, present_hns, false, anchored);
+        self.shown.presented(
+            frame,
+            target_hns,
+            present_id,
+            queued_hns,
+            present_hns,
+            false,
+            anchored,
+        );
     }
 
     /// Whether frames still wait for statistics.
@@ -983,10 +1090,35 @@ mod tests {
         wait: Wait,
         k: i64,
         frames: usize,
+        d: Display,
+        start: i64,
+        wake: impl Fn(usize) -> i64,
+        slow: impl Fn(u64) -> i64,
+    ) -> Run {
+        run_loop_with(wait, k, frames, d, start, wake, slow, Loop::default())
+    }
+
+    /// What else a test loop does.
+    #[derive(Default)]
+    struct Loop {
+        /// How long after `Present` returns the loop reads the clock for frame n, beyond the
+        /// usual 1,000 hns (a thread preempted right after the call).
+        read_late: Option<Box<dyn Fn(u64) -> i64>>,
+        /// From when to when (QPC) `GetFrameStatistics` fails.
+        outage: Option<(i64, i64)>,
+    }
+
+    /// [`run_loop`], with `extra`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_loop_with(
+        wait: Wait,
+        k: i64,
+        frames: usize,
         mut d: Display,
         start: i64,
         wake: impl Fn(usize) -> i64,
         slow: impl Fn(u64) -> i64,
+        extra: Loop,
     ) -> Run {
         let mut pacer = VsyncPacer::new(k as u32, d.reported, start, wait == Wait::Blocking);
         let mut out = Vec::new();
@@ -994,16 +1126,26 @@ mod tests {
         let mut now = wake(0);
         let mut drawn = 0;
         let mut i = 0;
+        let mut statistics = false;
         while drawn < frames {
+            pacer.woke(now);
+            let outage = extra.outage.is_some_and(|(a, b)| (a..b).contains(&now));
             match d.stats(now) {
                 // The first call is DISJOINT (Microsoft's flip-model page).
                 _ if wait == Wait::Blocking && i == 0 => {}
-                Some(stats) => out.extend(pacer.on_stats(stats)),
+                _ if outage => {}
+                Some(stats) => {
+                    statistics = true;
+                    out.extend(pacer.on_stats(stats));
+                }
                 // The waitable loop's model takes the monitor's clock until statistics come; the
                 // blocking one waits for them, as run.rs does for its first 3 s.
-                None if wait == Wait::Waitable => pacer.on_vblank(d.time(d.vblank_at(now))),
+                None if wait == Wait::Waitable && !statistics => {
+                    pacer.on_vblank(d.time(d.vblank_at(now)));
+                }
                 None => {}
             }
+            out.extend(pacer.shown().expire(now));
             // A blocking Present queues its frame once the one before it is taken.
             let queued = match wait {
                 Wait::Waitable => now,
@@ -1021,8 +1163,15 @@ mod tests {
                     skipped: s,
                 } => {
                     skipped.extend(s);
+                    // Present is called just before the frame is queued, and returns 1,000 hns
+                    // after (blocking: once the frame before it is taken).
+                    let call = match wait {
+                        Wait::Waitable => queued,
+                        Wait::Blocking => now,
+                    };
                     let id = d.present(queued, i64::from(pacer.interval()), slow(frame));
-                    pacer.presented(frame, target_hns, id, queued + 1_000);
+                    let read = queued + 1_000 + extra.read_late.as_ref().map_or(0, |f| f(frame));
+                    pacer.presented(frame, target_hns, id, call, read);
                     drawn += 1;
                 }
                 Step::Lost => panic!("lost the clock"),
@@ -1278,11 +1427,12 @@ mod tests {
     }
 
     #[test]
-    fn independent_flip_then_composition_costs_one_number_at_most_and_a_stall_resets_it() {
+    fn independent_flip_then_composition_skips_no_number_and_shows_on_target() {
         // A borderless window flipped independently (no latency) until vblank 400, composed (a
         // vblank) until 600, then independent again, with a 3.5-vblank stall near vblank 800.
-        // The switch to composition can't be told from a late frame, so it may cost one number
-        // at k ≤ 2; after the stall every frame shows on its target again.
+        // The switch to composition reads as one late frame, but the loop resumed after it
+        // before the next vblank, so no number is skipped for it; after the stall every frame
+        // shows on its target.
         let latency = |v: i64| i64::from((400..600).contains(&v));
         for k in [1, 2, 3] {
             let stall_frame = (764 / k) as u64;
@@ -1299,7 +1449,7 @@ mod tests {
             let run = run_vsync(k, (1_100 / k) as usize, d, start, wake, |_| 0);
             let what = format!("k {k}");
             let before = run.skipped.iter().filter(|&&n| n < stall_frame).count();
-            assert!(before <= 1, "{what}: {:?}", run.skipped);
+            assert_eq!(before, 0, "{what}: {:?}", run.skipped);
             assert!(
                 run.skipped.iter().all(|&n| n < stall_frame + 4),
                 "{what}: {:?}",
@@ -1312,6 +1462,272 @@ mod tests {
         }
     }
 
+    /// The frames whose targets fall at vblanks `from..to` and that don't show `latency(v)`
+    /// vblanks after their target's vblank v.
+    fn off_their_flips(run: &Run, latency: impl Fn(i64) -> i64, from: i64, to: i64) -> Vec<u64> {
+        run.out
+            .iter()
+            .filter(|r| {
+                let v = HZ180.nearest(r.record.target_hns);
+                let want = r.record.target_hns + HZ180.times(latency(v));
+                (from..to).contains(&v) && r.record.display_hns.is_some_and(|t| !near(t, want))
+            })
+            .map(|r| r.record.frame)
+            .collect()
+    }
+
+    /// The frames marked late.
+    fn late(run: &Run) -> Vec<u64> {
+        run.out
+            .iter()
+            .filter(|r| r.missed)
+            .map(|r| r.record.frame)
+            .collect()
+    }
+
+    /// The vblank frame 0 was drawn for.
+    fn anchor_v(run: &Run) -> i64 {
+        HZ180.nearest(run.anchor)
+    }
+
+    #[test]
+    fn a_window_that_turns_composed_keeps_its_targets_on_the_flips() {
+        // Independent flip until vblank 400, composed from then on, and a stall of 2.5 to 5.5
+        // vblanks near vblank 800. The first composed frame shows a vblank later than its
+        // cadence and reads as late, but the loop resumed after it before the next vblank, so
+        // its take isn't moved and no number is skipped for it. Before and after the stall,
+        // every frame shows a vblank after its target.
+        let latency = |v: i64| i64::from(v >= 400);
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for k in [1, 2, 3, 4] {
+                for tenths in [25, 35, 45, 55] {
+                    let stall_pass = 36 + (764 / k) as usize;
+                    let wake = move |i: usize| {
+                        if i == stall_pass {
+                            55_556 * tenths / 10
+                        } else {
+                            20_000
+                        }
+                    };
+                    let d = Display::with(HZ180, Box::new(latency), 0);
+                    let start = 2 * HNS_PER_SECOND / 10;
+                    let run = run_loop(wait, k, (1_100 / k) as usize, d, start, wake, |_| 0);
+                    let what = format!("{wait:?} k {k} stall {tenths}");
+                    let stall_from = ((790 - anchor_v(&run)) / k) as u64;
+                    assert!(
+                        run.skipped.iter().all(|&n| n >= stall_from),
+                        "{what}: {:?}",
+                        run.skipped
+                    );
+                    assert_eq!(
+                        off_their_flips(&run, latency, 410, 790),
+                        [0_u64; 0],
+                        "{what}"
+                    );
+                    assert_eq!(
+                        off_their_flips(&run, latency, 830, 1_300),
+                        [0_u64; 0],
+                        "{what}"
+                    );
+                    assert!(late(&run).len() <= 2, "{what}: {:?}", late(&run));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composed_then_independent_then_composed_skips_nothing() {
+        // Composed, then independent flip from vblank 400 to 599, then composed again; no
+        // stall. Moving to independent flip shows frames a vblank sooner, which is no miss; at
+        // k = 1 the first vblank after the present places the take. Coming back to composition
+        // reads as one late frame. No number is skipped, and once composed again every frame
+        // shows a vblank after its target.
+        let latency = |v: i64| i64::from(!(400..600).contains(&v));
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for k in [1, 2, 3, 4] {
+                let d = Display::with(HZ180, Box::new(latency), 0);
+                let start = 2 * HNS_PER_SECOND / 10;
+                let run = run_loop(wait, k, (1_000 / k) as usize, d, start, |_| 20_000, |_| 0);
+                let what = format!("{wait:?} k {k}");
+                assert!(run.skipped.is_empty(), "{what}: {:?}", run.skipped);
+                assert!(late(&run).len() <= 1, "{what}: {:?}", late(&run));
+                assert_eq!(
+                    off_their_flips(&run, latency, 40, 396),
+                    [0_u64; 0],
+                    "{what}"
+                );
+                assert_eq!(
+                    off_their_flips(&run, latency, 610, 1_100),
+                    [0_u64; 0],
+                    "{what}"
+                );
+                // While flipped independently a frame shows on its target, or (k ≥ 2, where
+                // nothing tells the take from a vblank sooner) a vblank after it.
+                for r in &run.out {
+                    let v = HZ180.nearest(r.record.target_hns);
+                    if let (true, Some(shown)) = ((404..596).contains(&v), r.record.display_hns) {
+                        let early = shown - r.record.target_hns;
+                        let ok = near(early, 0) || (k > 1 && near(early, HZ180.times(1)));
+                        assert!(ok, "{what}: {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_present_read_late_moves_no_take() {
+        // Composed throughout. Every 50th frame's Present returns and the clock is read 4 to
+        // 16 ms after it was queued, and every 37th pass presents 50 µs before the vblank it
+        // makes, so its clock read lands after that vblank. The take's floor comes from the
+        // clock read just before Present, so neither skips a number or moves a target.
+        let latency = |_: i64| 1;
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for k in [1, 2, 3, 4] {
+                let read_late = |n: u64| {
+                    if n % 50 == 7 {
+                        40_000 * (1 + n as i64 % 4)
+                    } else {
+                        0
+                    }
+                };
+                let wake = |i: usize| if i % 37 == 5 { 55_556 - 500 } else { 20_000 };
+                let extra = Loop {
+                    read_late: Some(Box::new(read_late)),
+                    outage: None,
+                };
+                let d = Display::with(HZ180, Box::new(latency), 0);
+                let start = 2 * HNS_PER_SECOND / 10;
+                let frames = (800 / k) as usize;
+                let run = run_loop_with(wait, k, frames, d, start, wake, |_| 0, extra);
+                let what = format!("{wait:?} k {k}");
+                assert!(run.skipped.is_empty(), "{what}: {:?}", run.skipped);
+                assert!(late(&run).is_empty(), "{what}: {:?}", late(&run));
+                assert_eq!(
+                    off_their_flips(&run, latency, 0, 1_000),
+                    [0_u64; 0],
+                    "{what}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_late_on_the_gpu_after_a_stall_keeps_the_targets() {
+        // Independent flip, k = 2 to 4. A stall of 2.5, 4.5 or 5.2 vblanks leaves the frame
+        // after it more vblanks of numbers than it took, and that frame is a vblank late on the
+        // GPU. The loop resumes only after its real take, so it isn't taken at its target, and
+        // the frames after it show on their targets.
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for k in [2, 3, 4] {
+                for tenths in [25, 45, 52] {
+                    let stall_pass = 36 + 60;
+                    let wake = move |i: usize| {
+                        if i == stall_pass {
+                            55_556 * tenths / 10
+                        } else {
+                            20_000
+                        }
+                    };
+                    // The first frame drawn after the stall is a vblank late on the GPU.
+                    let first = std::cell::Cell::new(None);
+                    let slow = |n: u64| {
+                        let after = n > 61 && first.get().is_none_or(|f| f == n);
+                        if after {
+                            first.set(Some(n));
+                        }
+                        i64::from(after)
+                    };
+                    let start = 2 * HNS_PER_SECOND / 10;
+                    let run = run_loop(wait, k, 120, Display::new(0, 0), start, wake, slow);
+                    let what = format!("{wait:?} k {k} stall {tenths}");
+                    let after = first.get().unwrap_or(0);
+                    let from = HZ180.nearest(HZ180.times(anchor_v(&run) + k * after as i64));
+                    assert_eq!(
+                        off_their_flips(&run, |_| 0, from + 3 * k, 2_000),
+                        [0_u64; 0],
+                        "{what}: frame {after}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_that_stop_for_a_while_cost_no_number() {
+        // GetFrameStatistics fails from 2.0 s to 3.2 or 3.5 s while frames keep showing on
+        // cadence. The frames the statistics never report a second after their present get
+        // `-`; when readings come back, nothing is marked late, the frames they passed over are
+        // filled in on cadence, and the targets stay on the flips throughout.
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for latency in [0, 1] {
+                for k in [1, 2, 3, 4] {
+                    for end in [32, 35] {
+                        let extra = Loop {
+                            read_late: None,
+                            outage: Some((20_000_000, end * 1_000_000)),
+                        };
+                        let start = 2 * HNS_PER_SECOND / 10;
+                        let d = Display::new(latency, 0);
+                        let frames = (900 / k) as usize;
+                        let run =
+                            run_loop_with(wait, k, frames, d, start, |_| 20_000, |_| 0, extra);
+                        let what = format!("{wait:?} latency {latency} k {k} until {end}");
+                        assert!(run.skipped.is_empty(), "{what}: {:?}", run.skipped);
+                        assert!(late(&run).is_empty(), "{what}: {:?}", late(&run));
+                        let on = |_: i64| latency;
+                        assert_eq!(off_their_flips(&run, on, 0, 2_000), [0_u64; 0], "{what}");
+                        // Frames presented in the last second before the readings came back
+                        // are filled in, not left unknown.
+                        let unknown = run
+                            .out
+                            .iter()
+                            .filter(|r| r.record.display_hns.is_none())
+                            .filter(|r| r.record.present_hns > (end - 9) * 1_000_000)
+                            .count();
+                        assert_eq!(unknown, 0, "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_first_frame_late_on_the_gpu_is_marked() {
+        // Frame 0 is two vblanks late on the GPU: shown later after its target than any
+        // window's latency, it is marked late and taken no earlier than a vblank before its
+        // display. Frame 1 then shows as late, and the pacer catches up by passing over at most
+        // one number (the group the delay took); every later frame shows on its target, or (in
+        // independent flip, where a vblank of lateness can't be told from a composed window's
+        // latency) a vblank after it.
+        for wait in [Wait::Waitable, Wait::Blocking] {
+            for latency in [0, 1] {
+                for k in [2, 3, 4] {
+                    let slow = |n: u64| if n == 0 { 2 } else { 0 };
+                    let start = 2 * HNS_PER_SECOND / 10;
+                    let d = Display::new(latency, 0);
+                    let run = run_loop(wait, k, 100, d, start, |_| 20_000, slow);
+                    let what = format!("{wait:?} latency {latency} k {k}");
+                    assert_eq!(late(&run), [0], "{what}");
+                    let near_start = run.skipped.iter().all(|&n| n < 4);
+                    assert!(
+                        run.skipped.len() <= 1 && near_start,
+                        "{what}: {:?}",
+                        run.skipped
+                    );
+                    for r in run.out.iter().filter(|r| r.record.frame >= 4) {
+                        let shown = r.record.display_hns.unwrap();
+                        let after = shown - r.record.target_hns - HZ180.times(latency);
+                        assert!(
+                            near(after, 0) || near(after, HZ180.times(1)),
+                            "{what}: {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_frame_the_statistics_missed_across_a_skipped_number_isnt_filled_in() {
         // k = 1: frame 59 at vblank 96, frame 60 a vblank late at 98 (never reported), number 61
@@ -1320,7 +1736,7 @@ mod tests {
         let mut shown = Shown::new(Some(1), HZ180);
         for (f, id) in [(59_u64, 1_u32), (60, 2), (62, 3)] {
             let t = HZ180.times(f as i64 + 37);
-            shown.presented(f, t, id, t, false, false);
+            shown.presented(f, t, id, t, t, false, false);
         }
         let stats = |id: u32, v: u32| Stats {
             present_count: id,
@@ -1382,7 +1798,7 @@ mod tests {
                 panic!("warm-up")
             };
             assert_eq!(frame, u64::from(i));
-            pacer.presented(frame, target_hns, 1 + i, target_hns);
+            pacer.presented(frame, target_hns, 1 + i, target_hns, target_hns);
         }
         pacer.disjoint();
         let step = pacer.next(HZ180.times(3) - 1);
@@ -1452,7 +1868,7 @@ mod tests {
         let mut shown = Shown::new(Some(1), HZ180);
         for f in 0..4_u32 {
             let t = HZ180.times(i64::from(f));
-            shown.presented(u64::from(f), t, f + 1, t, false, false);
+            shown.presented(u64::from(f), t, f + 1, t, t, false, false);
         }
         assert!(shown.expire(HNS_PER_SECOND).is_empty());
         // A second after frame 1 was presented, frames 0 and 1 go out unknown, in order.
@@ -1553,7 +1969,7 @@ mod tests {
                 panic!("warm-up")
             };
             targets.push(target_hns);
-            pacer.presented(frame, target_hns, 10 + i, target_hns - 1);
+            pacer.presented(frame, target_hns, 10 + i, target_hns - 1, target_hns - 1);
         }
         // Frames 0–3 are presents 10–13, shown at vblanks 0–3; the statistics catch 10 and 13.
         let stats = |id: u32, v: u32| Stats {
@@ -1584,7 +2000,7 @@ mod tests {
             else {
                 panic!("warm-up")
             };
-            pacer.presented(frame, target_hns, 1 + i, target_hns);
+            pacer.presented(frame, target_hns, 1 + i, target_hns, target_hns);
         }
         let stats = |id: u32, v: u32| Stats {
             present_count: id,
@@ -1619,7 +2035,7 @@ mod tests {
             else {
                 panic!("warm-up")
             };
-            pacer.presented(frame, target_hns, 1 + i, target_hns);
+            pacer.presented(frame, target_hns, 1 + i, target_hns, target_hns);
         }
         assert_eq!(pacer.on_stats(stats(1, 1_000, 1_000, 0)).len(), 1);
         // Full screen to windowed: counts restart near 0; frame 2 isn't taken as late.
@@ -1641,7 +2057,7 @@ mod tests {
         else {
             panic!("warm-up")
         };
-        pacer.presented(frame, target_hns, 1, 2);
+        pacer.presented(frame, target_hns, 1, 2, 2);
         assert!(pacer.waiting());
         let end = pacer.finish();
         assert_eq!(end.len(), 1);
@@ -1657,6 +2073,7 @@ mod tests {
                 u64::from(f),
                 i64::from(f),
                 f + 1,
+                i64::from(f),
                 i64::from(f),
                 f == 2,
                 false,
