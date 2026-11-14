@@ -522,6 +522,12 @@ impl Ctx<'_> {
                 true
             }
             Statistics::Disjoint => {
+                // The counts start over: the next frame reported is judged on its own, so a
+                // reader must not tie the `-` frames before it to its `m` line. The first
+                // reading of a run is always DISJOINT, with nothing reported yet to reset.
+                if shown.last_shown().is_some() {
+                    self.log.event("statistics_disjoint", &[]);
+                }
                 shown.disjoint();
                 false
             }

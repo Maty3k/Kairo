@@ -385,11 +385,12 @@ b <m> <N_f> <target_hns> <played_hns|->
 m <N> vblank|slot
 e <name> [k=v …]   (ready, activate result=ok|failed, fse result=ok|failed, fullscreen_lost,
                     hdr_changed hdr=0|1, device_lost, no_frame_statistics, no_vblank_timing,
-                    audio_failed, audio_device_changed, end reason=…)
+                    statistics_disjoint, audio_failed, audio_device_changed, end reason=…)
 ```
 
 - **Times** are absolute QPC in 100 ns (core/timeline.rs:88).
   - `display`: the vblank where frame N first appeared, from `GetFrameStatistics` (PresentCount → SyncQPCTime); `-` if unknown or never shown.
+  - `statistics_disjoint`: DXGI's statistics were DISJOINT after frames had been reported (a mode change, exclusive fullscreen lost). Their counts start over, so the next frame reported is judged on its own, like the first of the run: its `m` line, if any, is its own, never the `-` frames before it.
   - A frame the statistics haven't reported a second after its present gets `-`; so do frames between two reported ones unless those two kept exact cadence with no number skipped between them and the gap is short: its frames span at most 16 vblanks, and none was given up on. Even a short gap can hide a window's move to composition and back that is shorter than itself (a vblank later, then a vblank sooner); the cap only bounds how long that can be, to 89 ms at 180 Hz.
   - **[Unverified]** for composed borderless and windowed modes. If `GetFrameStatistics` gives nothing through the 3 s warm-up, the log says `e no_frame_statistics`, the pacer takes its vblanks from the monitor's own clock (a thread on `IDXGIOutput::WaitForVBlank`; the grid runs through the earliest of the densest cluster of its wake phases) and, until DXGI's statistics arrive, if they ever do, every `display` is `-`: unknown, not missed. DWM's composition clock isn't used: since Windows 8.1 it follows the primary or fastest display, not necessarily this one. With no clock either, `e no_vblank_timing`, and the grid comes from the loop's own time.
 - **Writing.** Each line goes out in one `write_all`. The parser drops a torn last line, as `Trace::parse` does (core/trace.rs:130–165).
