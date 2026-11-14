@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use kairo_core::testbed_log::{Event, Mode, Pace, TestbedLog, TestbedRecord, ToneLog, ToneRecord};
+
+use crate::checks::unknown_before_late;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -238,25 +240,16 @@ pub fn testbed(log: &TestbedLog) -> Summary {
         .find(|e| has(&events, e));
     let timed = !shown.is_empty();
     // Missed: m lines and frames never drawn; with vsync, also a `-` just before a frame marked
-    // late (the statistics passed over an irregular stretch), as `check` counts them. Any other
-    // `-` is unknown: the first frame the statistics report is never marked late, so frames before
-    // statistics that came late are never read as misses.
+    // late (the statistics passed over an irregular stretch), as `check` counts them, except
+    // before the first frame reported and the first since `e statistics_disjoint`, which the
+    // testbed judges on their own. Any other `-` is unknown.
     let mut missed: BTreeSet<u64> = m_lines.clone();
     let drawn: BTreeSet<u64> = frames.iter().map(|f| f.frame).collect();
     if let (Some(a), Some(b)) = (first, last) {
         missed.extend((a..=b).filter(|n| !drawn.contains(n)));
     }
     if timed && !timer {
-        let mut before_late = false;
-        for f in frames.iter().rev() {
-            match f.display_hns {
-                Some(_) => before_late = m_lines.contains(&f.frame),
-                None if before_late => {
-                    missed.insert(f.frame);
-                }
-                None => {}
-            }
-        }
+        missed.extend(unknown_before_late(log, |n| m_lines.contains(&n)));
     }
     // Between frames shown one after another: the vblanks, and the time per frame.
     let vblank_steps: Vec<i64> = shown
@@ -816,5 +809,29 @@ mod tests {
             "{}",
             s.to_text()
         );
+        // Not before the first frame reported, nor the first since the counts started over: the
+        // testbed judged those on their own.
+        let late_600 = format!("f 600 1 2 {}\nm 600 vblank\n", 10_000_000 + 55_556 * 601);
+        for change in [
+            |n: u64| match n {
+                0..=599 => Some(format!("f {n} 1 2 -\n")),
+                _ => None,
+            },
+            |n: u64| match n {
+                599 => Some("e statistics_disjoint\nf 599 1 2 -\n".to_owned()),
+                _ => None,
+            },
+        ] {
+            let s = summarize(&testbed_text(3_600, "borderless", "", |n| match n {
+                600 => Some(late_600.clone()),
+                _ => change(n),
+            }))
+            .unwrap();
+            assert!(
+                s.criteria[0].detail.contains("1 of 3600 frames missed"),
+                "{}",
+                s.to_text()
+            );
+        }
     }
 }

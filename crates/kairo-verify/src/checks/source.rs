@@ -8,10 +8,12 @@
 //! shown more than k vblanks after the one before it), when it was never drawn (a gap between
 //! drawn frames' numbers), or, with vsync pacing, when its display time is `-` just before a
 //! frame the testbed marked late: the statistics passed over an irregular stretch, where the
-//! unreported frame may be the late one. Any other `-` means the statistics didn't say (none
-//! yet, a stretch they never reported, or none at all after `e no_frame_statistics`: the first
-//! frame they report is never marked late, so `-` frames before statistics start are never read
-//! as misses), and with timer pacing it is a frame the display passed over by design.
+//! unreported frame may be the late one. That holds only after a frame was reported: the first
+//! frame reported, and the first after `e statistics_disjoint` (DXGI's counts started over), is
+//! judged on its own, so its `m` line is its own and the `-` frames before it stay unknown. Any
+//! other `-` means the statistics didn't say (none yet, a stretch they never reported, or none at
+//! all after `e no_frame_statistics`), and with timer pacing it is a frame the display passed
+//! over by design.
 //!
 //! What the misses excuse is bounded by what they can do to the screen ([`Excuses`]).
 
@@ -72,6 +74,34 @@ fn seconds(hns: i64) -> f64 {
     hns as f64 / 10_000_000.0
 }
 
+/// The fewest fresh frames with display times that set a clip's lag range.
+const MIN_LAGS: usize = 10;
+
+/// The `-` frames just before a frame marked late (`late`) that has a display time, in log
+/// order: the statistics passed over them, and one may be the late one. Not before the first
+/// frame reported, nor the first since `e statistics_disjoint`: the testbed judges those on their
+/// own. Vsync pacing only; `log`, the summary, counts them as `check` does.
+pub(crate) fn unknown_before_late(log: &TestbedLog, late: impl Fn(u64) -> bool) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut stretch = Vec::new();
+    let mut reported = false;
+    for record in &log.records {
+        match record {
+            TestbedRecord::Frame(f) if f.display_hns.is_none() => stretch.push(f.frame),
+            TestbedRecord::Frame(f) => {
+                if reported && late(f.frame) {
+                    out.append(&mut stretch);
+                }
+                stretch.clear();
+                reported = true;
+            }
+            TestbedRecord::Event(e) if e.name() == "statistics_disjoint" => reported = false,
+            _ => {}
+        }
+    }
+    out
+}
+
 impl Source {
     /// Reads `log`.
     pub fn new(log: &TestbedLog) -> Source {
@@ -96,19 +126,13 @@ impl Source {
         }
         let timed = shown.values().any(Option::is_some);
         let timer = h.pace == Pace::Timer;
-        // With vsync, a `-` just before a frame marked late: from the last frame back, each
-        // `-` frame belongs to the next frame that has a display time.
+        // With vsync, a `-` just before a frame marked late: each `-` frame belongs to the next
+        // frame that has a display time, unless that frame is the first reported, or the first
+        // since DXGI's counts started over, which the testbed judges on its own.
         if timed && !timer {
-            let mut before_late = false;
-            let mut unknown_before_late = Vec::new();
-            for (&n, display) in shown.iter().rev() {
-                match display {
-                    Some(_) => before_late = misses.contains(&n),
-                    None if before_late => unknown_before_late.push(n),
-                    None => {}
-                }
-            }
-            misses.extend(unknown_before_late);
+            let unknown =
+                unknown_before_late(log, |n| i64::try_from(n).is_ok_and(|n| misses.contains(&n)));
+            misses.extend(unknown.into_iter().filter_map(|n| i64::try_from(n).ok()));
         }
         let beeps = log
             .beeps()
@@ -162,18 +186,28 @@ impl Source {
         self.shown.get(&n).copied().flatten()
     }
 
-    /// Whether frame `n` was on screen within `slack` seconds of QPC time `t`, by the log's
-    /// display times: from its display to the next frame's that has one. A frame drawn but not
-    /// reported could have shown any time between its neighbours that were; a frame never drawn
-    /// was never on screen. `None` where the log can't say.
-    pub fn on_screen(&self, n: i64, t: f64, slack: f64) -> Option<bool> {
-        let shown = self.shown.get(&n)?;
-        let from = match shown {
+    /// When drawn frame `n` was on screen, in seconds of QPC time, by the log's display times:
+    /// from its display to the next frame's that has one. A frame drawn but not reported could
+    /// have shown any time between its neighbours that were. Each end must come from a frame
+    /// with no more than `unreported` drawn frames without a display time in between (frames
+    /// never drawn don't count: they never held the screen); `None` where the log can't say,
+    /// such as after the statistics stopped.
+    pub fn screen_window(&self, n: i64, unreported: usize) -> Option<(f64, f64)> {
+        let from = match self.shown.get(&n)? {
             Some(d) => *d,
-            None => self.shown.range(..n).rev().find_map(|(_, d)| *d)?,
+            None => self
+                .shown
+                .range(..n)
+                .rev()
+                .take(unreported + 1)
+                .find_map(|(_, d)| *d)?,
         };
-        let until = self.shown.range(n + 1..).find_map(|(_, d)| *d);
-        Some(from <= t + slack && until.is_none_or(|u| u > t - slack))
+        let until = self
+            .shown
+            .range(n + 1..)
+            .take(unreported + 1)
+            .find_map(|(_, d)| *d)?;
+        Some((from, until))
     }
 
     /// Whether frame `n` was never drawn: the log has an `m` line or a gap for it.
@@ -225,6 +259,33 @@ impl Source {
         Some(gaps[((gaps.len() - 1) as f64 * 0.05).floor() as usize])
     }
 
+    /// The spread of the capture's lag behind the screen, in seconds: the 5th and 95th
+    /// percentiles of `pts_i − display(N_i)` over the readable frames after the held frame 0
+    /// that show a new testbed frame and whose display the log knows. A repeat is left out, so a
+    /// capture that froze doesn't widen it. `None` with fewer than [`MIN_LAGS`] such frames.
+    pub fn clip_lags(
+        &self,
+        numbers: &[Option<i64>],
+        pts: &[i64],
+        timescale: u64,
+    ) -> Option<(f64, f64)> {
+        let mut lags: Vec<f64> = (1..numbers.len().min(pts.len()))
+            .filter_map(|i| {
+                let n = numbers[i]?;
+                if numbers[i - 1] == Some(n) {
+                    return None;
+                }
+                Some(pts[i] as f64 / timescale as f64 - self.display_s(n)?)
+            })
+            .collect();
+        if lags.len() < MIN_LAGS {
+            return None;
+        }
+        lags.sort_by(f64::total_cmp);
+        let at = |q: f64| lags[((lags.len() - 1) as f64 * q).round() as usize];
+        Some((at(0.05), at(0.95)))
+    }
+
     /// The log's word on frames `first..=last`: the span a clip shows, which the caller carries
     /// on over any misses that excused its steps (a stall still under way at the clip's end).
     pub fn stability(&self, first: i64, last: i64) -> Stability {
@@ -251,11 +312,13 @@ impl Source {
     }
 }
 
-/// Where a clip's output frames fall on the testbed's clock: each one's QPC time in seconds, by
-/// the clip clock ([`Source::clip_clock`]), and how far a capture's picture may be from it.
+/// Where a clip's output frames can fall on the testbed's clock: each one's time in the clip,
+/// and the spread of the capture's lag behind the screen ([`Source::clip_lags`]).
 pub(crate) struct Screen {
-    /// Each output frame's QPC time, in seconds.
-    pub times: Vec<f64>,
+    /// Each output frame's time in the clip, in seconds.
+    pub pts: Vec<f64>,
+    /// The least and most a capture lagged the screen in this clip, in seconds.
+    pub lag: (f64, f64),
     /// One vblank, in seconds: a capture takes what the screen showed within about that.
     pub slack: f64,
 }
@@ -266,12 +329,14 @@ pub(crate) struct Screen {
 /// time: the testbed's numbers only go forward.
 ///
 /// Where the log's display times say what the screen showed, that decides: the step is the
-/// testbed's when N was on screen at the step's first output frame and N′ at its second, each
-/// within a vblank, so the capture showed what the screen did. A capture that froze, dropped a
-/// frame or took a stale one beside a testbed miss shows a frame the screen had left or not yet
-/// shown, and stays the capture's.
+/// testbed's when one capture lag, within the spread this clip shows, puts N on screen at the
+/// step's first output frame and N′ at its second, each within a vblank, so the capture showed
+/// what the screen did. A capture that froze, dropped a frame or took a stale one beside a
+/// testbed miss shows a frame the screen had left or not yet shown at any such lag, and stays the
+/// capture's.
 ///
-/// Where they can't (no display times near N or N′, or no clip clock), the misses are bounded
+/// Where they can't (no display times near N or N′, or too few to measure the lag), the misses
+/// are bounded
 /// by what they can do to the screen. A run of m missed frames held the screen m frame times
 /// longer, and e more where the display times there show the frames around it came e frame
 /// times later than their numbers say ([`Source::late_frames`]). So it can account for at most
@@ -383,21 +448,26 @@ impl<'a> Excuses<'a> {
         true
     }
 
-    /// Whether the log puts `from` on screen at output frame `at - 1` and `to` at `at`; `None`
-    /// where it can't say.
+    /// Whether the log puts `from` on screen at output frame `at - 1` and `to` at `at` at one
+    /// capture lag this clip shows; `None` where it can't say.
     fn on_screen(&self, at: usize, from: i64, to: i64) -> Option<bool> {
         let screen = self.screen.as_ref()?;
-        let (t0, t1) = (
-            *screen.times.get(at.checked_sub(1)?)?,
-            *screen.times.get(at)?,
-        );
+        let (p0, p1) = (*screen.pts.get(at.checked_sub(1)?)?, *screen.pts.get(at)?);
         // A frame never drawn was never shown: the picture isn't the testbed's.
         if self.source.never_drawn(from) || self.source.never_drawn(to) {
             return Some(false);
         }
-        let shown = self.source.on_screen(from, t0, screen.slack)?
-            && self.source.on_screen(to, t1, screen.slack)?;
-        Some(shown)
+        // The display times around them must be near: no more unreported frames than the step
+        // spans, and one.
+        let unreported = usize::try_from(to - from).unwrap_or(0) + 1;
+        let (f0, u0) = self.source.screen_window(from, unreported)?;
+        let (f1, u1) = self.source.screen_window(to, unreported)?;
+        // At lag L a picture at clip time p shows QPC time p − L, and frame n was on screen
+        // within a vblank s of that when from_n − s ≤ p − L ≤ until_n + s.
+        let s = screen.slack;
+        let low = (p0 - u0 - s).max(p1 - u1 - s).max(screen.lag.0);
+        let high = (p0 - f0 + s).min(p1 - f1 + s).min(screen.lag.1);
+        Some(low <= high)
     }
 
     /// The last missed frame that excused a step, if any did.
@@ -518,10 +588,16 @@ mod tests {
     }
 
     /// A capture's output frames at 60 fps, sampled 0.1 vblank after the vblanks `vblanks`, on
-    /// the testbed's clock.
+    /// the testbed's clock: a clip whose lag behind the screen never varies.
     fn screen(vblanks: &[i64]) -> Screen {
+        lagging(vblanks, (0.0, 0.0))
+    }
+
+    /// The same frames, from a clip whose lag behind the screen spans `lag` vblanks.
+    fn lagging(vblanks: &[i64], lag: (f64, f64)) -> Screen {
         Screen {
-            times: vblanks.iter().map(|&v| (v as f64 + 0.1) / 180.0).collect(),
+            pts: vblanks.iter().map(|&v| (v as f64 + 0.1) / 180.0).collect(),
+            lag: (lag.0 / 180.0, lag.1 / 180.0),
             slack: 1.0 / 180.0,
         }
     }
@@ -598,6 +674,112 @@ mod tests {
         // 3604 → 3612 is 5 frames off a tick, more than either run of 3 allows alone.
         let mut x = Excuses::new(&s, 60, None);
         assert!(x.excuse(1, 3_604, 3_612));
+    }
+
+    #[test]
+    fn display_times_say_nothing_once_the_statistics_stop() {
+        // 180 fps on 180 Hz: frames reported up to 3600, then the statistics stop and every
+        // frame gets `-`; 3650 was never drawn. Nothing reported is near the miss, so the size
+        // bound judges a 60 fps capture's steps around it: a freeze on 3649 stays the capture's.
+        let lines: String = (3_580..3_700)
+            .map(|n: i64| {
+                let t = (n as f64 * 10_000_000.0 / 180.0).round() as i64;
+                match n {
+                    3_650 => "m 3650 vblank\n".to_owned(),
+                    _ if n <= 3_600 => format!("f {n} {t} {t} {t}\n"),
+                    _ => format!("f {n} {t} {t} -\n"),
+                }
+            })
+            .collect();
+        let s = Source::new(&log(&lines, 180, "vsync"));
+        assert_eq!(s.screen_window(3_649, 1), None);
+        assert_eq!(s.screen_window(3_602, 2), None, "nothing reported after it");
+        let (d0, d1) = (s.display_s(3_599).unwrap(), s.display_s(3_600).unwrap());
+        assert_eq!(s.screen_window(3_599, 0), Some((d0, d1)));
+        let vblanks: Vec<i64> = (3_600..3_700).step_by(3).collect();
+        let mut x = Excuses::new(&s, 60, Some(screen(&vblanks)));
+        assert!(!x.excuse(17, 3_649, 3_649), "a repeat a tick short");
+        assert!(x.excuse(17, 3_648, 3_651), "a step of a tick over the miss");
+    }
+
+    #[test]
+    fn one_lag_within_the_clip_s_spread_places_both_frames() {
+        // The screen of the test above: 3599 held 7 vblanks while 3600 showed 6 late. This
+        // capture samples it every third vblank and delivers each picture 2.5 vblanks later, a
+        // lag this clip's other frames also show.
+        let frames: Vec<(i64, Option<i64>)> = (3_580..3_620)
+            .map(|n| match n {
+                3_600 => (n, Some(3_606)),
+                3_601 => (n, Some(3_607)),
+                3_602..=3_607 => (n, None),
+                _ => (n, Some(n)),
+            })
+            .collect();
+        let s = shown_at(180, &frames, &[3_600]);
+        let pts: Vec<f64> = [3_591, 3_594, 3_597, 3_600, 3_603, 3_606, 3_609, 3_612]
+            .iter()
+            .map(|&v| (v as f64 + 2.6) / 180.0)
+            .collect();
+        let lagging_by = |vblanks: (f64, f64)| Screen {
+            pts: pts.clone(),
+            lag: (vblanks.0 / 180.0, vblanks.1 / 180.0),
+            slack: 1.0 / 180.0,
+        };
+        // It shows 3597, 3599, 3599, 3600, 3609: one lag places each step on the screen.
+        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 3.0))));
+        assert!(x.excuse(3, 3_597, 3_599));
+        assert!(x.excuse(4, 3_599, 3_599));
+        assert!(x.excuse(6, 3_600, 3_609));
+        // At the freshest lag alone the screen had moved on by then.
+        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 0.0))));
+        assert!(!x.excuse(3, 3_597, 3_599));
+        // A freeze on 3599 after the screen left it needs a lag this clip never shows.
+        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 3.0))));
+        assert!(!x.excuse(6, 3_599, 3_599));
+    }
+
+    #[test]
+    fn the_lag_range_leaves_out_repeats() {
+        // Frames shown 100 ms apart at QPC 10 s + n/10, and a capture that shows frame n at n/10 s
+        // but freezes on 20 for five more frames: the repeats don't widen the range.
+        let lines: String = (0..40)
+            .map(|n| format!("f {n} 0 0 {}\n", 100_000_000 + n * 1_000_000))
+            .collect();
+        let s = Source::new(&log(&lines, 10, "timer"));
+        let numbers: Vec<Option<i64>> = (0..40)
+            .map(|i| Some(if (21..=25).contains(&i) { 20 } else { i }))
+            .collect();
+        let pts: Vec<i64> = (0..40).map(|i: i64| i * 1_536).collect();
+        let (low, high) = s.clip_lags(&numbers, &pts, 15_360).unwrap();
+        assert!(
+            (low + 10.0).abs() < 1e-9 && (high + 10.0).abs() < 1e-9,
+            "{low} {high}"
+        );
+        // Too few fresh frames to say.
+        assert_eq!(s.clip_lags(&numbers[..10], &pts[..10], 15_360), None);
+    }
+
+    #[test]
+    fn a_first_report_s_m_line_is_its_own() {
+        // The first frame reported, and the first after DXGI's counts start over, are judged on
+        // their own: the `-` frames before them stay unknown.
+        let s = Source::new(&log(
+            "f 0 0 1 -\nf 1 1 2 -\nf 2 2 3 4\nm 2 vblank\nf 3 3 4 5\n",
+            180,
+            "vsync",
+        ));
+        assert!(!s.is_miss(0) && !s.is_miss(1) && s.is_miss(2));
+        let after =
+            "f 0 0 1 0\nf 1 1 2 1\ne statistics_disjoint\nf 2 2 3 -\nf 3 3 4 9\nm 3 vblank\n";
+        let s = Source::new(&log(after, 180, "vsync"));
+        assert!(!s.is_miss(2) && s.is_miss(3));
+        // Without the event it is one more stretch the statistics passed over.
+        let s = Source::new(&log(
+            &after.replace("e statistics_disjoint\n", ""),
+            180,
+            "vsync",
+        ));
+        assert!(s.is_miss(2));
     }
 
     #[test]

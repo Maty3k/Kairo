@@ -119,8 +119,10 @@ struct Analysis {
     /// The flash at the nominal rate F the lit frames fit best (F or F ± 1), with that F.
     flashes: Option<(u32, Flashes)>,
     /// The 99th percentile of |step − tick| between consecutive readable frames, in 100 ns, from
-    /// the line's slope (README §6.3 `cadence.judder`).
+    /// the log's display times or else the line's slope (README §6.3 `cadence.judder`).
     p99_step_error_hns: Option<f64>,
+    /// Which of the two it came from.
+    p99_from: &'static str,
     /// Each picture's bars, the unreadable ones scored against their likely frame numbers.
     bars: Vec<Option<FrameBars>>,
     /// Each picture's presentation time, in media ticks.
@@ -385,11 +387,9 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
     let mut excused_until = None;
     let counts = source_fps.zip(fps).and_then(|(fs, f)| match &source {
         Some(s) => {
-            let screen = s.clip_clock(&numbers, &pts, timescale).map(|clock| Screen {
-                times: pts
-                    .iter()
-                    .map(|&p| p as f64 / timescale as f64 - clock)
-                    .collect(),
+            let screen = s.clip_lags(&numbers, &pts, timescale).map(|lag| Screen {
+                pts: pts.iter().map(|&p| p as f64 / timescale as f64).collect(),
+                lag,
                 slack: 1.0 / s.refresh_hz.max(1.0),
             });
             let mut excuses = Excuses::new(s, f, screen);
@@ -427,16 +427,19 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
             best
         }),
     };
-    let p99_step_error_hns = match (&source, &line, fps) {
-        (Some(s), line, Some(fps)) if s.timed => {
-            display_step_error_p99(s, &numbers, fps).or_else(|| {
-                line.as_ref()
-                    .ok()
-                    .and_then(|l| step_error_p99(l, &numbers, timescale, fps))
-            })
-        }
-        (_, Ok(line), Some(fps)) => step_error_p99(line, &numbers, timescale, fps),
+    let from_display = match (&source, fps) {
+        (Some(s), Some(fps)) if s.timed => display_step_error_p99(s, &numbers, fps),
         _ => None,
+    };
+    let (p99_step_error_hns, p99_from) = match from_display {
+        Some(p99) => (Some(p99), "the testbed log's display times"),
+        None => (
+            line.as_ref()
+                .ok()
+                .zip(fps)
+                .and_then(|(l, fps)| step_error_p99(l, &numbers, timescale, fps)),
+            "the barcode line",
+        ),
     };
     let mut frame_bars = decoded.bars.clone();
     if let Some(bands) = decoded.bands.as_ref() {
@@ -464,6 +467,7 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
         ideal,
         flashes,
         p99_step_error_hns,
+        p99_from,
         source,
         timescale,
     }
@@ -1133,7 +1137,7 @@ fn judder(plan: &Plan, a: &Analysis) -> Outcome {
         value: json!({"judder_steps": counts.judder, "steps": counts.steps, "share": share,
                       "ideal_share": ideal, "excess": excess, "refresh_hz": a.refresh.map(|r| r.0),
                       "source_fps": a.source_fps, "p99_step_error_hns": a.p99_step_error_hns,
-                      "p99_from": if a.source.as_ref().is_some_and(|s| s.timed) { "the testbed log's display times" } else { "the barcode line" },
+                      "p99_from": a.p99_from,
                       "source_events": counts.source_events.len()}),
         limit: json!({"max_excess": limit, "source": "README §2 item 12 (proposed outside test; test: one step)"}),
         detail: format!(
@@ -1538,6 +1542,7 @@ mod tests {
             ideal: Some((0.0, 0.0)),
             flashes: None,
             p99_step_error_hns: None,
+            p99_from: "the barcode line",
             bars: Vec::new(),
             pts: Vec::new(),
             source: None,
