@@ -107,7 +107,7 @@ foreach ($file in $files) {
 # Without them the build still deploys; a program that links FFmpeg then can't start until
 # pc ffmpeg and another deploy.
 $ffmpeg = $null
-$ffmpegNote = ''
+$ffmpegNotes = @()
 $ffmpegBin = Join-Path $Kairo.Ffmpeg 'bin'
 $installed = Read-JsonFile (Join-Path $Kairo.Ffmpeg 'KAIRO-PIN.json')
 if (([string](Get-Field $installed 'sha256') -ceq $pin) -and [IO.Directory]::Exists($ffmpegBin)) {
@@ -118,15 +118,24 @@ if (([string](Get-Field $installed 'sha256') -ceq $pin) -and [IO.Directory]::Exi
         foreach ($dll in $dlls) {
             [IO.File]::Copy((Join-Path $ffmpegBin $dll), (Join-Path $destination $dll), $false)
         }
+        # A program built against another FFmpeg (other library versions in the names) imports DLLs
+        # the pinned build lacks; Windows would only say so when it starts.
+        $missing = @($images | ForEach-Object { Get-PeImports $_ } | Where-Object {
+                ($_ -match '^(avcodec|avformat|avutil|avfilter|avdevice|swresample|swscale|postproc)-[0-9]+\.dll\z') -and
+                -not [IO.File]::Exists((Join-Path $ffmpegBin $_)) } | Sort-Object -Unique)
     } catch {
         Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
         Fail ('FFmpeg''s DLLs: ' + $_.Exception.Message + '; nothing was deployed')
     }
     $ffmpeg = [ordered]@{ asset = [string](Get-Field $installed 'asset'); sha256 = $pin; dlls = $dlls }
-    if ($dlls.Count -gt 0) { $ffmpegNote = 'with FFmpeg''s ' + ($dlls -join ', ') + ' (' + $ffmpeg.asset + ')' }
+    if ($dlls.Count -gt 0) { $ffmpegNotes += 'with FFmpeg''s ' + ($dlls -join ', ') + ' (' + $ffmpeg.asset + ')' }
+    if ($missing.Count -gt 0) {
+        $ffmpegNotes += 'warning: this build imports ' + ($missing -join ', ') + ', which the pinned FFmpeg lacks, so ' +
+            'what imports them can''t start: it was built against another FFmpeg (run tools/mac/pc build, then deploy again)'
+    }
 } elseif ($files | Where-Object { $_.Name -ieq 'kairo-verify.exe' }) {
-    $ffmpegNote = 'warning: kairo-verify.exe has no FFmpeg DLLs beside it, so it can''t start: ' + $Kairo.Ffmpeg +
-        ' is not the build tools/pc/bootstrap.ps1 pins (run tools/mac/pc ffmpeg, then deploy again)'
+    $ffmpegNotes += 'warning: kairo-verify.exe has no FFmpeg DLLs beside it, so it can''t start: ' + $Kairo.Ffmpeg +
+        ' is not the build tools/pc/bootstrap.ps1 pins (run tools/mac/pc ffmpeg, then build and deploy again)'
 }
 
 $info = [ordered]@{
@@ -148,7 +157,7 @@ Set-CurrentBuild $id
 $was = 'none'
 if ($previous) { $was = $previous }
 Say ('deployed ' + $id + ' (' + $files.Count + ' files: ' + (@($exes | ForEach-Object { $_.Name }) -join ', ') + ')')
-if ($ffmpegNote) { Say $ffmpegNote }
+foreach ($note in $ffmpegNotes) { Say $note }
 Say ('C:\kairo\bin\current -> ' + $id + ' (was ' + $was + ')')
 Restart-WatchAgent
 Remove-OldBuilds

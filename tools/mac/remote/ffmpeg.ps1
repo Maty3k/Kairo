@@ -44,7 +44,10 @@ Remove-Work
 $zip = Join-Path $work ($asset + '.zip')
 Say ('downloading ' + $asset + ' (about 80 MB)')
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-$r = Invoke-Native -Exe $curl -Arguments @('--fail', '--location', '--proto', '=https', '--silent', '--show-error',
+# --disable must stay the first argument: otherwise curl reads a .curlrc or _curlrc from %USERPROFILE% or
+# %APPDATA% (stub.ps1 keeps both), which any program running as the owner can write, and this session
+# would carry out its options (another URL, another output file) with Administrators' rights.
+$r = Invoke-Native -Exe $curl -Arguments @('--disable', '--fail', '--location', '--proto', '=https', '--silent', '--show-error',
     '--retry', '3', '--retry-delay', '5', '--connect-timeout', '30', '--max-time', '900',
     '--user-agent', 'Kairo-pc/1 (+https://github.com/Maty3k/Kairo)', '--output', $zip, $url)
 if ($r.Code -ne 0) {
@@ -78,9 +81,11 @@ Write-TextFileAtomic (Join-Path $new 'KAIRO-PIN.json') ($record | ConvertTo-Json
 
 # The swap: two renames on one volume. A file still open in the old folder stops the first one.
 $aside = Join-Path $work 'previous'
+$movedAside = $false
 if ([IO.Directory]::Exists($dir)) {
     try {
         [IO.Directory]::Move($dir, $aside)
+        $movedAside = $true
     } catch {
         Remove-Work
         Fail ('the old FFmpeg could not be moved aside (is a program still using it?): ' + $_.Exception.Message + '; nothing changed')
@@ -90,12 +95,14 @@ try {
     [IO.Directory]::Move($new, $dir)
 } catch {
     $problem = $_.Exception.Message
-    if ([IO.Directory]::Exists($aside)) {
-        try {
-            [IO.Directory]::Move($aside, $dir)
-        } catch {
-            Fail ('the new FFmpeg could not be moved into place (' + $problem + '), nor the old one back from ' + $aside + ': ' + $_.Exception.Message)
-        }
+    if (-not $movedAside) {
+        Remove-Work
+        Fail ('the new FFmpeg could not be moved into place: ' + $problem + '; nothing was installed (there was no FFmpeg before)')
+    }
+    try {
+        [IO.Directory]::Move($aside, $dir)
+    } catch {
+        Fail ('the new FFmpeg could not be moved into place (' + $problem + '), nor the old one back from ' + $aside + ': ' + $_.Exception.Message)
     }
     Remove-Work
     Fail ('the new FFmpeg could not be moved into place: ' + $problem + '; the old one is back')
@@ -106,5 +113,5 @@ Remove-Work
 if ([IO.Directory]::Exists($work)) { Say ('note: ' + $work + ' could not be removed yet (the old copy may still be in use)') }
 
 Say ('installed ' + $asset + ' in ' + $dir + ' (was ' + $was + ')')
-Say 'next: tools/mac/pc deploy, so the next build''s kairo-verify.exe gets these DLLs (the current build keeps its own)'
+Say 'next: tools/mac/pc build, then tools/mac/pc deploy: the new build links against this FFmpeg and gets its DLLs (the current build keeps its own)'
 Exit-Pc 0
