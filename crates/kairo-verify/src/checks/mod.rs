@@ -8,6 +8,7 @@ mod audio;
 mod container;
 mod content;
 mod export;
+mod source;
 mod tracks;
 mod video;
 
@@ -27,6 +28,7 @@ use crate::report::{Summary, Verdict};
 pub(crate) use container::structure_problems;
 pub use content::Decoded;
 pub(crate) use content::decode;
+pub(crate) use source::unknown_before_late;
 
 /// Each audio track's channel count, as its sample entry gives it (at least 1), and its packet
 /// count, in file order.

@@ -171,6 +171,12 @@ pub const ENGINE_MAX_HOLD: (usize, i128) = (2, 2);
 /// `cadence.judder`: the most judder steps above the ideal delivery's, as a share, outside
 /// `test`, which allows none (README §2 item 12, proposed).
 pub const JUDDER_MAX_EXCESS: f64 = 0.05;
+/// `source.stability`: the most of the clip's testbed frames the testbed may miss (README §6.3,
+/// §6.5, proposed); above it the run is redone and the clip isn't blamed.
+pub const SOURCE_MISSED_MAX: f64 = 0.001;
+/// How far the clip's barcode rate may be from the log's frame rate before the log is taken
+/// for another run's.
+pub const SOURCE_RATE_TOLERANCE: f64 = 0.005;
 /// How many first frames are searched for the pattern in a clip that needn't hold it
 /// (README §6.1).
 pub const PATTERN_PROBE_FRAMES: usize = 60;
@@ -417,6 +423,10 @@ pub struct Plan {
     /// `content.bars_lines`' limit in codes as a PC corpus calibrates it (README §7.4), or
     /// [`BARS_LINES_MAX_CODES`] when `None`.
     pub bars_lines_codes: Option<f64>,
+    /// `--testbed-log`: the testbed's QPC log of the run the clip shows (README §4.9).
+    pub testbed_log: Option<kairo_core::testbed_log::TestbedLog>,
+    /// `--voice-log`: `kairo-tone`'s log of the same run (README §5).
+    pub voice_log: Option<kairo_core::testbed_log::ToneLog>,
 }
 
 /// Why a profile, gate and expect file don't fit together.
@@ -478,6 +488,8 @@ impl Plan {
             voice_included: false,
             cue: None,
             bars_lines_codes: None,
+            testbed_log: None,
+            voice_log: None,
         };
         match (profile, expect.as_ref()) {
             (Profile::Test, Some(e)) => {
