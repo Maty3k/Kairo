@@ -366,6 +366,23 @@ impl Shown {
         self.last_shown
     }
 
+    /// How long after its slot the newest frame reported was presented (timer pacing: the wait
+    /// and the call itself); 0 before a report.
+    pub fn present_delay_hns(&self) -> i64 {
+        self.last_shown
+            .map_or(0, |r| (r.present_hns - r.target_hns).max(0))
+    }
+
+    /// The display's latency, from the newest frame reported: how long after the first vblank
+    /// following its present it showed (a composed window shows a frame a vblank after it
+    /// takes it). 0 before a report.
+    pub fn latency_hns(&self) -> i64 {
+        match (self.last_shown, self.grid) {
+            (Some(r), Some(g)) => (r.shown_hns - g.time_of(g.next_after(r.present_hns))).max(0),
+            _ => 0,
+        }
+    }
+
     /// The statistics went away and came back (`DXGI_ERROR_FRAME_STATISTICS_DISJOINT`, as after
     /// a change between full screen and a window): their vblank counts may now be in another
     /// domain, so no count is compared across the change. The grid's times stay valid until
@@ -818,6 +835,26 @@ impl VsyncPacer {
             false,
             anchored,
         );
+    }
+
+    /// When frame `frame` should first show, on the cadence as it stands (README §4.7: the last
+    /// known vblank plus whole refresh periods): k vblanks a frame from the vblank the last frame
+    /// drawn was taken at, plus the display's latency as the newest frame reported shows it,
+    /// all in whole vblanks of the latest grid. A frame already drawn, or passed over, gets the
+    /// time it had on that cadence, which has gone by. `None` before frame 0.
+    pub fn predict(&self, frame: u64) -> Option<i64> {
+        let grid = self.grid()?;
+        let (previous, taken) = self.last_taken()?;
+        let ahead = i64::try_from(frame).ok()? - i64::try_from(previous).ok()?;
+        let latency = self.shown.latency_vblanks().unwrap_or(0).max(0);
+        let taken_v = grid.at_or_after(taken - self.period.times(1) / 2);
+        Some(
+            grid.time_of(
+                taken_v
+                    .saturating_add(ahead.saturating_mul(self.k))
+                    .saturating_add(latency),
+            ),
+        )
     }
 
     /// Whether frames still wait for statistics.
@@ -2193,6 +2230,51 @@ mod tests {
                 assert!(off <= 2_500 || off >= 55_558 - 600, "vblank {v}: {off}");
             }
         }
+    }
+
+    #[test]
+    fn future_frames_are_predicted_on_the_cadence() {
+        let mut pacer = VsyncPacer::new(2, HZ180, 0, false);
+        assert_eq!(pacer.predict(10), None);
+        pacer.on_vblank(0);
+        let Step::Frame {
+            frame, target_hns, ..
+        } = pacer.next(-2)
+        else {
+            panic!("warm-up")
+        };
+        assert_eq!(frame, 0);
+        // Presented before vblank 0, so DXGI can take it there.
+        pacer.presented(0, target_hns, 1, -1, -1);
+        // Frame 0 at vblank 0, so frame 180 at vblank 360; frame 0 itself, drawn, at 0.
+        assert!(near(pacer.predict(180).unwrap(), HZ180.times(360)));
+        assert!(near(pacer.predict(0).unwrap(), 0));
+        // Frame 0 reported a vblank after it was taken (a composed window): the prediction is a
+        // display time, a vblank later too.
+        pacer.on_stats(Stats {
+            present_count: 1,
+            present_refresh: 1,
+            sync_refresh: 1,
+            sync_hns: HZ180.times(1),
+        });
+        assert!(near(pacer.predict(180).unwrap(), HZ180.times(361)));
+        // A frame shown later than its cadence moves the ones after it.
+        let Step::Frame {
+            frame, target_hns, ..
+        } = pacer.next(HZ180.times(1) + 1)
+        else {
+            panic!("warm-up")
+        };
+        assert_eq!((frame, near(target_hns, HZ180.times(2))), (1, true));
+        pacer.presented(1, target_hns, 2, HZ180.times(1) + 2, HZ180.times(1) + 2);
+        pacer.on_stats(Stats {
+            present_count: 2,
+            present_refresh: 4,
+            sync_refresh: 4,
+            sync_hns: HZ180.times(4),
+        });
+        // Frame 1 showed at vblank 4 (taken at 3, a vblank late): frame 180 at 3 + 2 × 179 + 1.
+        assert!(near(pacer.predict(180).unwrap(), HZ180.times(362)));
     }
 
     #[test]
