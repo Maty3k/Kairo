@@ -304,8 +304,12 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            cargo build --release (--workspace unless -p) of C:\kairo\src as a hidden,
                            below-normal \Kairo\Run job in the owner's session, never elevated, into
                            C:\kairo\build\target; stops if the owner becomes active (unless --force).
-  deploy [--force]         Copy the last successful build to C:\kairo\bin\<build-id>, point
-                           C:\kairo\bin\current at it, restart the watch agent, keep 3 builds.
+  deploy [--force]         Copy the last successful build to C:\kairo\bin\<build-id>, with the
+                           pinned FFmpeg's DLLs beside kairo-verify.exe, point C:\kairo\bin\current
+                           at it, restart the watch agent, keep 3 builds.
+  ffmpeg [--force]         Put the FFmpeg build tools/pc/bootstrap.ps1 pins into C:\kairo\tools\ffmpeg
+                           with the bootstrap's steps (download, SHA-256 check, swap the folder,
+                           KAIRO-PIN.json); refused while a \Kairo\Run job runs. Then deploy again.
   rollback [BUILD-ID] [--force]
                            Point C:\kairo\bin\current at the previous (or the named) build.
   run JOB [--no-wait | --wait SECONDS] [--tail N] [--force]
@@ -560,6 +564,27 @@ cmd_build() {
     run_ps build
 }
 
+# The FFmpeg build tools/pc/bootstrap.ps1 pins, read as CI reads it (.github/workflows/ci.yml); the
+# doctor's copy of the SHA-256 must agree. pc ffmpeg installs it; pc deploy copies its DLLs only
+# while it is the one installed.
+FFMPEG_ASSET='' FFMPEG_URL='' FFMPEG_SHA256=''
+read_ffmpeg_pin() {
+    local bootstrap="$REPO_ROOT/tools/pc/bootstrap.ps1" doctor_sha
+    # shellcheck disable=SC2016 # sed programs: the \$ is a literal dollar sign
+    FFMPEG_ASSET=$(sed -n 's/^\$FfmpegAsset *= *'"'"'\([A-Za-z0-9._-]*\)'"'"'.*/\1/p' "$bootstrap" | head -n 1)
+    # shellcheck disable=SC2016
+    FFMPEG_URL=$(sed -n 's/^\$FfmpegUrl *= *'"'"'\(https:\/\/github\.com\/[A-Za-z0-9._\/-]*\)'"'"'.*/\1/p' "$bootstrap" | head -n 1)
+    # shellcheck disable=SC2016
+    FFMPEG_SHA256=$(sed -n 's/^\$FfmpegSha256 *= *'"'"'\([0-9a-f]\{64\}\)'"'"'.*/\1/p' "$bootstrap" | head -n 1)
+    # shellcheck disable=SC2016
+    doctor_sha=$(sed -n 's/^\$FfmpegSha256 *= *'"'"'\([0-9a-f]\{64\}\)'"'"'.*/\1/p' "$REPO_ROOT/tools/pc/doctor.ps1" | head -n 1)
+    if [ -z "$FFMPEG_ASSET" ] || [ -z "$FFMPEG_URL" ] || [ -z "$FFMPEG_SHA256" ]; then
+        die "cannot read the FFmpeg pin (\$FfmpegAsset, \$FfmpegUrl, \$FfmpegSha256) from tools/pc/bootstrap.ps1"
+    fi
+    [ "$doctor_sha" = "$FFMPEG_SHA256" ] || die "tools/pc/doctor.ps1 pins another FFmpeg SHA-256 than tools/pc/bootstrap.ps1"
+    case "$FFMPEG_URL" in */"$FFMPEG_ASSET.zip") ;; *) die "the FFmpeg URL in tools/pc/bootstrap.ps1 does not end in $FFMPEG_ASSET.zip" ;; esac
+}
+
 cmd_deploy() {
     local force=0
     while [ $# -gt 0 ]; do
@@ -569,9 +594,29 @@ cmd_deploy() {
         esac
         shift
     done
+    read_ffmpeg_pin
     pre_reset
     pre_bool Force "$force"
+    pre_str FfmpegSha256 "$FFMPEG_SHA256"
     run_ps deploy
+}
+
+cmd_ffmpeg() {
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --force) force=1 ;;
+        *) usage_error "ffmpeg: unknown option $1" ;;
+        esac
+        shift
+    done
+    read_ffmpeg_pin
+    pre_reset
+    pre_bool Force "$force"
+    pre_str FfmpegAsset "$FFMPEG_ASSET"
+    pre_str FfmpegUrl "$FFMPEG_URL"
+    pre_str FfmpegSha256 "$FFMPEG_SHA256"
+    run_ps ffmpeg
 }
 
 cmd_rollback() {
@@ -948,6 +993,7 @@ doctor) cmd_doctor "$@" ;;
 sync) cmd_sync "$@" ;;
 build) cmd_build "$@" ;;
 deploy) cmd_deploy "$@" ;;
+ffmpeg) cmd_ffmpeg "$@" ;;
 rollback) cmd_rollback "$@" ;;
 run) cmd_run "$@" ;;
 logs) cmd_logs "$@" ;;

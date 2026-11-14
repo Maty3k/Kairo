@@ -174,6 +174,27 @@ jobs:
           & $kv corpus check $corpus
           exit $LASTEXITCODE
 
+      # pc deploy puts the FFmpeg DLLs that Kairo's programs import, directly or through each other,
+      # beside them, read from their import tables (tools/mac/remote/lib.ps1 Get-FfmpegDlls; research 16
+      # section 3.4). The same code on the same build must name exactly these, so a new pin that
+      # changes them shows up here first.
+      - name: The FFmpeg DLLs pc deploy puts beside kairo-verify.exe
+        shell: pwsh
+        run: |
+          . ./tools/mac/remote/lib.ps1
+          $got = @(Get-FfmpegDlls @('target\release\kairo-verify.exe') (Join-Path $env:FFMPEG_DIR 'bin')) -join ' '
+          $want = 'avcodec-63.dll avformat-63.dll avutil-61.dll swresample-7.dll'
+          Write-Host "pc deploy copies: $got"
+          if ($got -cne $want) { Write-Host "::error::pc deploy would copy '$got', not '$want'"; exit 1 }
+          # A file that isn't a PE image is refused, never misread.
+          try {
+            $null = @(Get-PeImports (Resolve-Path Cargo.toml).Path)
+            Write-Host '::error::Get-PeImports read Cargo.toml as a PE image'
+            exit 1
+          } catch {
+            Write-Host "refused as expected: $($_.Exception.Message)"
+          }
+
   cargo-deny:
     name: cargo-deny (${{ matrix.checks }})
     runs-on: ubuntu-latest

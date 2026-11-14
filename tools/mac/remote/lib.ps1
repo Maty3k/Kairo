@@ -48,6 +48,7 @@ $Kairo = @{
     State     = 'C:\kairo\state'
     Watch     = 'C:\kairo\state\watch.json'
     Tools     = 'C:\kairo\tools'
+    Ffmpeg    = 'C:\kairo\tools\ffmpeg'
 }
 $WatchStaleSeconds = 5          # kairo-core WATCH_STALE_AFTER_MS
 $BusyInputMs = 600000           # kairo-core BUSY_INPUT_WINDOW_MS
@@ -502,6 +503,105 @@ function Remove-OldBuilds {
             Say ('  kept old build ' + $dir.Name + ' for now (in use?): ' + $_.Exception.Message)
         }
     }
+}
+
+# --- The DLLs a program imports (pc deploy; CI runs the same code) ----------------------------
+function Read-U16([byte[]]$Bytes, [long]$At) {
+    if ($At -lt 0 -or $At + 2 -gt $Bytes.LongLength) { throw 'it ends too soon' }
+    return [long][BitConverter]::ToUInt16($Bytes, [int]$At)
+}
+
+function Read-U32([byte[]]$Bytes, [long]$At) {
+    if ($At -lt 0 -or $At + 4 -gt $Bytes.LongLength) { throw 'it ends too soon' }
+    return [long][BitConverter]::ToUInt32($Bytes, [int]$At)
+}
+
+function Get-PeImports([string]$Path) {
+    # The names of the DLLs a PE image (an .exe or a .dll, 32- or 64-bit) lists in its import table,
+    # as the file spells them (Microsoft's "PE Format": the DOS stub's e_lfanew, the COFF header, the
+    # optional header's data directory 1, the section table, then 20-byte import descriptors up to a
+    # null one). Delay-loaded imports aren't read: neither Kairo's programs nor FFmpeg's DLLs use
+    # them. Throws for a file that isn't a well-formed PE image. Call as @(Get-PeImports ...).
+    $b = [IO.File]::ReadAllBytes($Path)
+    try {
+        if ($b.LongLength -lt 64 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A) { throw 'no MZ header' }
+        $pe = Read-U32 $b 0x3C
+        if ((Read-U32 $b $pe) -ne 0x4550) { throw 'no PE signature' }
+        $sectionCount = Read-U16 $b ($pe + 6)
+        $optionalSize = Read-U16 $b ($pe + 20)
+        $optional = $pe + 24
+        $magic = Read-U16 $b $optional
+        if ($magic -eq 0x20B) {
+            $directoryCount = Read-U32 $b ($optional + 108)
+            $directories = $optional + 112
+        } elseif ($magic -eq 0x10B) {
+            $directoryCount = Read-U32 $b ($optional + 92)
+            $directories = $optional + 96
+        } else {
+            throw ('an unknown optional header (magic 0x' + $magic.ToString('X') + ')')
+        }
+        if ($directoryCount -lt 2) { return }
+        $importRva = Read-U32 $b ($directories + 8)
+        if ($importRva -eq 0) { return }
+        $sections = @()
+        for ($i = 0; $i -lt $sectionCount; $i++) {
+            $at = $optional + $optionalSize + 40 * $i
+            $sections += [pscustomobject]@{
+                Va      = Read-U32 $b ($at + 12)
+                Size    = [Math]::Max((Read-U32 $b ($at + 8)), (Read-U32 $b ($at + 16)))
+                Raw     = Read-U32 $b ($at + 20)
+                RawSize = Read-U32 $b ($at + 16)
+            }
+        }
+        $offset = {
+            # A relative virtual address as a file offset, in a section's raw data or nowhere.
+            param([long]$Rva)
+            foreach ($s in $sections) {
+                $into = $Rva - $s.Va
+                if ($into -ge 0 -and $into -lt $s.Size -and $into -lt $s.RawSize) { return ($s.Raw + $into) }
+            }
+            throw ('the address 0x' + $Rva.ToString('X') + ' is in no section')
+        }
+        $table = & $offset $importRva
+        for ($n = 0; $n -lt 4096; $n++) {
+            $descriptor = $table + 20 * $n
+            $nameRva = Read-U32 $b ($descriptor + 12)
+            $thunks = Read-U32 $b ($descriptor + 16)
+            if ($nameRva -eq 0 -and $thunks -eq 0) { return }
+            $at = & $offset $nameRva
+            $name = [Text.StringBuilder]::new()
+            while ($true) {
+                if ($at -ge $b.LongLength -or $name.Length -gt 255) { throw 'an import name runs on' }
+                if ($b[$at] -eq 0) { break }
+                [void]$name.Append([char]$b[$at])
+                $at++
+            }
+            $name.ToString()
+        }
+        throw 'more than 4096 imported DLLs'
+    } catch {
+        throw ([IO.Path]::GetFileName($Path) + ' is not a PE image this can read: ' + $_.Exception.Message)
+    }
+}
+
+function Get-FfmpegDlls([string[]]$Images, [string]$FfmpegBin) {
+    # The DLLs in $FfmpegBin that the PE images $Images import, directly or through each other: what
+    # pc deploy copies beside Kairo's programs (research 16 section 3.4). Names as the import tables
+    # spell them, sorted; system DLLs and anything else not in $FfmpegBin are left to Windows. Call as
+    # @(Get-FfmpegDlls ...).
+    $found = [Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $queue = [Collections.Generic.Queue[string]]::new()
+    foreach ($image in $Images) { $queue.Enqueue($image) }
+    while ($queue.Count -gt 0) {
+        foreach ($name in @(Get-PeImports $queue.Dequeue())) {
+            if (($name -cnotmatch '^[A-Za-z0-9_.-]{1,64}\.[Dd][Ll][Ll]\z') -or $found.Contains($name)) { continue }
+            $path = Join-Path $FfmpegBin $name
+            if (-not [IO.File]::Exists($path)) { continue }
+            [void]$found.Add($name)
+            $queue.Enqueue($path)
+        }
+    }
+    $found
 }
 
 # --- Jobs (crates/kairo-core/src/job.rs) ----------------------------------------------------

@@ -261,7 +261,9 @@ function Get-Sha256([string] $Path) {
 function Invoke-Download([string] $Url, [string] $OutFile) {
     $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
     if (Test-Path -LiteralPath $curl) {
-        $r = Invoke-Native -FilePath $curl -ArgumentList @('--fail', '--location', '--silent', '--show-error',
+        # --disable must stay the first argument, or curl reads a .curlrc or _curlrc from your profile,
+        # which any program running as you can write, and this elevated window would follow it.
+        $r = Invoke-Native -FilePath $curl -ArgumentList @('--disable', '--fail', '--location', '--silent', '--show-error',
             '--retry', '3', '--retry-delay', '5', '--connect-timeout', '30',
             '--user-agent', $UserAgent, '--output', $OutFile, $Url)
         if ($r.ExitCode -ne 0) { throw ('Download failed (curl exit code {0}): {1} {2}' -f $r.ExitCode, $Url, $r.Text) }
