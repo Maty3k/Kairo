@@ -655,8 +655,11 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
         match pacer.next(platform::now_hns()) {
             Step::Warmup => {
                 ctx.chain.draw(&black);
-                ctx.present(1)?;
-                pacer.warmup_presented(platform::now_hns());
+                if ctx.present(1)? {
+                    pacer.warmup_presented(platform::now_hns());
+                } else {
+                    pacer.fullscreen_lost();
+                }
             }
             Step::Lost => return Err(lost_clock()),
             Step::Frame {
@@ -671,6 +674,9 @@ fn vsync_frames(ctx: &mut Ctx<'_>, pacer: &mut VsyncPacer) -> Result<(), Stop> {
                 ctx.chain.draw(&plan);
                 let queued_hns = platform::now_hns();
                 if !ctx.present(pacer.interval())? {
+                    // The failing Present found exclusive fullscreen lost before the check at
+                    // the top of the pass did: tell the pacer here too.
+                    pacer.fullscreen_lost();
                     ctx.log.missed(frame, Miss::Vblank);
                     continue;
                 }
