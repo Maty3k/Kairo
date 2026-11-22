@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The FFmpeg command lines M1's instruments share, and what FFmpeg's log must say about them
 //! (docs/research/16-verify-testbed/README.md §7.2, §8.4, §8.5). `kairo-verify corpus build`
-//! and the harness's capture give AMF the same options, convert to BT.709 limited the same way
-//! and read the same log lines, so the PC corpus and gate 2's clips come from one encoder setup.
-//! Plain text in and out, so neither needs the other, nor FFmpeg's libraries, to share it.
+//! and the harness's capture tag frames BT.709 limited the same way ([`SETPARAMS_FILTER`]), give
+//! AMF the same options and read the same log lines, so the PC corpus and gate 2's clips come
+//! from one encoder setup. Only the capture converts BGRA to NV12 ([`nv12_bt709_chain`]): the
+//! corpus's NV12 comes from `synth` already in BT.709, so the PC corpus doesn't test that step,
+//! which the Mac's conversion rehearsal does (README §9). Plain text in and out, so neither needs
+//! the other, nor FFmpeg's libraries, to share it.
 
 /// Tags frames BT.709 limited (README §7.2's `SETPARAMS`): the only way the 9.0 CLI hands the
 /// primaries and transfer to the encoder and `colr`.
