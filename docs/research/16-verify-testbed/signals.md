@@ -371,7 +371,7 @@ b <m> <N_f> <scheduled_hns> <played_hns|->
 - `content`: the time the frame was rendered for.
 - `present`: just after `Present` returns.
 - `display`: the QPC of the vblank where the frame first appeared, from DXGI frame statistics (`PresentCount` → `SyncQPCTime`); `-` if unknown or never shown.
-- `played`: the beep's first sample, from `IAudioClock::GetPosition` (position plus QPC). [Unverified] which API gives reliable per-present display times in windowed and borderless (composed) modes; `DwmGetCompositionTimingInfo` is the fallback for the vblank grid.
+- `played`: the beep's first sample, from `IAudioClock::GetPosition` (position plus QPC). [Unverified] which API gives reliable per-present display times in windowed and borderless (composed) modes; without frame statistics the testbed takes its vblank grid from the monitor's own clock (`IDXGIOutput::WaitForVBlank`) and logs `-` (README §4.9). DWM's composition clock isn't used: it follows the primary or fastest display.
 - **Voice log** `voice-<run>.log`: header `# kairo-voice 1`, `# run 5a`, then lines `v <k> <scheduled_hns> <played_hns|->`.
 - **Privacy.** No monitor, adapter or PC names, no window titles, no paths and no wall-clock time (CLAUDE.md:16, :18; docs/milestones/M1.md:96). These are raw results, so they stay in `C:\kairo\logs` and `.dogfood/` (docs/milestones/M1.md:74). A committed fixture would be rebased to 0 and needs the owner's OK, like the trace fixture (docs/milestones/M1.md:195).
 
