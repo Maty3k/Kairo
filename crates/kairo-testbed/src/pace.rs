@@ -71,10 +71,14 @@ const COMPOSED_LATENCY: i64 = 1;
 /// gap: this bounds how long that can be, to 89 ms at 180 Hz. A longer gap stays unknown.
 const FILL_IN_MAX_VBLANKS: i64 = 16;
 
-/// How far a grid's vblank times may have drifted, per unit of its age: a panel can run a few
-/// hundred ppm off the rate it reports. That covers statistics outages of a few seconds; after
-/// one of tens of seconds, the targets themselves may have drifted half a period, which can
-/// cost an `m` line and leave N one past its group until the next stall.
+/// How far a grid's vblank times may have drifted, per unit of its age, at most a quarter of a
+/// period: a panel can run a few hundred ppm off the rate it reports. It loosens only the resume
+/// bound, an upper bound, so a fast panel's take isn't pulled below its real vblank. The
+/// earliest vblank a frame can still make keeps the plain grid: counting a time just after a
+/// vblank as before it would aim frames at vblanks that have gone by, on exact panels too. So on
+/// a panel slower than it reports, a wake that comes within the drift before a vblank, after an
+/// outage of a second or more, can still cost an `m` line and leave N one past its group until
+/// the next stall, as can any outage of tens of seconds.
 const GRID_DRIFT: f64 = 2e-4;
 
 /// The QPC time, in 100 ns, of the first whole second at or after `now_hns`.
@@ -201,21 +205,17 @@ impl Grid {
     }
 
     /// How far this grid's vblanks may have drifted by `t_hns`: a panel off its reported rate
-    /// builds that up since the reading the grid comes from, either way.
+    /// builds that up since the reading the grid comes from, either way. At most a quarter of a
+    /// period, so a grid that aged through a long outage still means something.
     fn drift(&self, t_hns: i64) -> i64 {
-        (t_hns.saturating_sub(self.t_hns).unsigned_abs() as f64 * GRID_DRIFT) as i64
+        let age = t_hns.saturating_sub(self.t_hns).unsigned_abs() as f64;
+        ((age * GRID_DRIFT) as i64).min(self.period.times(1) / 4)
     }
 
     /// [`Grid::at_or_before`], allowing for the drift: a time just after a vblank still counts
     /// as after it.
     pub fn at_or_before_aged(&self, t_hns: i64) -> i64 {
         self.at_or_before(t_hns.saturating_add(self.drift(t_hns)))
-    }
-
-    /// [`Grid::next_after`], allowing for the drift: a time just before a vblank still counts
-    /// as before it.
-    pub fn next_after_aged(&self, t_hns: i64) -> i64 {
-        self.next_after(t_hns.saturating_sub(self.drift(t_hns)))
     }
 
     /// The time of the vblank nearest `t_hns`.
@@ -441,7 +441,7 @@ impl Shown {
             if let Some(t) = p.taken_by {
                 v = v.min(grid.at_or_before_aged(t));
             }
-            taken = (p.frame, v.max(grid.next_after_aged(p.queued_hns)));
+            taken = (p.frame, v.max(grid.next_after(p.queued_hns)));
         }
         Some((taken.0, grid.time_of(taken.1)))
     }
@@ -535,7 +535,7 @@ impl Shown {
             };
             let taken_v = estimate
                 .min(ceiling)
-                .max(grid.next_after_aged(p.queued_hns))
+                .max(grid.next_after(p.queued_hns))
                 .min(shown_v);
             out.push(resolved(p, Some(shown_t), late));
             self.last_shown = Some(Reported {
@@ -677,7 +677,10 @@ impl VsyncPacer {
 
     /// Exclusive fullscreen was lost: the window may now be composed, a vblank after each take.
     pub fn fullscreen_lost(&mut self) {
+        // A composed window's resume can come a vblank or more after its take, which would read
+        // an on-time frame as late: the display's latency judges a first report from here on.
         self.shown.max_latency = COMPOSED_LATENCY;
+        self.shown.first_by_resume = false;
     }
 
     /// The statistics were disjoint: see [`Shown::disjoint`].
@@ -720,7 +723,7 @@ impl VsyncPacer {
         let Some(grid) = self.grid() else {
             return Step::Warmup;
         };
-        let mut reachable = grid.next_after_aged(now_hns);
+        let mut reachable = grid.next_after(now_hns);
         match self.queued.filter(|_| self.blocking) {
             Some(Queued::Frame(t)) => {
                 reachable = reachable.max(grid.at_or_after(t - self.period.times(1) / 2));
@@ -1178,6 +1181,8 @@ mod tests {
         /// A blocking loop whose swap chain is composed while it says it is in full screen
         /// (fullscreen optimizations with an overlay up): run.rs never tells the pacer.
         untold: bool,
+        /// The first pass at or after this time (QPC) starts this much later.
+        late_pass: Option<(i64, i64)>,
     }
 
     /// [`run_loop`], with `extra`.
@@ -1201,6 +1206,9 @@ mod tests {
         let mut statistics = false;
         let mut last_presented = None;
         while drawn < frames {
+            if let Some((_, delay)) = extra.late_pass.take_if(|(at, _)| now >= *at) {
+                now += delay;
+            }
             pacer.woke(now);
             // A blocking loop's window composed: exclusive fullscreen was lost, as run.rs tells
             // the pacer.
@@ -1863,44 +1871,108 @@ mod tests {
     }
 
     #[test]
-    fn an_aging_grid_on_a_slow_panel_keeps_a_late_wake_s_frame() {
-        // The panel runs 100 or 200 ppm slower than the 180 Hz it reports, the statistics fail
-        // from 2.0 to 2.95 s, and once, at about 2.8 s, the loop wakes so late that it presents
-        // 50 µs before the vblank it still makes. The last reading's grid has its vblanks early
-        // by then, by more than 50 µs; the pacer allows for that, so it neither skips a number
-        // nor numbers the frames after it one past their group.
-        for ppm in [100, 200] {
-            let slow_panel = Period {
-                num: 10_000_000 * (1_000_000 + ppm),
-                den: 180 * 1_000_000,
-            };
-            for k in [1, 2] {
-                let late_pass = 36 + (26 * 180 / 10 / k) as usize;
-                let wake = move |i: usize| {
-                    if i == late_pass {
-                        slow_panel.times(k) - 500
-                    } else {
-                        300
+    fn an_outage_keeps_a_late_frame_s_miss_where_it_happened() {
+        // The statistics fail from 2.0 to 3.0 s, and at about 2.8 s one frame is a vblank late
+        // on the GPU. However old the last reading's grid, the next frame is aimed at a vblank
+        // still to come: on exact panels and one 50 ppm fast, in both loops, with wakes 10 to
+        // 100 µs after each take, no frame with a display time shows off its target. The miss is
+        // marked where it happened (the waitable loop on an exact panel skips a number at once)
+        // or when the statistics return, on the frames passed over, which a reader counts as
+        // missed: the blocking loop learns of it only then, and so does a loop that woke closer
+        // to the vblank than the aged grid has drifted. Measuring the panel's period would
+        // settle those; this pacer doesn't.
+        let fast = Period {
+            num: 10_000_000_000_000,
+            den: 180 * 1_000_050,
+        };
+        let start = 2 * HNS_PER_SECOND / 10;
+        let late_n = (HZ180.nearest(28_000_000 - start)) as u64;
+        for (name, period) in [("exact", HZ180), ("50 ppm fast", fast)] {
+            for wait in [Wait::Waitable, Wait::Blocking] {
+                for wake_hns in [100, 300, 1_000] {
+                    let extra = Loop {
+                        outage: Some((20_000_000, 30_000_000)),
+                        ..Loop::default()
+                    };
+                    let d = Display::with(period, Box::new(|_| 0), 0);
+                    let slow = move |n: u64| i64::from(n == late_n);
+                    let run = run_loop_with(wait, 1, 700, d, start, move |_| wake_hns, slow, extra);
+                    let what = format!("{name} {wait:?} wake {wake_hns}");
+                    let after_outage = run
+                        .out
+                        .iter()
+                        .find(|r| r.record.display_hns.is_some_and(|t| t >= 30_000_000))
+                        .map(|r| r.record.frame);
+                    let mut missed = late(&run);
+                    missed.extend(&run.skipped);
+                    missed.sort_unstable();
+                    let after = after_outage.unwrap_or(u64::MAX);
+                    // The frames around the first one reported when the statistics return.
+                    let returning = after.saturating_sub(2)..=after.saturating_add(2);
+                    let where_due =
+                        |n: &u64| (late_n..=late_n + 1).contains(n) || returning.contains(n);
+                    assert!(
+                        (1..=3).contains(&missed.len()) && missed.iter().all(where_due),
+                        "{what}: {missed:?}, first after the outage {after_outage:?}"
+                    );
+                    if wait == Wait::Waitable && name == "exact" {
+                        assert!(
+                            missed.iter().any(|n| (late_n..=late_n + 1).contains(n)),
+                            "{what}: {missed:?}"
+                        );
                     }
-                };
+                    let off: Vec<u64> = run
+                        .out
+                        .iter()
+                        .filter(|r| {
+                            r.record.frame != late_n && !returning.contains(&r.record.frame)
+                        })
+                        .filter(|r| {
+                            r.record.display_hns.is_some_and(|t| {
+                                (t - r.record.target_hns).abs() > HZ180.times(1) / 4
+                            })
+                        })
+                        .map(|r| r.record.frame)
+                        .collect();
+                    assert!(off.is_empty(), "{what}: {off:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn once_told_exclusive_fullscreen_is_lost_a_late_resume_marks_nothing() {
+        // Exclusive until vblank 400, composed after. The pass that sees it starts 2.5 to 3.5
+        // periods late (a ResizeBuffers, the focus moving), tells the pacer, and reads DISJOINT.
+        // The first frame reported after it shows a vblank after its take, as composed frames do,
+        // and the late resume after it mustn't read that as a miss: only the stall's own numbers
+        // are skipped, and from vblank 405 every target is a vblank before its display.
+        let latency = |v: i64| i64::from(v >= 400);
+        for k in [1, 2, 3, 4] {
+            for tenths in [25, 30, 35] {
                 let extra = Loop {
-                    outage: Some((20_000_000, 29_500_000)),
+                    disjoint_at: Some(HZ180.times(400)),
+                    late_pass: Some((HZ180.times(400), HZ180.times(tenths) / 10)),
                     ..Loop::default()
                 };
-                let d = Display::with(slow_panel, Box::new(|_| 0), 0);
+                let d = Display::with(HZ180, Box::new(latency), 0);
                 let start = 2 * HNS_PER_SECOND / 10;
                 let frames = (900 / k) as usize;
-                let run = run_loop_with(Wait::Waitable, k, frames, d, start, wake, |_| 0, extra);
-                let what = format!("{ppm} ppm, k {k}");
+                let run = run_loop_with(
+                    Wait::Blocking,
+                    k,
+                    frames,
+                    d,
+                    start,
+                    |_| 20_000,
+                    |_| 0,
+                    extra,
+                );
+                let what = format!("k {k} late by {tenths} tenths");
                 assert_eq!(late(&run), [] as [u64; 0], "{what}");
-                assert_eq!(run.skipped, [] as [u64; 0], "{what}");
-                let mut previous = None;
-                for r in &run.out {
-                    if let Some(p) = previous {
-                        assert_eq!(r.record.frame, p + 1, "{what}");
-                    }
-                    previous = Some(r.record.frame);
-                }
+                assert!(run.skipped.len() <= 3, "{what}: {:?}", run.skipped);
+                let off = off_their_flips(&run, latency, 405, 2_000);
+                assert!(off.is_empty(), "{what}: {off:?}");
             }
         }
     }
