@@ -74,8 +74,8 @@ fn seconds(hns: i64) -> f64 {
     hns as f64 / 10_000_000.0
 }
 
-/// The fewest fresh frames with display times that set a clip's lag range.
-const MIN_LAGS: usize = 10;
+/// How many clean output frames on each side of a step set the capture's delay there.
+const NEIGHBOURS: usize = 3;
 
 /// The `-` frames just before a frame marked late (`late`) that has a display time, in log
 /// order: the statistics passed over them, and one may be the late one. Not before the first
@@ -259,31 +259,28 @@ impl Source {
         Some(gaps[((gaps.len() - 1) as f64 * 0.05).floor() as usize])
     }
 
-    /// The spread of the capture's lag behind the screen, in seconds: the 5th and 95th
-    /// percentiles of `pts_i − display(N_i)` over the readable frames after the held frame 0
-    /// that show a new testbed frame and whose display the log knows. A repeat is left out, so a
-    /// capture that froze doesn't widen it. `None` with fewer than [`MIN_LAGS`] such frames.
-    pub fn clip_lags(
-        &self,
-        numbers: &[Option<i64>],
-        pts: &[i64],
-        timescale: u64,
-    ) -> Option<(f64, f64)> {
-        let mut lags: Vec<f64> = (1..numbers.len().min(pts.len()))
-            .filter_map(|i| {
+    /// Where a clip's output frames fall on the testbed's clock ([`Screen`]): each one's time in
+    /// the clip (`pts` in `timescale` ticks) and, for a clean one, the capture delays its picture
+    /// allows. Clean: after the held frame 0, a new testbed frame whose step from the frame before
+    /// touches no miss, and whose time on screen the log's reports next to it give.
+    pub fn screen(&self, numbers: &[Option<i64>], pts: &[i64], timescale: u64) -> Screen {
+        let times: Vec<f64> = pts.iter().map(|&p| p as f64 / timescale as f64).collect();
+        let delay = (0..numbers.len().min(times.len()))
+            .map(|i| {
                 let n = numbers[i]?;
-                if numbers[i - 1] == Some(n) {
+                let before = numbers[i.checked_sub(1)?]?;
+                if n <= before || self.misses.range(before + 1..=n + 1).next().is_some() {
                     return None;
                 }
-                Some(pts[i] as f64 / timescale as f64 - self.display_s(n)?)
+                let (from, until) = self.screen_window(n, 0)?;
+                Some((times[i] - until, times[i] - from))
             })
             .collect();
-        if lags.len() < MIN_LAGS {
-            return None;
+        Screen {
+            pts: times,
+            delay,
+            slack: 1.0 / self.refresh_hz.max(1.0),
         }
-        lags.sort_by(f64::total_cmp);
-        let at = |q: f64| lags[((lags.len() - 1) as f64 * q).round() as usize];
-        Some((at(0.05), at(0.95)))
     }
 
     /// The log's word on frames `first..=last`: the span a clip shows, which the caller carries
@@ -312,15 +309,38 @@ impl Source {
     }
 }
 
-/// Where a clip's output frames can fall on the testbed's clock: each one's time in the clip,
-/// and the spread of the capture's lag behind the screen ([`Source::clip_lags`]).
+/// Where a clip's output frames can fall on the testbed's clock ([`Source::screen`]): a picture
+/// at clip time p taken with capture delay D shows the screen at QPC time p − D.
 pub(crate) struct Screen {
     /// Each output frame's time in the clip, in seconds.
     pub pts: Vec<f64>,
-    /// The least and most a capture lagged the screen in this clip, in seconds.
-    pub lag: (f64, f64),
+    /// For each clean output frame, the delays that put its picture inside its frame's time on
+    /// screen, least and most, in seconds: p − until and p − display.
+    pub delay: Vec<Option<(f64, f64)>>,
     /// One vblank, in seconds: a capture takes what the screen showed within about that.
     pub slack: f64,
+}
+
+impl Screen {
+    /// The capture delay around the step at output frame `at`: the delays the clean frames
+    /// nearest it all allow, up to [`NEIGHBOURS`] before frame `at - 1` and as many after `at`,
+    /// within `span` output frames. A capture's delay drifts slowly, so near the step one delay
+    /// fits them all; where they miss each other by up to a vblank (jitter), the gap between
+    /// them. `None` without any; `Some(None)` where they disagree by more: the delay jumped at
+    /// the step, as when the capture dropped or repeated a picture and closed up its timeline.
+    fn delay_near(&self, at: usize, span: usize) -> Option<Option<(f64, f64)>> {
+        let before = (at.saturating_sub(1 + span)..at.saturating_sub(1))
+            .rev()
+            .filter_map(|j| self.delay.get(j).copied().flatten())
+            .take(NEIGHBOURS);
+        let after = (at + 1..=at.saturating_add(span))
+            .filter_map(|j| self.delay.get(j).copied().flatten())
+            .take(NEIGHBOURS);
+        let (low, high) = before
+            .chain(after)
+            .reduce(|(a, b), (c, d)| (a.max(c), b.min(d)))?;
+        Some((low <= high + self.slack).then_some((low.min(high), high.max(low))))
+    }
 }
 
 /// What the testbed's misses can excuse among a clip's steps (README §6.3). An event step (a
@@ -329,14 +349,14 @@ pub(crate) struct Screen {
 /// time: the testbed's numbers only go forward.
 ///
 /// Where the log's display times say what the screen showed, that decides: the step is the
-/// testbed's when one capture lag, within the spread this clip shows, puts N on screen at the
-/// step's first output frame and N′ at its second, each within a vblank, so the capture showed
-/// what the screen did. A capture that froze, dropped a frame or took a stale one beside a
-/// testbed miss shows a frame the screen had left or not yet shown at any such lag, and stays the
-/// capture's.
+/// testbed's when one capture delay, one that the clean frames next to the step also allow, puts
+/// N on screen at the step's first output frame and N′ at its second, each within a vblank, so
+/// the capture showed what the screen did. A capture that froze, dropped a frame or took a stale
+/// one beside a testbed miss shows a frame the screen had left or not yet shown at the delay its
+/// neighbours show, and stays the capture's.
 ///
-/// Where they can't (no display times near N or N′, or too few to measure the lag), the misses
-/// are bounded
+/// Where they can't (no display times near N or N′, no clean frames near the step, or clean
+/// frames that disagree about the delay), the misses are bounded
 /// by what they can do to the screen. A run of m missed frames held the screen m frame times
 /// longer, and e more where the display times there show the frames around it came e frame
 /// times later than their numbers say ([`Source::late_frames`]). So it can account for at most
@@ -350,6 +370,8 @@ pub(crate) struct Excuses<'a> {
     source: &'a Source,
     /// The output frames on the testbed's clock, when the log can place them.
     screen: Option<Screen>,
+    /// A second of output frames: how far from a step its clean neighbours may be.
+    span: usize,
     /// Each run of missed frames.
     runs: Vec<Run>,
     /// Testbed frames per output frame.
@@ -397,6 +419,7 @@ impl<'a> Excuses<'a> {
         Excuses {
             source,
             screen,
+            span: fps.max(1) as usize,
             runs,
             nominal: 1.0 / per_frame,
             used_until: None,
@@ -449,7 +472,7 @@ impl<'a> Excuses<'a> {
     }
 
     /// Whether the log puts `from` on screen at output frame `at - 1` and `to` at `at` at one
-    /// capture lag this clip shows; `None` where it can't say.
+    /// capture delay the clean frames around the step allow; `None` where it can't say.
     fn on_screen(&self, at: usize, from: i64, to: i64) -> Option<bool> {
         let screen = self.screen.as_ref()?;
         let (p0, p1) = (*screen.pts.get(at.checked_sub(1)?)?, *screen.pts.get(at)?);
@@ -462,11 +485,15 @@ impl<'a> Excuses<'a> {
         let unreported = usize::try_from(to - from).unwrap_or(0) + 1;
         let (f0, u0) = self.source.screen_window(from, unreported)?;
         let (f1, u1) = self.source.screen_window(to, unreported)?;
-        // At lag L a picture at clip time p shows QPC time p − L, and frame n was on screen
-        // within a vblank s of that when from_n − s ≤ p − L ≤ until_n + s.
+        // At delay D a picture at clip time p shows QPC time p − D, and frame n was on screen
+        // within a vblank s of that when from_n − s ≤ p − D ≤ until_n + s.
+        // Clean frames on either side that disagree about the delay: the capture jumped there.
+        let Some((near_low, near_high)) = screen.delay_near(at, self.span)? else {
+            return Some(false);
+        };
         let s = screen.slack;
-        let low = (p0 - u0 - s).max(p1 - u1 - s).max(screen.lag.0);
-        let high = (p0 - f0 + s).min(p1 - f1 + s).min(screen.lag.1);
+        let low = (p0 - u0 - s).max(p1 - u1 - s).max(near_low);
+        let high = (p0 - f0 + s).min(p1 - f1 + s).min(near_high);
         Some(low <= high)
     }
 
@@ -588,16 +615,11 @@ mod tests {
     }
 
     /// A capture's output frames at 60 fps, sampled 0.1 vblank after the vblanks `vblanks`, on
-    /// the testbed's clock: a clip whose lag behind the screen never varies.
+    /// the testbed's clock, with no delay: every frame's neighbours say so.
     fn screen(vblanks: &[i64]) -> Screen {
-        lagging(vblanks, (0.0, 0.0))
-    }
-
-    /// The same frames, from a clip whose lag behind the screen spans `lag` vblanks.
-    fn lagging(vblanks: &[i64], lag: (f64, f64)) -> Screen {
         Screen {
             pts: vblanks.iter().map(|&v| (v as f64 + 0.1) / 180.0).collect(),
-            lag: (lag.0 / 180.0, lag.1 / 180.0),
+            delay: vec![Some((0.0, 0.0)); vblanks.len()],
             slack: 1.0 / 180.0,
         }
     }
@@ -702,61 +724,211 @@ mod tests {
         assert!(x.excuse(17, 3_648, 3_651), "a step of a tick over the miss");
     }
 
-    #[test]
-    fn one_lag_within_the_clip_s_spread_places_both_frames() {
-        // The screen of the test above: 3599 held 7 vblanks while 3600 showed 6 late. This
-        // capture samples it every third vblank and delivers each picture 2.5 vblanks later, a
-        // lag this clip's other frames also show.
-        let frames: Vec<(i64, Option<i64>)> = (3_580..3_620)
-            .map(|n| match n {
-                3_600 => (n, Some(3_606)),
-                3_601 => (n, Some(3_607)),
-                3_602..=3_607 => (n, None),
-                _ => (n, Some(n)),
+    /// A vsync testbed's run on an exact 180 Hz display, one frame every `k` vblanks from vblank
+    /// 0, except that after frame `after` the next one shows `jump` vblanks later (a stall, or a
+    /// frame late on the GPU when `late`). Frames are numbered by their vblank group, as the
+    /// testbed numbers them, so numbers passed over were never drawn and get `m` lines. Returns
+    /// the log and each drawn frame's number and display time in seconds.
+    fn vsync_run(
+        k: i64,
+        frames: i64,
+        after: i64,
+        jump: i64,
+        late: bool,
+    ) -> (Source, Vec<(i64, f64)>) {
+        let mut shown = Vec::new();
+        let mut v = 0;
+        let mut n = 0;
+        while n < frames {
+            shown.push((n, v));
+            v += if n == after { jump } else { k };
+            n = (2 * v + k).div_euclid(2 * k);
+        }
+        let mut lines = String::new();
+        let mut last = -1;
+        for &(n, v) in &shown {
+            for skipped in last + 1..n {
+                lines.push_str(&format!("m {skipped} vblank\n"));
+            }
+            let t = (v as f64 * 10_000_000.0 / 180.0).round() as i64;
+            lines.push_str(&format!("f {n} {t} {t} {t}\n"));
+            if late && n == after + 1 + (jump - k) / k {
+                lines.push_str(&format!("m {n} vblank\n"));
+            }
+            last = n;
+        }
+        let source = Source::new(&log(&lines, (180 / k) as u32, "vsync"));
+        let times = shown.iter().map(|&(n, v)| (n, v as f64 / 180.0)).collect();
+        (source, times)
+    }
+
+    /// What a capture at `fps` shows of `shown`: output frame i, at clip time i/fps, shows what
+    /// was on screen at QPC time i/fps + `phase` − `delay(i)`. Returns the numbers and the pts in
+    /// ticks of 1/15,360 s.
+    fn capture(
+        shown: &[(i64, f64)],
+        fps: u32,
+        outputs: usize,
+        phase: f64,
+        delay: impl Fn(usize) -> f64,
+    ) -> (Vec<Option<i64>>, Vec<i64>) {
+        let numbers = (0..outputs)
+            .map(|i| {
+                let t = i as f64 / f64::from(fps) + phase - delay(i);
+                let on = shown.partition_point(|&(_, d)| d <= t);
+                on.checked_sub(1).map(|j| shown[j].0)
             })
             .collect();
-        let s = shown_at(180, &frames, &[3_600]);
-        let pts: Vec<f64> = [3_591, 3_594, 3_597, 3_600, 3_603, 3_606, 3_609, 3_612]
-            .iter()
-            .map(|&v| (v as f64 + 2.6) / 180.0)
+        let pts = (0..outputs)
+            .map(|i| (i * 15_360 / fps as usize) as i64)
             .collect();
-        let lagging_by = |vblanks: (f64, f64)| Screen {
-            pts: pts.clone(),
-            lag: (vblanks.0 / 180.0, vblanks.1 / 180.0),
-            slack: 1.0 / 180.0,
+        (numbers, pts)
+    }
+
+    /// The steps that touch the testbed's misses and that the misses don't explain: repeats,
+    /// skips, backward and judder steps. Steps elsewhere are the capture's alone.
+    fn unexplained(source: &Source, numbers: &[Option<i64>], pts: &[i64], fps: u32) -> usize {
+        let screen = source.screen(numbers, pts, 15_360);
+        let mut x = Excuses::new(source, fps, Some(screen));
+        let counts =
+            crate::analyze::cadence::count_excluding(numbers, source.fps, fps, |at, from, to| {
+                x.excuse(at, from, to)
+            })
+            .unwrap();
+        let touches = |e: &&crate::analyze::cadence::Event| {
+            let (a, b) = (e.from.min(e.to), e.from.max(e.to));
+            source.misses.range(a + 1..=b + 1).next().is_some()
         };
-        // It shows 3597, 3599, 3599, 3600, 3609: one lag places each step on the screen.
-        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 3.0))));
-        assert!(x.excuse(3, 3_597, 3_599));
-        assert!(x.excuse(4, 3_599, 3_599));
-        assert!(x.excuse(6, 3_600, 3_609));
-        // At the freshest lag alone the screen had moved on by then.
-        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 0.0))));
-        assert!(!x.excuse(3, 3_597, 3_599));
-        // A freeze on 3599 after the screen left it needs a lag this clip never shows.
-        let mut x = Excuses::new(&s, 60, Some(lagging_by((0.0, 3.0))));
-        assert!(!x.excuse(6, 3_599, 3_599));
+        counts
+            .events
+            .iter()
+            .chain(&counts.judder_events)
+            .filter(touches)
+            .count()
     }
 
     #[test]
-    fn the_lag_range_leaves_out_repeats() {
-        // Frames shown 100 ms apart at QPC 10 s + n/10, and a capture that shows frame n at n/10 s
-        // but freezes on 20 for five more frames: the repeats don't widen the range.
+    fn perfect_captures_pass_around_the_testbed_s_misses() {
+        // Round 4's and 5's cases, from the testbed's own numbering: stalls and late frames at
+        // k = 1-3, in the middle of a clip and in its last 2%, captured at 60 and 120 fps at 12
+        // phases, with a constant delay or one that rises 2 vblanks for a second around the
+        // miss. A capture that shows exactly what the screen did is never blamed for them.
+        let vblank = 1.0 / 180.0;
+        for k in [1, 2, 3] {
+            for (jump, late) in [(k + 2, false), (k + 6, false), (k + 4, true), (k + 7, true)] {
+                for fps in [60, 120] {
+                    let outputs = 40 * fps as usize;
+                    for at_s in [20.0, 39.3] {
+                        let after = (at_s * 180.0 / k as f64) as i64;
+                        let (source, shown) = vsync_run(k, 40 * 180 / k + 60, after, jump, late);
+                        for phase in (0..12).map(|p| (p as f64 + 0.37) * vblank / 12.0 + 0.002) {
+                            for rise in [0.0, 2.0] {
+                                let delay = |i: usize| {
+                                    let t = i as f64 / f64::from(fps);
+                                    let near = 1.0 - ((t - at_s).abs() - 0.5).clamp(0.0, 0.5) / 0.5;
+                                    rise * vblank * near
+                                };
+                                let (numbers, pts) = capture(&shown, fps, outputs, phase, delay);
+                                let what = format!(
+                                    "k {k} jump {jump} late {late} {fps} fps at {at_s} s phase {phase:.5} rise {rise}"
+                                );
+                                assert_eq!(unexplained(&source, &numbers, &pts, fps), 0, "{what}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// How many of 12 capture phases catch a capture that, right after the testbed's miss, holds
+    /// a picture `held` output frames longer than the screen did, and how many catch one that
+    /// drops the output frame after the miss and closes up its timeline.
+    fn caught(k: i64, jump: i64, late: bool, fps: u32, held: usize) -> (usize, usize) {
+        let vblank = 1.0 / 180.0;
+        let outputs = 20 * fps as usize;
+        let after = (10.0 * 180.0 / k as f64) as i64;
+        let (source, shown) = vsync_run(k, 20 * 180 / k + 60, after, jump, late);
+        let (mut frozen_caught, mut dropped_caught) = (0, 0);
+        for phase in (0..12).map(|p| (p as f64 + 0.37) * vblank / 12.0 + 0.002) {
+            let (perfect, pts) = capture(&shown, fps, outputs, phase, |_| 0.0);
+            let first = perfect
+                .iter()
+                .position(|n| n.is_some_and(|n| n > after))
+                .unwrap();
+            let mut frozen = perfect.clone();
+            for i in first..first + held {
+                frozen[i] = frozen[first - 1];
+            }
+            let mut dropped = perfect.clone();
+            dropped.remove(first);
+            dropped.push(None);
+            assert_eq!(unexplained(&source, &perfect, &pts, fps), 0);
+            frozen_caught += usize::from(unexplained(&source, &frozen, &pts, fps) > 0);
+            dropped_caught += usize::from(unexplained(&source, &dropped, &pts, fps) > 0);
+        }
+        (frozen_caught, dropped_caught)
+    }
+
+    #[test]
+    fn freezes_and_drops_beside_a_testbed_miss_stay_the_capture_s() {
+        // A freeze of two output frames is the capture's at every phase, at every k, beside
+        // stalls and late frames alike, at 60 and at 120 fps (three there).
+        for k in [1, 2, 3] {
+            for (jump, late) in [(k + 6, false), (k + 4, true)] {
+                for (fps, held) in [(60, 2), (120, 3)] {
+                    let what = format!("k {k} jump {jump} late {late} {fps} fps held {held}");
+                    assert_eq!(caught(k, jump, late, fps, held).0, 12, "{what}");
+                }
+            }
+        }
+        // Where the testbed's frames are shorter than the capture's (k = 1 at 60 or 120 fps), a
+        // dropped output frame is the capture's at every phase too, and so is a freeze of one
+        // output frame at most phases. Where a testbed frame lasts as long as a capture frame or
+        // longer, one capture delay at the edge of the frames' windows fits a single dropped or
+        // repeated picture as well as the screen's own: the log can't tell, and it stays the
+        // testbed's (README §6.3).
+        for (jump, late) in [(7, false), (5, true)] {
+            for fps in [60, 120] {
+                let what = format!("k 1 jump {jump} late {late} {fps} fps");
+                assert_eq!(caught(1, jump, late, fps, 1).1, 12, "{what}: dropped");
+            }
+            assert!(
+                caught(1, jump, late, 60, 1).0 >= 8,
+                "k 1 jump {jump}: frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn only_clean_frames_set_the_delay() {
+        // Frames shown 100 ms apart at QPC 10 s + n/10, a capture that shows frame n at n/10 s,
+        // freezes on 20 for five frames and skips 30 and 31, which the testbed missed: repeats
+        // and steps that touch a miss say nothing about the delay.
         let lines: String = (0..40)
-            .map(|n| format!("f {n} 0 0 {}\n", 100_000_000 + n * 1_000_000))
+            .map(|n| match n {
+                30 | 31 => format!("m {n} slot\n"),
+                _ => format!("f {n} 0 0 {}\n", 100_000_000 + n * 1_000_000),
+            })
             .collect();
         let s = Source::new(&log(&lines, 10, "timer"));
         let numbers: Vec<Option<i64>> = (0..40)
-            .map(|i| Some(if (21..=25).contains(&i) { 20 } else { i }))
+            .map(|i| match i {
+                21..=25 => Some(20),
+                30 | 31 => Some(29),
+                _ => Some(i),
+            })
             .collect();
         let pts: Vec<i64> = (0..40).map(|i: i64| i * 1_536).collect();
-        let (low, high) = s.clip_lags(&numbers, &pts, 15_360).unwrap();
+        let screen = s.screen(&numbers, &pts, 15_360);
+        assert_eq!(screen.delay[0], None, "the held frame 0");
+        assert_eq!(screen.delay[22], None, "a repeat");
+        assert_eq!(screen.delay[32], None, "the step over the miss");
+        let (low, high) = screen.delay[10].unwrap();
         assert!(
-            (low + 10.0).abs() < 1e-9 && (high + 10.0).abs() < 1e-9,
+            (low + 10.1).abs() < 1e-9 && (high + 10.0).abs() < 1e-9,
             "{low} {high}"
         );
-        // Too few fresh frames to say.
-        assert_eq!(s.clip_lags(&numbers[..10], &pts[..10], 15_360), None);
     }
 
     #[test]

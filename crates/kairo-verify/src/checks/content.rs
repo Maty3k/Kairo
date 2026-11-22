@@ -14,7 +14,7 @@ use std::ops::ControlFlow;
 
 use serde_json::json;
 
-use super::source::{Excuses, Screen, Source};
+use super::source::{Excuses, Source};
 use super::{Ctx, Finding, Outcome, Status, audio, skipped, weigh};
 use crate::analyze::bars::{self, BandSums, Bands, FrameBars};
 use crate::analyze::cadence::{self, Counts, Event, Shows};
@@ -387,11 +387,7 @@ fn analyse(ctx: &Ctx<'_>, decoded: &Decoded) -> Analysis {
     let mut excused_until = None;
     let counts = source_fps.zip(fps).and_then(|(fs, f)| match &source {
         Some(s) => {
-            let screen = s.clip_lags(&numbers, &pts, timescale).map(|lag| Screen {
-                pts: pts.iter().map(|&p| p as f64 / timescale as f64).collect(),
-                lag,
-                slack: 1.0 / s.refresh_hz.max(1.0),
-            });
+            let screen = Some(s.screen(&numbers, &pts, timescale));
             let mut excuses = Excuses::new(s, f, screen);
             let counts = cadence::count_excluding(&numbers, fs, f, |at, from, to| {
                 excuses.excuse(at, from, to)
