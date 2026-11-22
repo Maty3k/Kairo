@@ -153,6 +153,8 @@ struct Ctx<'a> {
     testbed_stdin: Option<ChildStdin>,
     tone: Option<Guarded>,
     tone_stdin: Option<ChildStdin>,
+    /// Whether kairo-tone still ran when FFmpeg ended, once the capture has run.
+    tone_alive: Option<bool>,
     log_check: LogCheck,
     /// Whether FFmpeg's log was read: the read-back table needs it.
     log_read: bool,
@@ -206,6 +208,7 @@ pub fn run(request: &Request) -> u8 {
         testbed_stdin: None,
         tone: None,
         tone_stdin: None,
+        tone_alive: None,
         log_check: LogCheck::default(),
         log_read: false,
         verify_report: None,
@@ -268,9 +271,18 @@ impl Ctx<'_> {
             Err(_) => PhaseOutcome::Failed,
         };
         self.report.phase(phase, seconds, how);
-        // A capture that went wrong still stops the testbed cleanly.
+        // A capture that went wrong still stops the testbed cleanly, and says how that went.
         if result.is_err() && phase == Phase::Capture {
+            let start = Instant::now();
             let _ = self.stop();
+            let killed = self.report.testbed.as_ref().is_some_and(|t| t.killed);
+            let how = if killed {
+                PhaseOutcome::Timeout
+            } else {
+                PhaseOutcome::Ok
+            };
+            self.report
+                .phase(Phase::Stop, start.elapsed().as_secs_f64(), how);
         }
         result
     }
@@ -488,7 +500,9 @@ impl Ctx<'_> {
                 && let Some(status) = testbed.ended()
             {
                 self.note_testbed(Some(status));
-                return Err(outcome::testbed_before_ready(code(Some(status))));
+                return Err(self
+                    .reason_of_end()
+                    .unwrap_or_else(|| outcome::testbed_before_ready(code(Some(status)))));
             }
             if Instant::now() >= deadline {
                 return Err(Outcome::new(
@@ -544,6 +558,14 @@ impl Ctx<'_> {
             .and_then(|t| TestbedLog::parse(&t).ok())
     }
 
+    /// The outcome the ended testbed's `e end` reason has of its own, if any (an HDR toggle):
+    /// it decides whichever phase sees the testbed gone.
+    fn reason_of_end(&self) -> Option<Outcome> {
+        self.testbed_log()
+            .and_then(|l| end_reason(&l))
+            .and_then(|r| outcome::testbed_reason(&r))
+    }
+
     /// Phase 2: 3 s for the testbed to settle, then the judgement.
     fn warm_up(&mut self) -> Result<(), Outcome> {
         let end = Instant::now() + Duration::from_secs(Phase::Warmup.limit_s(0).into());
@@ -552,10 +574,9 @@ impl Ctx<'_> {
                 && let Some(status) = testbed.ended()
             {
                 self.note_testbed(Some(status));
-                return Err(Outcome::new(
-                    exit::FAILED,
-                    "the testbed ended during the warm-up",
-                ));
+                return Err(self.reason_of_end().unwrap_or_else(|| {
+                    Outcome::new(exit::FAILED, "the testbed ended during the warm-up")
+                }));
             }
             let now = Instant::now();
             let log = self.testbed_log();
@@ -627,6 +648,7 @@ impl Ctx<'_> {
             .ok()
             .map(|m| m.len());
         let testbed_alive = self.testbed.as_mut().is_some_and(|t| t.ended().is_none());
+        self.tone_alive = self.tone.as_mut().map(|t| t.ended().is_none());
         if let Some(testbed) = self.report.testbed.as_mut() {
             testbed.alive_through_capture = testbed_alive;
         } else {
@@ -640,6 +662,11 @@ impl Ctx<'_> {
                 exit::FAILED,
                 "the capture ran past its limit (an AMF hang?)",
             ));
+        }
+        // A testbed that ended for a reason of its own (an HDR toggle) explains whatever FFmpeg
+        // then did.
+        if !testbed_alive && let Some(o) = self.reason_of_end() {
+            return Err(o);
         }
         let Some(log) = read_capped(&self.paths.folder.join("ffmpeg.log"), LOG_MAX) else {
             return Err(Outcome::new(
@@ -710,7 +737,7 @@ impl Ctx<'_> {
                 exit_code: code(status),
                 end,
                 killed: tone.killed,
-                alive_through_capture: true,
+                alive_through_capture: self.tone_alive.unwrap_or(false),
                 message,
             });
         }
@@ -808,8 +835,12 @@ impl Ctx<'_> {
         if let Some(mut testbed) = self.testbed.take() {
             drop(self.testbed_stdin.take());
             let status = testbed.kill();
+            let killed = testbed.killed;
             drop(testbed);
             self.note_testbed(status);
+            if let Some(t) = self.report.testbed.as_mut() {
+                t.killed |= killed;
+            }
         }
         if let Some(mut tone) = self.tone.take() {
             drop(self.tone_stdin.take());

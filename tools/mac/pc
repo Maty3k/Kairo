@@ -331,10 +331,15 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            (default 180hz; never the OLED), recording the testbed with FFmpeg into
                            AMF for N s (default 30; --smoke: 10 s, profile smoke) and judging it
                            with kairo-verify. Refuses over a fullscreen window even with --force.
-                           Prints the verdict, failing checks, read-back counts and start-to-report
-                           time; keeps the job and reports in .dogfood/ (and the clip with
-                           --fetch-clip). Then checks the System log for display-driver resets.
-  harness events           Run the reset check a capture left pending. Never refuses.
+                           Right after the job it checks the System log for display-driver resets
+                           and unexpected reboots: on one it exits 7 before fetching any report
+                           (pc logs ID shows the job's result). Otherwise it prints the verdict,
+                           failing checks, read-back counts and start-to-report time, and keeps
+                           the job and reports in .dogfood/ (and the clip with --fetch-clip).
+  harness events [--ack STAMP]
+                           Run the reset checks captures left pending. Never refuses. A reset found
+                           blocks every capture until the owner has seen it and said so; then
+                           --ack STAMP (the run's yyyyMMdd-HHmmss) clears it.
   cli ping|keys [--pipe NAME] [--force]
                            Run kairo-cli on the PC as a short \Kairo\Run job. It reaches a named-pipe
                            server running outside \Kairo\Run: refused while a pc run job holds it.
@@ -870,9 +875,11 @@ harness_displays() {
 # Gate 2 (research 16 README section 8.7): one hidden job runs "kairo-harness run", which starts
 # the testbed on the monitor, records it with FFmpeg into AMF and has kairo-verify judge the clip.
 # The job and everything fetched stay in .dogfood/ (they name a monitor and the PC's adapter);
-# this terminal gets the verdict, the failing checks, counts and file names only. Afterwards the
-# System log is read for display-driver resets (4101) and unexpected reboots (41): either is a
-# P0 (M1:204), exit 7, and the next capture refuses to start until the check has run.
+# this terminal gets the verdict, the failing checks, counts and file names only. Right after the
+# job the System log is read for display-driver resets (4101) and unexpected reboots (41): either
+# is a P0 (M1:204), exit 7. A check is pending from before the job starts (tdr-pending) until it
+# has covered the whole job, and a reset found stays a P0 (tdr-p0) until the owner's OK clears it
+# (pc harness events --ack): until then no capture starts.
 
 # The device path of alias $a in monitors.json, refusing the OLED: its alias, or any alias that
 # names the same display. Without an oled alias the guard would be blind, so that refuses too.
@@ -900,34 +907,66 @@ JQ_HARNESS_SUMMARY='
 # kairo-verify's failing checks, one line each.
 JQ_VERIFY_FAILING='.checks[] | select(.status == "fail" or .status == "error") | "\(.id): \(.detail)" | gsub("[[:cntrl:]]"; " ")'
 
-# The pending reset checks of earlier captures: a capture whose check didn't finish blocks the next.
+# A reset check for run $1 (yyyyMMdd-HHmmss), covering the job from $2 (UTC) to its end. 0: none,
+# and the pending marker is gone; 7: found, and it stays a P0 until acknowledged; anything else:
+# still pending (5: the job still runs), with harness-events' own exit code.
+harness_check() {
+    local stamp=$1 since=$2 rc dir="$REPO_ROOT/.dogfood/harness/$1"
+    pre_reset
+    pre_str Id "harness-$stamp"
+    pre_str Since "$since"
+    run_ps harness-events
+    rc=$?
+    case "$rc" in
+    0) rm -f "$dir/tdr-pending" ;;
+    7)
+        mv -f "$dir/tdr-pending" "$dir/tdr-p0" 2>/dev/null || printf '%s\n' "$since" >"$dir/tdr-p0"
+        err "P0: a display-driver reset or an unexpected reboot during harness-$stamp: stop all PC work and report it to the owner (read-only follow-up: pc logs harness-$stamp); after the owner's OK, pc harness events --ack $stamp"
+        ;;
+    esac
+    return "$rc"
+}
+
+# Earlier captures' reset checks: a P0 not yet acknowledged, or a check that hasn't covered its
+# whole job, blocks the next capture.
 harness_pending_checks() {
-    local marker stamp since rc
+    local marker stamp rc
+    for marker in "$REPO_ROOT"/.dogfood/harness/*/tdr-p0; do
+        [ -f "$marker" ] || continue
+        stamp=${marker%/tdr-p0}
+        stamp=${stamp##*/}
+        die "P0 not yet acknowledged: a display-driver reset or an unexpected reboot during harness-$stamp; once the owner has seen it and said so: pc harness events --ack $stamp" 7
+    done
     for marker in "$REPO_ROOT"/.dogfood/harness/*/tdr-pending; do
         [ -f "$marker" ] || continue
         stamp=${marker%/tdr-pending}
         stamp=${stamp##*/}
-        since=$(head -n 1 "$marker")
         say "checking the System log after harness-$stamp, whose check didn't finish"
-        pre_reset
-        pre_str Id "harness-$stamp"
-        pre_str Since "$since"
-        run_ps harness-events
+        harness_check "$stamp" "$(head -n 1 "$marker")"
         rc=$?
-        case "$rc" in
-        0) rm -f "$marker" ;;
-        7)
-            err "P0: a display-driver reset or an unexpected reboot during harness-$stamp: stop all PC work and report it to the owner"
-            exit 7
-            ;;
-        *) die "the reset check of harness-$stamp is still pending (exit $rc); nothing started" 1 ;;
-        esac
+        [ "$rc" = 0 ] || exit "$rc"
     done
 }
 
 harness_events() {
-    [ $# -eq 0 ] || usage_error "harness events: takes no arguments"
-    local before
+    local ack='' before
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --ack)
+            need_value "$1" $#
+            case "$2" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ack=$2 ;; *) usage_error "harness events: --ack takes a run's yyyyMMdd-HHmmss" ;; esac
+            shift
+            ;;
+        *) usage_error "harness events: unknown argument $1" ;;
+        esac
+        shift
+    done
+    if [ -n "$ack" ]; then
+        [ -f "$REPO_ROOT/.dogfood/harness/$ack/tdr-p0" ] || die "harness events: no P0 to acknowledge for $ack" 2
+        rm -f "$REPO_ROOT/.dogfood/harness/$ack/tdr-p0"
+        say "the P0 of harness-$ack is acknowledged (with the owner's OK); captures can start again"
+        return 0
+    fi
     before=$(find "$REPO_ROOT/.dogfood/harness" -name tdr-pending 2>/dev/null | wc -l | tr -d ' ')
     harness_pending_checks
     [ "$before" != 0 ] || say "no pending reset checks"
@@ -937,7 +976,7 @@ harness_events() {
 harness_capture() {
     local force=0 alias=180hz seconds='' smoke=0 fps=180 capture=gfxcapture rate='' output=1080p60
     local loglevel=debug finishing=0 voice=0 fetch_clip=0 profile size path stamp id dir job_tmp
-    local encoded started final run_rc events_rc verdict share asset pinned bytes need free
+    local encoded started final run_rc events_rc rc verdict share asset pinned bytes need free
     local rate_on finishing_on voice_on
     local start=$SECONDS
     while [ $# -gt 0 ]; do
@@ -955,7 +994,8 @@ harness_capture() {
             ;;
         --seconds)
             need_value "$1" $#
-            if ! is_uint "$2" || [ "$2" -lt 5 ] || [ "$2" -gt 60 ]; then
+            # A leading zero would read as octal in the arithmetic below.
+            if ! is_uint "$2" || [ "${2#0}" != "$2" ] || [ "$2" -lt 5 ] || [ "$2" -gt 60 ]; then
                 usage_error "harness capture: --seconds takes 5 to 60"
             fi
             seconds=$2
@@ -963,7 +1003,7 @@ harness_capture() {
             ;;
         --testbed-fps)
             need_value "$1" $#
-            if ! is_uint "$2" || [ "$2" -lt 1 ] || [ "$2" -gt 1000 ]; then
+            if ! is_uint "$2" || [ "${2#0}" != "$2" ] || [ "$2" -lt 1 ] || [ "$2" -gt 1000 ]; then
                 usage_error "harness capture: --testbed-fps takes 1 to 1000"
             fi
             fps=$2
@@ -1018,7 +1058,7 @@ harness_capture() {
     [ -f "$REPO_ROOT/.dogfood/pc/monitors.json" ] ||
         die "harness capture: run pc harness displays, then --alias 180hz=DISPLAYn --alias oled=DISPLAYm" 2
     path=$(/usr/bin/jq -r --arg a "$alias" "$JQ_CAPTURE_MONITOR" "$REPO_ROOT/.dogfood/pc/monitors.json" 2>&1) ||
-        die "harness capture: $(printf '%s' "$path" | sed 's/^jq: error[^:]*: //')" 2
+        die "harness capture: $(printf '%s' "$path" | sed 's/^jq: error (at [^)]*): //')" 2
     case "$path" in "\\\\?\\"*) ;; *) die "harness capture: the alias $alias doesn't hold a device path" 2 ;; esac
     case "$path" in *[![:print:]]*) die "harness capture: the alias $alias holds a control character" 2 ;; esac
 
@@ -1067,25 +1107,32 @@ harness_capture() {
     pre_int Wait "$((seconds + 240))"
     pre_int Tail 40
     say "job $id ($profile, $seconds s, monitor $alias, $capture, $output, max_seconds $((seconds + 210)))"
+    # The check is pending before the job can start, so a pc stopped during the wait still leaves
+    # it: from the Mac's clock less a minute for the two clocks' difference, until the PC's start.
+    date -u -v-60S +%Y-%m-%dT%H:%M:%S.000Z >"$dir/tdr-pending" || die "cannot write $dir/tdr-pending"
     run_ps run
     run_rc=$?
     started=$(kv_get started)
-    # Nothing started: nothing to check or fetch.
-    [ -n "$started" ] || return "$run_rc"
-
+    if [ -z "$started" ]; then
+        # Refused before the job started (bad job, busy, unknown): nothing to check or fetch.
+        case "$run_rc" in 2 | 3 | 4) rm -f "$dir/tdr-pending" ;; esac
+        return "$run_rc"
+    fi
     printf '%s\n' "$started" >"$dir/tdr-pending"
-    pre_reset
-    pre_str Id "$id"
-    pre_str Since "$started"
-    run_ps harness-events
+    # Only once the job has ended (done, failed, or stopped by devrun) does a check cover all of it.
+    case "$run_rc" in
+    0 | 1 | 6) ;;
+    *)
+        err "harness capture: the job may still be running (exit $run_rc): run pc harness events once it has ended"
+        return "$run_rc"
+        ;;
+    esac
+    harness_check "$stamp" "$started"
     events_rc=$?
     final=$run_rc
     case "$events_rc" in
-    0) rm -f "$dir/tdr-pending" ;;
-    7)
-        err "P0: a display-driver reset or an unexpected reboot during $id: stop all PC work and report it to the owner (read-only follow-up: pc logs $id)"
-        exit 7
-        ;;
+    0) ;;
+    7) exit 7 ;;
     *) [ "$final" -ne 0 ] || final=1 ;;
     esac
     case "$run_rc" in 0 | 1) ;; *) return "$run_rc" ;; esac
@@ -1094,10 +1141,12 @@ harness_capture() {
     pre_bool Force "$force"
     pre_str Id "$id"
     pre_list Files harness.json verify.json verify.txt
-    run_ps harness-fetch >/dev/null || {
-        err "harness capture: the reports couldn't be fetched"
-        return 1
-    }
+    run_ps harness-fetch
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        err "harness capture: the reports couldn't be fetched (exit $rc); pc logs $id shows the job's result"
+        return "$rc"
+    fi
     harness_keep "$dir" harness_json harness.json '.kairo_harness == 1'
     harness_keep "$dir" verify_json verify.json '.kairo_verify == 1'
     harness_keep "$dir" verify_txt verify.txt ''
@@ -1110,7 +1159,7 @@ harness_capture() {
     fi
     verdict=''
     if [ -f "$dir/verify.json" ]; then
-        verdict=$(/usr/bin/jq -r '.verdict' "$dir/verify.json")
+        verdict=$(/usr/bin/jq -r '.verdict | tostring | gsub("[[:cntrl:]]"; " ")' "$dir/verify.json")
         say "verify: $verdict"
         /usr/bin/jq -r "$JQ_VERIFY_FAILING" "$dir/verify.json" | sed 's/^/  failing: /'
         share=$(/usr/bin/jq -r '[.checks[] | select(.id == "content.barcode") | .value.share // empty][0] // empty' "$dir/verify.json")

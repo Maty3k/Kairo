@@ -38,12 +38,16 @@ pub fn testbed_before_ready(code: Option<i32>) -> Outcome {
     }
 }
 
+/// The outcome the testbed's `e end` reason has of its own, whenever the testbed ended: an HDR
+/// toggle is the environment refusing (exit 3).
+pub fn testbed_reason(reason: &str) -> Option<Outcome> {
+    (reason == "hdr_changed").then(|| Outcome::new(exit::REFUSED, "the monitor's HDR changed"))
+}
+
 /// The testbed's log ended with `reason` during the warm-up or the capture.
 pub fn testbed_ended(reason: &str) -> Outcome {
-    match reason {
-        "hdr_changed" => Outcome::new(exit::REFUSED, "the monitor's HDR changed"),
-        _ => Outcome::new(exit::FAILED, "the testbed ended during the run"),
-    }
+    testbed_reason(reason)
+        .unwrap_or_else(|| Outcome::new(exit::FAILED, "the testbed ended during the run"))
 }
 
 /// kairo-verify exited with `code` (`None`: killed at its limit), leaving `report` if it wrote
@@ -98,6 +102,12 @@ mod tests {
         }
         assert_eq!(testbed_ended("hdr_changed").code, exit::REFUSED);
         assert_eq!(testbed_ended("error").code, exit::FAILED);
+        // An HDR toggle has its own code whichever phase sees the testbed gone.
+        assert_eq!(
+            testbed_reason("hdr_changed").map(|o| o.code),
+            Some(exit::REFUSED)
+        );
+        assert_eq!(testbed_reason("seconds"), None);
     }
 
     #[test]

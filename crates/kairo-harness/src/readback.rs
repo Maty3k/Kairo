@@ -90,20 +90,41 @@ fn finding<'a>(report: Option<&'a Value>, id: &str) -> Option<(&'a str, &'a Valu
         .and_then(|c| Some((c.get("status")?.as_str()?, c.get("value")?)))
 }
 
-/// A row read from the bitstream: `holds` says whether a value proves the option.
+/// What decides a bitstream row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decides {
+    /// The check's own outcome: its pass is the proof.
+    Check,
+    /// A value read from the whole stream: it decides whatever else failed the check.
+    Stream,
+    /// A value read from the stream's header (`avcC`): it decides a failure, but a check that
+    /// failed on another rule may mean the stream changed after the header, so it can't prove
+    /// the option then.
+    Header,
+}
+
+/// A row read from the bitstream: `holds` says whether the check, or a value in it, proves the
+/// option; `decides` says which.
 fn bitstream(
     report: Option<&Value>,
     option: &str,
     id: &str,
     what: &str,
+    decides: Decides,
     holds: impl Fn(&str, &Value) -> Option<bool>,
 ) -> Row {
     let (status, evidence) = match finding(report, id) {
         None => (Status::Unknown, format!("{id}: not in the report")),
-        Some((check, value)) => match (check, holds(check, value)) {
-            ("skip" | "error", _) | (_, None) => (Status::Unknown, format!("{id}: {check}")),
-            ("fail", _) | (_, Some(false)) => (Status::Failed, format!("{id}: {check}, {what}")),
-            (_, Some(true)) => (Status::Verified, format!("{id}: {check}, {what}")),
+        Some((check, value)) => match (check, holds(check, value), decides) {
+            ("skip" | "error", _, _) | (_, None, _) => (Status::Unknown, format!("{id}: {check}")),
+            (_, Some(false), _) | ("fail", _, Decides::Check) => {
+                (Status::Failed, format!("{id}: {check}, {what}"))
+            }
+            ("fail", Some(true), Decides::Header) => (
+                Status::Unknown,
+                format!("{id}: failed on another rule, so {what} isn't proof"),
+            ),
+            (_, Some(true), _) => (Status::Verified, format!("{id}: {check}, {what}")),
         },
     };
     Row {
@@ -192,14 +213,25 @@ pub fn table(
             "-profile:v high",
             "video.params",
             "profile 100",
+            Decides::Header,
             |_, v| Some(int(v, "profile")? == 100),
         ),
-        bitstream(report, "-coder cabac", "video.params", "CABAC", |_, v| {
-            v.get("cabac")?.as_bool()
-        }),
-        bitstream(report, "-g 60", "video.gop", "an IDR every 60", |s, _| {
-            Some(s == "pass")
-        }),
+        bitstream(
+            report,
+            "-coder cabac",
+            "video.params",
+            "CABAC",
+            Decides::Header,
+            |_, v| v.get("cabac")?.as_bool(),
+        ),
+        bitstream(
+            report,
+            "-g 60",
+            "video.gop",
+            "an IDR every 60",
+            Decides::Check,
+            |s, _| Some(s == "pass"),
+        ),
     ]);
     for option in ["-bf 0", "-max_b_frames 0"] {
         rows.push(bitstream(
@@ -207,6 +239,7 @@ pub fn table(
             option,
             "video.no_reorder",
             "no B slice",
+            Decides::Check,
             |s, v| Some(s == "pass" && int(v, "b_samples")? == 0),
         ));
     }
@@ -216,6 +249,7 @@ pub fn table(
             "-header_spacing 60",
             "video.gop",
             "an SPS and a PPS with every IDR",
+            Decides::Stream,
             |_, v| {
                 let idr = int(v, "idr")?;
                 Some(idr > 0 && int(v, "idr_with_params")? == idr)
@@ -226,6 +260,7 @@ pub fn table(
             "-filler_data 0",
             "video.params",
             "no filler unit",
+            Decides::Stream,
             |_, v| Some(int(v, "filler_nals")? == 0),
         ),
         bitstream(
@@ -233,6 +268,7 @@ pub fn table(
             "-frame_skipping 0",
             "video.cfr",
             "one sample per tick",
+            Decides::Check,
             |s, v| Some(s == "pass" && int(v, "irregular")? == 0),
         ),
         bitstream(
@@ -244,8 +280,13 @@ pub fn table(
             },
             "video.params",
             "VUI 1/1/1, limited",
+            Decides::Header,
             |_, v| {
-                let colour = v.get("vui_colour")?.as_array()?;
+                // No colour description at all is the option not holding, not a missing fact.
+                let colour = match v.get("vui_colour")? {
+                    Value::Null => return Some(false),
+                    colour => colour.as_array()?,
+                };
                 let bt709 = colour.len() == 3 && colour.iter().all(|c| c.as_u64() == Some(1));
                 Some(bt709 && !v.get("vui_full_range")?.as_bool()?)
             },
@@ -255,6 +296,7 @@ pub fn table(
             "colr 1/1/1/0",
             "video.colr",
             "BT.709 limited",
+            Decides::Check,
             |s, _| Some(s == "pass"),
         ),
     ]);
@@ -282,6 +324,7 @@ pub fn table(
             "-r 60 -fps_mode cfr",
             "video.cfr",
             "CFR 60",
+            Decides::Check,
             |s, _| Some(s == "pass"),
         ),
         bitstream(
@@ -289,6 +332,7 @@ pub fn table(
             &format!("-t {seconds}"),
             "duration",
             "the length",
+            Decides::Check,
             |s, _| Some(s == "pass"),
         ),
         bitstream(
@@ -296,6 +340,7 @@ pub fn table(
             "-movflags +faststart",
             "container.faststart",
             "moov first",
+            Decides::Check,
             |s, _| Some(s == "pass"),
         ),
         bitstream(
@@ -303,6 +348,7 @@ pub fn table(
             "-use_editlist 0",
             "container.no_editlist",
             "no edit list",
+            Decides::Check,
             |s, _| Some(s == "pass"),
         ),
     ]);
@@ -396,6 +442,35 @@ mod tests {
         assert_eq!(status(&rows, "-max_b_frames 0"), Status::Failed);
         assert_eq!(status(&rows, "-header_spacing 60"), Status::Failed);
         assert_eq!(status(&rows, "-g 60"), Status::Verified);
+    }
+
+    #[test]
+    fn a_shared_check_failing_elsewhere_leaves_each_row_to_its_own_value() {
+        // video.params fails because the VUI has no colour description: that row fails, the
+        // stream-wide filler count still proves its option, and profile and CABAC, read from
+        // the header, can't prove theirs while the check failed.
+        let r = report(|r| {
+            r["checks"][0]["status"] = json!("fail");
+            r["checks"][0]["value"]["vui_colour"] = Value::Null;
+        });
+        let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
+        assert_eq!(status(&rows, "setparams (VUI colour)"), Status::Failed);
+        assert_eq!(status(&rows, "-filler_data 0"), Status::Verified);
+        assert_eq!(status(&rows, "-profile:v high"), Status::Unknown);
+        assert_eq!(status(&rows, "-coder cabac"), Status::Unknown);
+        // video.gop fails for an extra IDR, but every IDR still carries its SPS and PPS.
+        let r = report(|r| {
+            r["checks"][1]["status"] = json!("fail");
+            r["checks"][1]["value"]["idr"] = json!(31);
+            r["checks"][1]["value"]["idr_with_params"] = json!(31);
+        });
+        let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
+        assert_eq!(status(&rows, "-g 60"), Status::Failed);
+        assert_eq!(status(&rows, "-header_spacing 60"), Status::Verified);
+        // A passing check with no colour description is a failure too.
+        let r = report(|r| r["checks"][0]["value"]["vui_colour"] = Value::Null);
+        let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
+        assert_eq!(status(&rows, "setparams (VUI colour)"), Status::Failed);
     }
 
     #[test]
