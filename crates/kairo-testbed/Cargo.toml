@@ -1,0 +1,40 @@
+[package]
+name = "kairo-testbed"
+description = "testbed.exe: pattern v1 on a chosen monitor, with a QPC log as ground truth (M1, research 16 §4)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "testbed"
+path = "src/bin/testbed.rs"
+
+[dependencies]
+kairo-core = { workspace = true }
+kairo-display = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",             # handles, HWND, LUID, RECT
+    "Win32_Graphics_Direct3D",      # driver types, feature levels
+    "Win32_Graphics_Direct3D11",    # the device, textures, clears and copies
+    "Win32_Graphics_Dxgi",          # factory, adapter by LUID, outputs, vblanks, swap chain
+    "Win32_Graphics_Dxgi_Common",   # formats, colour spaces
+    "Win32_Graphics_Gdi",           # HMONITOR, the black brush, ClientToScreen
+    "Win32_Security",               # CreateWaitableTimerExW's attributes
+    "Win32_System_LibraryLoader",   # GetModuleHandleW
+    "Win32_System_Performance",     # QPC
+    "Win32_System_Power",           # ES_DISPLAY_REQUIRED
+    "Win32_System_SystemInformation", # GetTickCount
+    "Win32_System_Threading",       # the timer, waits, EcoQoS
+    "Win32_UI_HiDpi",               # the framed window's size at its DPI
+    "Win32_UI_Input_KeyboardAndMouse", # GetLastInputInfo (the session's idle time only)
+    "Win32_UI_WindowsAndMessaging", # the window, its messages, the foreground
+] }
+
+[lints]
+workspace = true

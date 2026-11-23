@@ -219,6 +219,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kairo-testbed"
+version = "0.1.0"
+dependencies = [
+ "kairo-core",
+ "kairo-display",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "kairo-verify"
 version = "0.1.0"
 dependencies = [

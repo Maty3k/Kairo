@@ -297,7 +297,7 @@ Kairo/ (public, GPL-3.0)  CLAUDE.md LICENSE SECURITY.md PRIVACY.md CHANGELOG.md 
 │           kairo-verify · kairo-testbed · kairo-loadgen · kairo-probes · kairo-devrun
 ├─ apps/ui/  Tauri 2 (src-tauri: engine client, kairo-media, clipboard, drag) + React/TS
 ├─ locales/ · data/{games,known-bad-drivers}.json · tools/{mac,pc}/ · .claude/commands/
-└─ docs/  PLAN.md (this plan) · research/ (00–13, 15, 16, prototypes/) · adr/ · spikes/ · milestones/
+└─ docs/  PLAN.md (this plan) · research/ (00–13, 15–17, prototypes/) · adr/ · spikes/ · milestones/
 kairo-cloud/ (separate PRIVATE repo, Laravel 13, Stage C)
 ```
 
@@ -350,7 +350,7 @@ Languages: Rust (engine, UI shell, tools), TypeScript/React (UI), HLSL (runtime-
 - **`testbed.exe`** (windowed, borderless or exclusive fullscreen; 60–360 fps): a block barcode that survives scaling and H.264; moving bars; a per-second flash with a 1 kHz "game" beep; a 2 kHz "voice" beep from another process; HDR patches; a QPC log as ground truth.
 - **`kairo-verify`** (ffprobe plus its own analysis): drops and duplicates (≤0.5% [proposed]), content cadence, CFR, A/V offset per track ≤40 ms, IDR at 0, closed 1 s GOP, pts = dts, moov first, no edit list, `colr`, decoded bars ≥40 dB PSNR (catches silent encoder corruption), routing (voice tone only on T4; Kairo's cue absent), tone SNR, curve levels, export profiles; nothing GPL linked.
 - **`kairo-loadgen`:** deterministic GPU load (ALU and bandwidth modes, research 13 §5.5), borderless on the OLED, scriptable.
-- **`pc bench`** (research 13 §9): environment in `bench/env.json`; AMD Chill, Boost, AFMF, FRTC, Enhanced Sync, RSR, Metrics Overlay and Instant Replay off, VSync off; warm-up; A/A noise floor (6 runs; CV >1% → more); ABBA×3 (12 × 60 s, 6 pairs) of Kairo off/on; PresentMon 2.6.0 with its own `--session_name KairoBench` (Adrenalin ships a PresentMon too), `--qpc_time --track_frame_type --track_gpu_video` (P17); `pm-stats.ps1`, `ab-stats.ps1`, PDH `encoder-usage.ps1`. **Gate (Instant Replay off):** mean FPS loss ≤3% with the upper 95% CI ≤4%; 1%-low loss ≤5%; PresentMode unchanged; no worse than Instant Replay alone + 1 pp (the three-way numbers feed the onboarding warning). **Workloads:** loadgen, built-in benchmarks of 2 of your games, one HDR run, video on the 180 Hz screen, alt-tab between monitors, a Copy for Discord export during play; live play only for soaks.
+- **`pc bench`** (research 13 §9; design: research 17): environment in `env.json`, kept on the Mac in `.dogfood/` (M1); AMD Chill, Boost, AFMF, FRTC, Enhanced Sync, RSR, Metrics Overlay and Instant Replay off, VSync off; warm-up; A/A noise floor (6 runs; CV >1% → more); ABBA×3 (12 × 60 s, 6 pairs) of Kairo off/on; PresentMon 2.6.0 with its own `--session_name KairoBench` (Adrenalin ships a PresentMon too), `--qpc_time --track_frame_type --track_gpu_video` (P17); `pm-stats.ps1`, `ab-stats.ps1`, PDH `encoder-usage.ps1`. **Gate (Instant Replay off):** mean FPS loss ≤3% with the upper 95% CI ≤4%; 1%-low loss ≤5%; PresentMode unchanged; no worse than Instant Replay alone + 1 pp (the three-way numbers feed the onboarding warning). **Workloads:** loadgen, built-in benchmarks of 2 of your games, one HDR run, video on the 180 Hz screen, alt-tab between monitors, a Copy for Discord export during play; live play only for soaks.
 
 | Games (yours first: Steam and Epic story games with HDR, M0) | Anti-cheat | Focus |
 |---|---|---|
@@ -737,7 +737,7 @@ Branches m<N>/<slug>; Conventional Commits + DCO + the session's co-author trail
 
 ## Appendix B. Research references and glossary
 
-**Research** (web-verified 2026-10-21; in `docs/research/`): `00-brief.md` (synthesis, fact-check) · `01-video-capture.md` · `02-audio-console-cloud.md` · `03-triggers-safety-detection.md` · `04-competitors.md` · `05-stack-workflow.md` · `06-post-clip-sharing.md` · `07-shipping-legal.md` · `08-capture-rust.md` · `09-encode-mux-rust.md` · `10-audio-rust.md` · `11-engine-shell-rust.md` · `12-tauri-ui.md` · `13-amd-performance.md` (AMF settings, AMD driver issues, measuring) · `15-implementation-cookbook.md` (verified APIs, code sketches, the M3 checklist; P1–P22) · `prototypes/` (type-checked sketches, not product code) · `14-name-check.md` (private, in the git-ignored `.private/`).
+**Research** (web-verified 2026-10-21; in `docs/research/`): `00-brief.md` (synthesis, fact-check) · `01-video-capture.md` · `02-audio-console-cloud.md` · `03-triggers-safety-detection.md` · `04-competitors.md` · `05-stack-workflow.md` · `06-post-clip-sharing.md` · `07-shipping-legal.md` · `08-capture-rust.md` · `09-encode-mux-rust.md` · `10-audio-rust.md` · `11-engine-shell-rust.md` · `12-tauri-ui.md` · `13-amd-performance.md` (AMF settings, AMD driver issues, measuring) · `15-implementation-cookbook.md` (verified APIs, code sketches, the M3 checklist; P1–P22) · `16-verify-testbed/` (M1's design of `kairo-verify`, the testbed and the voice-tone process, 2026-10-24) · `17-loadgen-bench/` (M1's design of `kairo-loadgen`, `pc bench` and the bench scripts, 2026-11-22) · `prototypes/` (type-checked sketches, not product code) · `14-name-check.md` (private, in the git-ignored `.private/`).
 
 | Term | Meaning |
 |---|---|
