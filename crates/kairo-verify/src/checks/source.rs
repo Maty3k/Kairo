@@ -901,11 +901,12 @@ mod tests {
                 }
             }
         }
-        // At k = 1 (60 or 120 fps) a dropped output frame at the catch-up is the capture's at
-        // these phases too, and a freeze of one output frame at most of them. Over a whole
-        // output frame of phases, one capture delay at the edge of the frames' windows fits a
-        // single dropped or repeated picture as well as the screen's own at a third or more of
-        // phases at any k: the log can't tell, and it stays the testbed's (README §6.3).
+        // At k = 1 a dropped output frame at the catch-up is the capture's at these phases too,
+        // at 60 and 120 fps, and a freeze of one output frame at most of them at 60 fps, but at
+        // only 2 to 6 of them at 120 fps. Over a whole output frame of phases, one capture delay
+        // at the edge of the frames' windows can fit a single dropped or repeated picture as
+        // well as the screen's own: the log can't tell, and it stays the testbed's (README §6.3
+        // gives the rates).
         for (jump, late) in [(7, false), (5, true)] {
             for fps in [60, 120] {
                 let what = format!("k 1 jump {jump} late {late} {fps} fps");
@@ -913,7 +914,11 @@ mod tests {
             }
             assert!(
                 caught(1, jump, late, 60, 1).0 >= 8,
-                "k 1 jump {jump}: frozen"
+                "k 1 jump {jump}: frozen at 60 fps"
+            );
+            assert!(
+                caught(1, jump, late, 120, 1).0 >= 2,
+                "k 1 jump {jump}: frozen at 120 fps"
             );
         }
     }
@@ -970,27 +975,48 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_delay_that_rises_and_falls_over_half_a_second_is_the_screen_s() {
-        // A perfect capture whose delay rises 2 vblanks and falls back within 0.25 s each way of
-        // the miss. Faster changes can be charged to the capture: around a miss the clean
-        // frames sit a few output frames from the step, and the delay there is no longer the
-        // step's (README §6.3).
+    fn a_capture_delay_that_moves_2_vblanks_over_0_4_s_is_the_screen_s() {
+        // A perfect capture whose delay rises or falls 2 vblanks in a straight line over the
+        // 0.4 s around the miss, or rises 2 vblanks over 0.4 s and falls back over 0.4 s with its
+        // peak 0.15 s before, at or 0.2 s after the miss. Faster moves can be charged to the
+        // capture: the clean frames on the two sides of the step sit about 0.15-0.2 s apart at
+        // 60 fps, and a delay that moves more than about a vblank between them makes the two
+        // sides disagree (README §6.3).
         let vblank = 1.0 / 180.0;
-        for (k, jump, late) in [(1, 7, true), (1, 8, false), (2, 10, false), (3, 10, false)] {
+        let ramp = |x: f64| ((x + 0.2) / 0.4).clamp(0.0, 1.0);
+        let peak = |x: f64| (1.0 - x.abs() / 0.4).max(0.0);
+        // Each shape gives the delay in vblanks x seconds after the miss.
+        let shapes: [(&str, &dyn Fn(f64) -> f64); 5] = [
+            ("rise", &|x| 2.0 * ramp(x)),
+            ("fall", &|x| 2.0 - 2.0 * ramp(x)),
+            ("peak 0.15 s before", &|x| 2.0 * peak(x + 0.15)),
+            ("peak at the miss", &|x| 2.0 * peak(x)),
+            ("peak 0.2 s after", &|x| 2.0 * peak(x - 0.2)),
+        ];
+        let cases = [
+            (1, 7, true),
+            (1, 9, false),
+            (1, 12, false),
+            (2, 10, false),
+            (2, 12, false),
+            (3, 11, false),
+        ];
+        for (k, jump, late) in cases {
             for fps in [60, 120] {
                 let outputs = 20 * fps as usize;
                 let after = (10.0 * 180.0 / k as f64) as i64;
                 let (source, shown) = vsync_run(k, 20 * 180 / k + 60, after, jump, late);
                 let at_s = after as f64 * k as f64 / 180.0;
-                for p in 0..36 {
-                    let phase = p as f64 / 36.0 / f64::from(fps) + 0.002;
-                    let delay = |i: usize| {
-                        let t = i as f64 / f64::from(fps) + phase;
-                        2.0 * vblank * (1.0 - (t - at_s).abs() / 0.25).max(0.0)
-                    };
-                    let (numbers, pts) = capture(&shown, fps, outputs, phase, delay);
-                    let what = format!("k {k} jump {jump} late {late} {fps} fps phase {p}/36");
-                    assert_eq!(unexplained(&source, &numbers, &pts, fps), 0, "{what}");
+                for (name, shape) in shapes {
+                    for p in 0..36 {
+                        let phase = p as f64 / 36.0 / f64::from(fps) + 0.002;
+                        let delay =
+                            |i: usize| vblank * shape(i as f64 / f64::from(fps) + phase - at_s);
+                        let (numbers, pts) = capture(&shown, fps, outputs, phase, delay);
+                        let what =
+                            format!("k {k} jump {jump} late {late} {fps} fps {name} phase {p}/36");
+                        assert_eq!(unexplained(&source, &numbers, &pts, fps), 0, "{what}");
+                    }
                 }
             }
         }
