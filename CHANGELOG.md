@@ -52,5 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The bootstrap makes Administrators the owner of `C:\kairo` and everything in it except `logs` and `state` (#2).
 - `SETUP.md` now matches what the bootstrap and the undo script do (#3).
 - The bootstrap installs Node.js 24 from winget's `OpenJS.NodeJS.24`: `OpenJS.NodeJS.LTS` moved to Node 26, so a fresh PC's Node.js step failed with "no applicable installer" (#38).
+- The undo script and `pc deploy`'s watch-agent restart find Kairo's programs by name and then look each one up alone by its WMI key, so they never open another program, a game included: the undo script had read every process's path, which opens it with memory-read rights and lists its modules (#37).
 
 [Unreleased]: https://github.com/Maty3k/Kairo/commits/main
