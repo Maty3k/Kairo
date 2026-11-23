@@ -9,7 +9,9 @@
 # - it ended without one (the owner signed out, the PC went down): up to its time limit
 #   (MaxSeconds) or its output files' last write, whichever is later, and a minute after; and when
 #   Windows started again before any clean shutdown, with its last event before that start inside
-#   this window, the event 41 that start logged.
+#   this window or up to 10 minutes after it, the event 41 that start logged. The 10 minutes
+#   cover a Since that is the Mac's clock less a minute (a check left by ssh's 255), which can end
+#   the window seconds before the job's own limit, and the System log's last writes.
 # Exit codes: 0 none, 7 found, 5 the job still runs (check again once it has ended), 1 the System
 # log can't be read (check it by hand first).
 

@@ -982,6 +982,7 @@ harness_capture() {
     local force=0 alias=180hz seconds='' smoke=0 fps=180 capture=gfxcapture rate='' output=1080p60
     local loglevel=debug finishing=0 voice=0 fetch_clip=0 profile size path stamp id dir job_tmp
     local encoded started final run_rc events_rc rc verdict share asset pinned bytes need free
+    local job_exit job_reason
     local rate_on finishing_on voice_on
     local start=$SECONDS
     while [ $# -gt 0 ]; do
@@ -1118,6 +1119,9 @@ harness_capture() {
     run_ps run
     run_rc=$?
     started=$(kv_get started)
+    # The job's own exit code and reason, kept now: each later call replaces the KV lines.
+    job_exit=$(kv_get job_exit)
+    job_reason=$(kv_get job_reason)
     if [ -z "$started" ]; then
         # Refused before \Kairo\Run took the job (bad job, busy, unknown, or run.ps1's exit 1: the
         # task missing, disabled or running another job): nothing ran, so nothing to check or
@@ -1157,7 +1161,7 @@ harness_capture() {
     0) ;;
     3 | 4)
         # The job ran; the PC turned busy (or its state unknown) between its end and the fetch.
-        err "harness capture: $id ran (job exit $run_rc), but the PC was no longer free for the fetch, so its reports stay on the PC; pc logs $id shows the job's result"
+        err "harness capture: $id ended (${job_reason:-no result}${job_exit:+, exit $job_exit}), but the PC was no longer free for the fetch, so its reports stay on the PC; pc logs $id shows the job's result"
         [ "$final" -ne 0 ] || final=1
         return "$final"
         ;;

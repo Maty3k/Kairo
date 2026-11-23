@@ -50,6 +50,9 @@ Show-Tail $run.ErrFile $tail -Since $run.Started
 Show-Tail $run.OwnLog 40 -Since $run.Started
 $exitCode = Get-Field $result 'exit_code'
 $reason = [string](Get-Field $result 'reason')
+# The job's own result, for a caller that reports it after later calls (pc harness capture).
+Send-KV 'job_exit' ([string]$exitCode)
+Send-KV 'job_reason' $reason
 if ((Get-Field $result 'aborted') -eq $true) {
     Say ('job ' + $job.Id + ' was stopped by kairo-devrun (' + $reason + ')')
     Exit-Pc 6
