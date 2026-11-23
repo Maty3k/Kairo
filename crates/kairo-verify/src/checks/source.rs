@@ -322,24 +322,41 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    /// The capture delay around the step at output frame `at`: the delays the clean frames
-    /// nearest it all allow, up to [`NEIGHBOURS`] before frame `at - 1` and as many after `at`,
-    /// within `span` output frames. A capture's delay drifts slowly, so near the step one delay
-    /// fits them all; where they miss each other by up to a vblank (jitter), the gap between
-    /// them. `None` without any; `Some(None)` where they disagree by more: the delay jumped at
-    /// the step, as when the capture dropped or repeated a picture and closed up its timeline.
+    /// The capture delay around the step at output frame `at`, from the clean frames nearest it
+    /// on each side: before frame `at - 1` and after `at`, within `span` output frames. A
+    /// capture's delay drifts slowly, so one delay fits each side's nearest frames, and the two
+    /// sides too; where they miss each other by up to a vblank (jitter), the gap between them.
+    /// `None` without any; `Some(None)` where the two sides disagree by more: the delay jumped
+    /// at the step, as when the capture dropped or repeated a picture there and closed up its
+    /// timeline. A jump further out on one side (the capture's own drop or repeat a few frames
+    /// away) ends that side's frames before it ([`Screen::side`]), so it says nothing here.
     fn delay_near(&self, at: usize, span: usize) -> Option<Option<(f64, f64)>> {
-        let before = (at.saturating_sub(1 + span)..at.saturating_sub(1))
-            .rev()
-            .filter_map(|j| self.delay.get(j).copied().flatten())
-            .take(NEIGHBOURS);
-        let after = (at + 1..=at.saturating_add(span))
-            .filter_map(|j| self.delay.get(j).copied().flatten())
-            .take(NEIGHBOURS);
+        let before = self.side((at.saturating_sub(1 + span)..at.saturating_sub(1)).rev());
+        let after = self.side(at + 1..=at.saturating_add(span));
         let (low, high) = before
+            .into_iter()
             .chain(after)
             .reduce(|(a, b), (c, d)| (a.max(c), b.min(d)))?;
         Some((low <= high + self.slack).then_some((low.min(high), high.max(low))))
+    }
+
+    /// The delays one side's clean frames allow, nearest first, up to [`NEIGHBOURS`] of them:
+    /// least and most, where the most may fall short of the least by up to a vblank (jitter).
+    /// It stops at the first frame that would push them apart by more, which lies past a jump.
+    fn side(&self, frames: impl Iterator<Item = usize>) -> Option<(f64, f64)> {
+        let mut group: Option<(f64, f64)> = None;
+        let clean = frames.filter_map(|j| self.delay.get(j).copied().flatten());
+        for (low, high) in clean.take(NEIGHBOURS) {
+            let next = match group {
+                None => (low, high),
+                Some((a, b)) => (a.max(low), b.min(high)),
+            };
+            if next.0 > next.1 + self.slack {
+                break;
+            }
+            group = Some(next);
+        }
+        group
     }
 }
 
@@ -355,9 +372,11 @@ impl Screen {
 /// one beside a testbed miss shows a frame the screen had left or not yet shown at the delay its
 /// neighbours show, and stays the capture's.
 ///
-/// Where they can't (no display times near N or N′, no clean frames near the step, or clean
-/// frames that disagree about the delay), the misses are bounded
-/// by what they can do to the screen. A run of m missed frames held the screen m frame times
+/// Clean frames on the two sides of the step that disagree about the delay by more than a vblank
+/// make the step the capture's: its delay jumped there ([`Screen::delay_near`]).
+///
+/// Where the display times can't decide (none near N or N′, or no clean frames near the step),
+/// the misses are bounded by what they can do to the screen. A run of m missed frames held the screen m frame times
 /// longer, and e more where the display times there show the frames around it came e frame
 /// times later than their numbers say ([`Source::late_frames`]). So it can account for at most
 /// ⌈(m + e + 1)·fps / F_s⌉ + 1 of the steps that touch it, each off its nominal size by at most
@@ -487,7 +506,7 @@ impl<'a> Excuses<'a> {
         let (f1, u1) = self.source.screen_window(to, unreported)?;
         // At delay D a picture at clip time p shows QPC time p − D, and frame n was on screen
         // within a vblank s of that when from_n − s ≤ p − D ≤ until_n + s.
-        // Clean frames on either side that disagree about the delay: the capture jumped there.
+        // Clean frames on the two sides that disagree about the delay: the capture jumped there.
         let Some((near_low, near_high)) = screen.delay_near(at, self.span)? else {
             return Some(false);
         };
@@ -882,12 +901,11 @@ mod tests {
                 }
             }
         }
-        // Where the testbed's frames are shorter than the capture's (k = 1 at 60 or 120 fps), a
-        // dropped output frame is the capture's at every phase too, and so is a freeze of one
-        // output frame at most phases. Where a testbed frame lasts as long as a capture frame or
-        // longer, one capture delay at the edge of the frames' windows fits a single dropped or
-        // repeated picture as well as the screen's own: the log can't tell, and it stays the
-        // testbed's (README §6.3).
+        // At k = 1 (60 or 120 fps) a dropped output frame at the catch-up is the capture's at
+        // these phases too, and a freeze of one output frame at most of them. Over a whole
+        // output frame of phases, one capture delay at the edge of the frames' windows fits a
+        // single dropped or repeated picture as well as the screen's own at a third or more of
+        // phases at any k: the log can't tell, and it stays the testbed's (README §6.3).
         for (jump, late) in [(7, false), (5, true)] {
             for fps in [60, 120] {
                 let what = format!("k 1 jump {jump} late {late} {fps} fps");
@@ -897,6 +915,84 @@ mod tests {
                 caught(1, jump, late, 60, 1).0 >= 8,
                 "k 1 jump {jump}: frozen"
             );
+        }
+    }
+
+    /// A capture that drops or repeats one picture at output frame `at` of `perfect` and keeps
+    /// its timeline shifted from there: a frame late after a repeat, early after a drop.
+    fn shifted(perfect: &[Option<i64>], at: usize, repeat: bool) -> Vec<Option<i64>> {
+        (0..perfect.len())
+            .map(|i| match i {
+                i if i < at => perfect[i],
+                i if repeat => perfect[i - 1],
+                i => perfect.get(i + 1).copied().flatten(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_capture_s_own_drop_or_repeat_near_a_miss_leaves_the_miss_the_testbed_s() {
+        // A capture that drops or repeats one picture a few output frames after the testbed's
+        // catch-up, and stays shifted, is charged with that event alone: the clean frames on
+        // each side of the catch-up nearest it still agree, so the testbed's hold and catch-up
+        // stay the testbed's, as they do when the same event is a second away. At k = 1 and
+        // 60 fps from 2 output frames, at k = 1-3 from 4 (README §6.3); 36 phases across a
+        // whole output frame.
+        for (k, jump, late, offsets) in [
+            (1, 7, true, 2..=4),
+            (1, 8, false, 2..=4),
+            (2, 10, false, 4..=4),
+            (2, 8, true, 4..=4),
+            (3, 10, false, 4..=4),
+        ] {
+            let fps = 60;
+            let outputs = 20 * fps as usize;
+            let after = (10.0 * 180.0 / k as f64) as i64;
+            let (source, shown) = vsync_run(k, 20 * 180 / k + 60, after, jump, late);
+            for p in 0..36 {
+                let phase = p as f64 / 36.0 / f64::from(fps) + 0.002;
+                let (perfect, pts) = capture(&shown, fps, outputs, phase, |_| 0.0);
+                let first = perfect
+                    .iter()
+                    .position(|n| n.is_some_and(|n| n > after))
+                    .unwrap();
+                for offset in offsets.clone().chain([fps as usize]) {
+                    for repeat in [true, false] {
+                        let numbers = shifted(&perfect, first + offset, repeat);
+                        let what = format!(
+                            "k {k} jump {jump} late {late} phase {p}/36 offset {offset} repeat {repeat}"
+                        );
+                        assert_eq!(unexplained(&source, &numbers, &pts, fps), 0, "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_capture_delay_that_rises_and_falls_over_half_a_second_is_the_screen_s() {
+        // A perfect capture whose delay rises 2 vblanks and falls back within 0.25 s each way of
+        // the miss. Faster changes can be charged to the capture: around a miss the clean
+        // frames sit a few output frames from the step, and the delay there is no longer the
+        // step's (README §6.3).
+        let vblank = 1.0 / 180.0;
+        for (k, jump, late) in [(1, 7, true), (1, 8, false), (2, 10, false), (3, 10, false)] {
+            for fps in [60, 120] {
+                let outputs = 20 * fps as usize;
+                let after = (10.0 * 180.0 / k as f64) as i64;
+                let (source, shown) = vsync_run(k, 20 * 180 / k + 60, after, jump, late);
+                let at_s = after as f64 * k as f64 / 180.0;
+                for p in 0..36 {
+                    let phase = p as f64 / 36.0 / f64::from(fps) + 0.002;
+                    let delay = |i: usize| {
+                        let t = i as f64 / f64::from(fps) + phase;
+                        2.0 * vblank * (1.0 - (t - at_s).abs() / 0.25).max(0.0)
+                    };
+                    let (numbers, pts) = capture(&shown, fps, outputs, phase, delay);
+                    let what = format!("k {k} jump {jump} late {late} {fps} fps phase {p}/36");
+                    assert_eq!(unexplained(&source, &numbers, &pts, fps), 0, "{what}");
+                }
+            }
         }
     }
 
