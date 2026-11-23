@@ -4,9 +4,10 @@
 //! and the harness's capture tag frames BT.709 limited the same way ([`SETPARAMS_FILTER`]), give
 //! AMF the same options and read the same log lines, so the PC corpus and gate 2's clips come
 //! from one encoder setup. Only the capture converts BGRA to NV12 ([`nv12_bt709_chain`]): the
-//! corpus's NV12 comes from `synth` already in BT.709, so the PC corpus doesn't test that step,
-//! which the Mac's conversion rehearsal does (README §9). Plain text in and out, so neither needs
-//! the other, nor FFmpeg's libraries, to share it.
+//! corpus's NV12 comes from `synth` already in BT.709, so the PC corpus doesn't test that step;
+//! README §9 plans a Mac rehearsal of it, not built yet, and until then gate 2's own clips are
+//! its test. Plain text in and out, so neither needs the other, nor FFmpeg's libraries, to share
+//! it.
 
 /// Tags frames BT.709 limited (README §7.2's `SETPARAMS`): the only way the 9.0 CLI hands the
 /// primaries and transfer to the encoder and `colr`.
