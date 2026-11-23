@@ -842,7 +842,7 @@ fn timer_frames(ctx: &mut Ctx<'_>, pacer: &mut TimerPacer, shown: &mut Shown) ->
             ctx.log.frame(r, Miss::Slot);
         }
         // A frame shows at the first vblank after its present, which comes as long after its
-        // slot as the newest frame's did, plus the display's latency, measured from there too.
+        // slot as the recent frames' median delay, plus their median latency, measured from there.
         let (grid, latency, delay) = (shown.grid(), shown.latency_hns(), shown.present_delay_hns());
         ctx.aim_beeps(now, Some(end), |flash| {
             let present = pacer.slot_time(flash).saturating_add(delay);

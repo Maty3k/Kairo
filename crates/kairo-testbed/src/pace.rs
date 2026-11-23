@@ -863,7 +863,9 @@ impl VsyncPacer {
     /// known vblank plus whole refresh periods): k vblanks a frame from the vblank the last frame
     /// drawn was taken at, plus the display's latency as the newest frame reported shows it,
     /// all in whole vblanks of the latest grid. A frame already drawn, or passed over, gets the
-    /// time it had on that cadence, which has gone by. `None` before frame 0.
+    /// time it had on that cadence, which has gone by. `None` before frame 0, and in a pass whose
+    /// frame was presented after its target vblank: the next pass predicts from the renumbered
+    /// frame.
     pub fn predict(&self, frame: u64) -> Option<i64> {
         let grid = self.grid()?;
         let (previous, taken) = self.last_taken()?;
@@ -2655,7 +2657,9 @@ mod tests {
                 false,
                 false,
             );
-            let v = 3 * n + 2;
+            // The newest frame also shows a vblank late (a composition DWM missed): neither its
+            // delay nor its latency moves the medians.
+            let v = 3 * n + 2 + u32::from(n == 8);
             shown.on_stats(Stats {
                 present_count: n + 1,
                 present_refresh: v,
