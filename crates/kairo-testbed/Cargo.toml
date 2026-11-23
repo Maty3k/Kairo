@@ -1,6 +1,6 @@
 [package]
 name = "kairo-testbed"
-description = "testbed.exe: pattern v1 on a chosen monitor, with a QPC log as ground truth (M1, research 16 §4)."
+description = "testbed.exe and kairo-tone.exe: pattern v1 and beeps on the QPC timeline, with logs as ground truth (M1, research 16 §4–5)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,12 @@ kairo-core = { workspace = true }
 kairo-display = { workspace = true }
 serde_json = { workspace = true }
 
+[[bin]]
+name = "kairo-tone"
+path = "src/bin/kairo-tone.rs"
+
 [target.'cfg(windows)'.dependencies]
+wasapi = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",             # handles, HWND, LUID, RECT
     "Win32_Graphics_Direct3D",      # driver types, feature levels
