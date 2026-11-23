@@ -497,6 +497,13 @@ pub enum Load {
     None,
 }
 
+/// Which of the load band's block rows holds a point `y_u_in_band` layout units below the band's
+/// top (rows outside the band take the nearest block row).
+fn load_block_row(y_u_in_band: f64) -> u64 {
+    let rows = (LOAD_U.1 - LOAD_U.0) / LOAD_BLOCK_U;
+    ((y_u_in_band / LOAD_BLOCK_U as f64).floor() as i64).clamp(0, rows - 1) as u64
+}
+
 /// The load band's sRGB codes at `x_u`, `y_u` layout units below the band's top, on frame
 /// `frame`.
 pub fn load_codes(x_u: f64, y_u_in_band: f64, frame: u64, load: Load) -> [u8; 3] {
@@ -508,10 +515,7 @@ pub fn load_codes(x_u: f64, y_u_in_band: f64, frame: u64, load: Load) -> [u8; 3]
             let col = ((x_u - shift) / LOAD_BLOCK_U as f64)
                 .floor()
                 .rem_euclid(LOAD_PERIOD_BLOCKS as f64) as u64;
-            let rows = (LOAD_U.1 - LOAD_U.0) / LOAD_BLOCK_U;
-            let row =
-                ((y_u_in_band / LOAD_BLOCK_U as f64).floor() as i64).clamp(0, rows - 1) as u64;
-            let key = (row << 16) | col;
+            let key = (load_block_row(y_u_in_band) << 16) | col;
             if load == Load::Churn {
                 key ^ (frame << 32)
             } else {
@@ -799,6 +803,29 @@ impl Scene {
     /// The bands' row ranges.
     pub fn bands(&self) -> &[Band] {
         &self.bands
+    }
+
+    /// `band`'s rows in runs that show the same pixels, in order and half-open: the whole band
+    /// for the bars and the ramp, one run per block row of the load texture. A renderer draws a
+    /// run's first row ([`Scene::band_row`]) and copies it down the run.
+    pub fn band_runs(&self, band: &Band) -> Vec<(i64, i64)> {
+        let BandKind::Load(_) = band.kind else {
+            return vec![(band.y0, band.y1)];
+        };
+        let h = self.size.height;
+        let block = |y| load_block_row(unit_of_pixel(y, h) - band.top_u as f64);
+        let mut runs = Vec::new();
+        let mut start = band.y0;
+        for y in band.y0 + 1..band.y1 {
+            if block(y) != block(start) {
+                runs.push((start, y));
+                start = y;
+            }
+        }
+        if start < band.y1 {
+            runs.push((start, band.y1));
+        }
+        runs
     }
 
     /// The sRGB codes of `band` on pixel row `y`, one per column.
@@ -1998,6 +2025,53 @@ mod tests {
                     want,
                     "{w}x{h} frame {frame} ({x}, {y})"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn band_runs_tile_each_band_with_rows_that_match() {
+        let cases = [
+            ((1_920, 1_080), 0, sdr(Pattern::Full, 60, 0, Load::Scroll)),
+            ((2_560, 1_440), 181, sdr(Pattern::Full, 180, 5, Load::Churn)),
+            ((1_280, 720), 77, sdr(Pattern::Motion, 60, 0, Load::Scroll)),
+            ((640, 361), 1_079, sdr(Pattern::Motion, 90, 0, Load::Scroll)),
+        ];
+        for ((w, h), frame, options) in cases {
+            let scene = Scene::new(Size::new(w, h).unwrap(), frame, &options).unwrap();
+            for band in scene.bands() {
+                let runs = scene.band_runs(band);
+                assert_eq!(runs.first().map(|r| r.0), Some(band.y0));
+                assert_eq!(runs.last().map(|r| r.1), Some(band.y1));
+                for pair in runs.windows(2) {
+                    assert_eq!(pair[0].1, pair[1].0, "{w}x{h} frame {frame}");
+                }
+                for &(y0, y1) in &runs {
+                    assert!(y0 < y1);
+                    let first = scene.band_row(band, y0);
+                    for y in y0 + 1..y1 {
+                        assert_eq!(
+                            scene.band_row(band, y),
+                            first,
+                            "{w}x{h} frame {frame} y {y}"
+                        );
+                    }
+                }
+                // Load runs are the texture's block rows: neighbours differ, and the band holds
+                // 12 of them unless the motion pattern's wrap splits it.
+                if let BandKind::Load(_) = band.kind {
+                    for pair in runs.windows(2) {
+                        assert_ne!(
+                            scene.band_row(band, pair[0].0),
+                            scene.band_row(band, pair[1].0)
+                        );
+                    }
+                    if band.y1 - band.y0 == px_y(LOAD_U.1, h) - px_y(LOAD_U.0, h) {
+                        assert_eq!(runs.len(), 12, "{w}x{h} frame {frame}");
+                    }
+                } else {
+                    assert_eq!(runs.len(), 1);
+                }
             }
         }
     }

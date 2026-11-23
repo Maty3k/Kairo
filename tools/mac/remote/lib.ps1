@@ -766,7 +766,12 @@ function Restart-WatchAgent {
     # "kairo-devrun watch" (and any "ensure") processes, never a "run" job or the "engine", and
     # start \Kairo\Ensure, which starts "kairo-devrun watch" from the new build.
     $stopped = 0
-    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'kairo-devrun.exe'" -ErrorAction SilentlyContinue)
+    # By name first, from the system's process list, which opens no process; then each kairo-devrun alone, by
+    # its WMI key, for its command line only, so no other process (a game) is ever opened (CLAUDE.md, Never 3).
+    $processes = @(Get-Process -Name 'kairo-devrun' -ErrorAction SilentlyContinue | ForEach-Object {
+            $query = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Handle = '{0}'" -f $_.Id
+            Get-CimInstance -Query $query -ErrorAction SilentlyContinue
+        })
     foreach ($process in $processes) {
         $commandLine = [string]$process.CommandLine
         if ($commandLine -notmatch '(^|\s)(watch|ensure)(\s|$)') { continue }
