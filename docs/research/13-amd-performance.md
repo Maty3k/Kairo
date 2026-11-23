@@ -634,6 +634,8 @@ $rows | Group-Object pid, type | ForEach-Object {
   Sort-Object avg -Descending | Format-Table -AutoSize
 ```
 
+**[Corrected] 2026-11-23** (research 17 §5.3): don't build on this sketch. PowerShell defines `$p.Path` as `$this.MainModule.FileName`, and `MainModule` opens the process with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and lists its modules. Against a game, that is a module list with memory-read rights, which CLAUDE.md bans (Never 3), and it prints a full path. One `Get-Counter -MaxSamples $Seconds` call also expands the wildcard only once, so a program that starts using an engine later goes unseen, and grouping by `pid, type` merges the two adapters. The built script, `tools/pc/bench/encoder-usage.ps1`, names processes from a `[Diagnostics.Process]::GetProcesses()` snapshot, reading only `Id` and `ProcessName`, keeps each adapter's LUID, and samples with one `-MaxSamples 1` call a second.
+
 ```rust
 // In-engine sampler. windows =0.62.2, feature "Win32_System_Performance". Signatures verified:
 // PdhOpenQueryW(PCWSTR, usize, *mut PDH_HQUERY) -> u32; PdhAddEnglishCounterW(PDH_HQUERY, PCWSTR, usize, *mut PDH_HCOUNTER) -> u32;
