@@ -244,8 +244,10 @@ impl Ctx<'_> {
             .and_then(|()| self.step(Phase::Testbed, Self::start_testbed))
             .and_then(|()| self.step(Phase::Warmup, Self::warm_up))
             .and_then(|()| self.step(Phase::Capture, Self::capture))
-            .and_then(|()| self.step(Phase::Stop, Self::stop))
-            .and_then(|()| self.step(Phase::Verify, Self::verify));
+            .and_then(|()| {
+                self.stop_phase();
+                self.step(Phase::Verify, Self::verify)
+            });
         match done {
             Ok(()) => outcome::verify(
                 self.report.verify.as_ref().and_then(|v| v.exit_code),
@@ -273,18 +275,25 @@ impl Ctx<'_> {
         self.report.phase(phase, seconds, how);
         // A capture that went wrong still stops the testbed cleanly, and says how that went.
         if result.is_err() && phase == Phase::Capture {
-            let start = Instant::now();
-            let _ = self.stop();
-            let killed = self.report.testbed.as_ref().is_some_and(|t| t.killed);
-            let how = if killed {
-                PhaseOutcome::Timeout
-            } else {
-                PhaseOutcome::Ok
-            };
-            self.report
-                .phase(Phase::Stop, start.elapsed().as_secs_f64(), how);
+            self.stop_phase();
         }
         result
+    }
+
+    /// Phase 4 and its record, the same after a good capture and a failed one: a stop that had
+    /// to kill the testbed or kairo-tone at its limit ran past it. The run goes on either way.
+    fn stop_phase(&mut self) {
+        let start = Instant::now();
+        self.stop();
+        let killed = self.report.testbed.as_ref().is_some_and(|t| t.killed)
+            || self.report.tone.as_ref().is_some_and(|t| t.killed);
+        let how = if killed {
+            PhaseOutcome::Timeout
+        } else {
+            PhaseOutcome::Ok
+        };
+        self.report
+            .phase(Phase::Stop, start.elapsed().as_secs_f64(), how);
     }
 
     /// Phase 0.
@@ -711,7 +720,7 @@ impl Ctx<'_> {
     /// Phase 4: standard input closes, so the testbed (and kairo-tone) end their logs; killed
     /// at the limit. A testbed alive through the capture is judged even if it was killed here:
     /// its log covers the clip.
-    fn stop(&mut self) -> Result<(), Outcome> {
+    fn stop(&mut self) {
         drop(self.testbed_stdin.take());
         drop(self.tone_stdin.take());
         let deadline = Instant::now() + Duration::from_secs(Phase::Stop.limit_s(0).into());
@@ -741,7 +750,6 @@ impl Ctx<'_> {
                 message,
             });
         }
-        Ok(())
     }
 
     /// What the testbed's end was.

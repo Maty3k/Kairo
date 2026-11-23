@@ -233,14 +233,16 @@ pub fn table(
             |s, _| Some(s == "pass"),
         ),
     ]);
+    // The B slices are counted over every frame, so a check failing on another rule (a reorder
+    // depth in the SPS, a ctts entry) doesn't touch these rows.
     for option in ["-bf 0", "-max_b_frames 0"] {
         rows.push(bitstream(
             report,
             option,
             "video.no_reorder",
             "no B slice",
-            Decides::Check,
-            |s, v| Some(s == "pass" && int(v, "b_samples")? == 0),
+            Decides::Stream,
+            |_, v| Some(int(v, "b_samples")? == 0),
         ));
     }
     rows.extend([
@@ -268,8 +270,8 @@ pub fn table(
             "-frame_skipping 0",
             "video.cfr",
             "one sample per tick",
-            Decides::Check,
-            |s, v| Some(s == "pass" && int(v, "irregular")? == 0),
+            Decides::Stream,
+            |_, v| Some(int(v, "irregular")? == 0),
         ),
         bitstream(
             report,
@@ -467,6 +469,24 @@ mod tests {
         let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
         assert_eq!(status(&rows, "-g 60"), Status::Failed);
         assert_eq!(status(&rows, "-header_spacing 60"), Status::Verified);
+        // video.no_reorder fails on the SPS's reorder depth with no B slice in the stream, and
+        // video.cfr on a rule other than the samples' spacing: the stream-wide counts decide.
+        let r = report(|r| {
+            r["checks"][2]["status"] = json!("fail");
+            r["checks"][2]["value"]["max_num_reorder_frames"] = json!(1);
+            r["checks"][3]["status"] = json!("fail");
+        });
+        let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
+        assert_eq!(status(&rows, "-bf 0"), Status::Verified);
+        assert_eq!(status(&rows, "-max_b_frames 0"), Status::Verified);
+        assert_eq!(status(&rows, "-frame_skipping 0"), Status::Verified);
+        // A check that stopped before counting leaves its rows unknown.
+        let r = report(|r| {
+            r["checks"][3]["status"] = json!("fail");
+            r["checks"][3]["value"] = json!({});
+        });
+        let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);
+        assert_eq!(status(&rows, "-frame_skipping 0"), Status::Unknown);
         // A passing check with no colour description is a failure too.
         let r = report(|r| r["checks"][0]["value"]["vui_colour"] = Value::Null);
         let rows = table(Some(&r), &LogCheck::default(), window(), 30, false);

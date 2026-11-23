@@ -911,10 +911,14 @@ JQ_VERIFY_FAILING='.checks[] | select(.status == "fail" or .status == "error") |
 # and the pending marker is gone; 7: found, and it stays a P0 until acknowledged; anything else:
 # still pending (5: the job still runs), with harness-events' own exit code.
 harness_check() {
-    local stamp=$1 since=$2 rc dir="$REPO_ROOT/.dogfood/harness/$1"
+    local stamp=$1 since=$2 rc max dir="$REPO_ROOT/.dogfood/harness/$1"
+    # The job's time limit bounds a job that ended without a result (0: not known).
+    max=$(/usr/bin/jq -r '.max_seconds // empty' "$REPO_ROOT/.dogfood/jobs/harness-$stamp.json" 2>/dev/null)
+    case "$max" in '' | *[!0-9]*) max=0 ;; esac
     pre_reset
     pre_str Id "harness-$stamp"
     pre_str Since "$since"
+    pre_int MaxSeconds "$max"
     run_ps harness-events
     rc=$?
     case "$rc" in
@@ -923,6 +927,7 @@ harness_check() {
         mv -f "$dir/tdr-pending" "$dir/tdr-p0" 2>/dev/null || printf '%s\n' "$since" >"$dir/tdr-p0"
         err "P0: a display-driver reset or an unexpected reboot during harness-$stamp: stop all PC work and report it to the owner (read-only follow-up: pc logs harness-$stamp); after the owner's OK, pc harness events --ack $stamp"
         ;;
+    *) err "the reset check for harness-$stamp is still pending (exit $rc): pc harness events runs it again" ;;
     esac
     return "$rc"
 }
@@ -1114,8 +1119,13 @@ harness_capture() {
     run_rc=$?
     started=$(kv_get started)
     if [ -z "$started" ]; then
-        # Refused before the job started (bad job, busy, unknown): nothing to check or fetch.
-        case "$run_rc" in 2 | 3 | 4) rm -f "$dir/tdr-pending" ;; esac
+        # Refused before \Kairo\Run took the job (bad job, busy, unknown, or run.ps1's exit 1: the
+        # task missing, disabled or running another job): nothing ran, so nothing to check or
+        # fetch. Without an answer (ssh's 255) the job may have started, so the check stays.
+        case "$run_rc" in
+        1 | 2 | 3 | 4) rm -f "$dir/tdr-pending" ;;
+        *) err "harness capture: no answer from the PC (exit $run_rc), so $id may have started: its reset check is pending (pc harness events)" ;;
+        esac
         return "$run_rc"
     fi
     printf '%s\n' "$started" >"$dir/tdr-pending"
@@ -1143,10 +1153,19 @@ harness_capture() {
     pre_list Files harness.json verify.json verify.txt
     run_ps harness-fetch
     rc=$?
-    if [ "$rc" != 0 ]; then
+    case "$rc" in
+    0) ;;
+    3 | 4)
+        # The job ran; the PC turned busy (or its state unknown) between its end and the fetch.
+        err "harness capture: $id ran (job exit $run_rc), but the PC was no longer free for the fetch, so its reports stay on the PC; pc logs $id shows the job's result"
+        [ "$final" -ne 0 ] || final=1
+        return "$final"
+        ;;
+    *)
         err "harness capture: the reports couldn't be fetched (exit $rc); pc logs $id shows the job's result"
         return "$rc"
-    fi
+        ;;
+    esac
     harness_keep "$dir" harness_json harness.json '.kairo_harness == 1'
     harness_keep "$dir" verify_json verify.json '.kairo_verify == 1'
     harness_keep "$dir" verify_txt verify.txt ''

@@ -10,7 +10,7 @@
 # job never passes off an earlier run's file. Nothing in the logs folder is created, renamed or
 # deleted. Refuses while the PC is busy unless --force.
 
-Assert-PcIdle 'harness'
+Assert-PcIdle 'harness fetch'
 
 $id = [string]$Pc['Id']
 if ($id -cnotmatch $JobIdRegex) { Fail 'the id must match ^[A-Za-z0-9_-]{1,64}$' 2 }
