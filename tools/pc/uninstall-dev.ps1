@@ -110,11 +110,20 @@ function Remove-KairoTasks {
 
 function Stop-KairoProcesses {
     # Programs started from C:\kairo (the watch agent, test windows) keep running after their task is gone.
+    # Kairo's programs are kairo*.exe and testbed.exe (the M1 contract), so they are found by name: the names
+    # come from the system's process list and open no process. A process's .Path would open every running
+    # process, games included, with memory-read rights and list its modules (CLAUDE.md, Never 3). Each one
+    # found is then looked up alone, by its WMI key, for its path only, so no other process is opened.
     $prefix = $KairoRoot + '\'
     $stopped = 0
-    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
+    foreach ($proc in @(Get-Process -Name 'kairo*', 'testbed' -ErrorAction SilentlyContinue)) {
         $path = $null
-        try { $path = $proc.Path } catch { $path = $null }
+        try {
+            $query = "SELECT ExecutablePath FROM Win32_Process WHERE Handle = '{0}'" -f $proc.Id
+            $path = (Get-CimInstance -Query $query -ErrorAction Stop).ExecutablePath
+        } catch {
+            $path = $null
+        }
         if ($path -and $path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop; $stopped++ } catch { Write-Note ('Could not stop {0}: {1}' -f $path, $_.Exception.Message) }
         }

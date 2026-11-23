@@ -123,7 +123,7 @@ $SshShellArguments = '/d'          # interactive logins (DefaultShellArguments, 
 #   default since 7.6.0, whose pwsh.exe has no fixed path, so '--installer-type wix' picks the MSI that puts
 #   pwsh.exe in C:\Program Files\PowerShell\7, where tools/mac/pc starts it over SSH; 7.7 will ship no MSI,
 #   hence the pin); LLVM.LLVM 23.1.4 (MSI);
-#   Rustlang.Rustup 1.29.1; OpenJS.NodeJS.LTS (MSI and zip; '--installer-type wix' picks the MSI with corepack);
+#   Rustlang.Rustup 1.29.1; OpenJS.NodeJS.24 (MSI; '--installer-type wix' picks it, with corepack);
 #   Microsoft.VisualStudio.BuildTools 18.x is "Visual Studio BuildTools 2026" (2022 is the separate ID
 #   Microsoft.VisualStudio.2022.BuildTools).
 $PwshVersion = '7.6.7.0'
@@ -147,9 +147,10 @@ $VsSqmPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM'
 $RustToolchain  = '1.99.1'
 $RustupOverride = '-y --default-host x86_64-pc-windows-msvc --default-toolchain {0} --profile minimal --component clippy,rustfmt' -f $RustToolchain
 
-# Node.js 24 LTS. nodejs.org lists v24.22.1 (2026-10-20, LTS "Krypton"); winget-pkgs had OpenJS.NodeJS.LTS only
-# up to 24.20.0 on 2026-10-21, and that ID moves to Node 26 when 26 becomes LTS. So the major is pinned and the
-# script takes 24.22.1 if winget has it, else the newest 24.x that winget offers.
+# Node.js 24 LTS. nodejs.org lists v24.22.1 (2026-10-20, LTS "Krypton"). winget's OpenJS.NodeJS.LTS moved to
+# Node 26 (by 2026-11-22 it held only 26.13.0), so the script uses the major's own ID, OpenJS.NodeJS.24 (24.19.0
+# to 24.22.3 then, each with a machine-scope MSI): 24.22.1 if winget has it, else the newest 24.x it offers.
+$NodeWingetId  = 'OpenJS.NodeJS.24'
 $NodeMajor     = 24
 $NodePreferred = '24.22.1'
 
@@ -1374,7 +1375,7 @@ function Select-NodeVersion {
     # Newest Node.js 24.x that winget offers, preferring the plan's pin.
     $found = @{}
     try {
-        $r = Invoke-Native -FilePath $Ctx.Winget -ArgumentList @('show', '--id', 'OpenJS.NodeJS.LTS', '--exact', '--source', 'winget',
+        $r = Invoke-Native -FilePath $Ctx.Winget -ArgumentList @('show', '--id', $NodeWingetId, '--exact', '--source', 'winget',
             '--versions', '--accept-source-agreements', '--disable-interactivity')
         $pattern = '(?<![\d.]){0}\.\d+\.\d+(?![\d.])' -f $NodeMajor
         foreach ($m in [regex]::Matches($r.Text, $pattern)) { $found[$m.Value] = $true }
@@ -1394,7 +1395,7 @@ function Install-Node {
     $current = Get-NodeVersion
     if ($current -and (Get-NodeMajor) -eq $NodeMajor) { return ('already installed: Node.js ' + $current) }
     $version = Select-NodeVersion
-    $res = Install-WingetPackage -Id 'OpenJS.NodeJS.LTS' -Version $version -ExtraArgs @('--installer-type', 'wix', '--scope', 'machine')
+    $res = Install-WingetPackage -Id $NodeWingetId -Version $version -ExtraArgs @('--installer-type', 'wix', '--scope', 'machine')
     if ((Get-NodeMajor) -ne $NodeMajor) { throw ('Node.js {0} is not installed (winget exit code {1}).' -f $NodeMajor, $res.Code) }
     return ('Node.js ' + (Get-NodeVersion))
 }
@@ -2052,7 +2053,7 @@ function Show-Plan($Facts, $State, $OwnerInfo, $KeyInfo) {
         @($State.BuildTools, 'Visual Studio Build Tools 2026 with the C++ tools and the Windows 11 SDK (about 7 GB; 10-25 minutes)'),
         @($State.Llvm, 'LLVM / clang (LLVM.LLVM) - Rust needs its libclang to read FFmpeg''s headers'),
         @($State.Rustup, ('Rust: rustup (Rustlang.Rustup), then Rust {0}' -f $RustToolchain)),
-        @($State.Node, ('Node.js {0} LTS (OpenJS.NodeJS.LTS), then pnpm {1} through corepack' -f $NodeMajor, $PnpmVersion))
+        @($State.Node, ('Node.js {0} LTS ({1}), then pnpm {2} through corepack' -f $NodeMajor, $NodeWingetId, $PnpmVersion))
     )
     foreach ($item in $items) {
         if ($item[0]) { Write-Note ('[already there] ' + $item[1]) } else { Write-Note ('[install] ' + $item[1]) }
