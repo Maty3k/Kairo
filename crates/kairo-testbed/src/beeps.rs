@@ -247,9 +247,11 @@ impl InOrder {
         self.settled.insert(played.beep.index, played);
     }
 
-    /// Every beep left when the stream stopped at `stop_hns`, in order: settled ones as they
-    /// settled, and ones the stream never reported as unplayed. An unplayed beep that wasn't due
-    /// until after the stop is left out: it was never meant to play yet.
+    /// Every beep left when the run stopped at `stop_hns`, in order: settled ones as they
+    /// settled, and ones the stream never reported as unplayed. A beep due after the stop is
+    /// left out, even one the stream started in its last moments: it was never meant to play
+    /// yet, and the stream cut it short. A beep under way at the stop is logged as played, and
+    /// may have been cut short too.
     pub fn rest(&mut self, stop_hns: i64) -> Vec<Played> {
         let mut out = std::mem::take(&mut self.settled);
         for (index, beep) in std::mem::take(&mut self.sent) {
@@ -259,7 +261,7 @@ impl InOrder {
             });
         }
         out.into_values()
-            .filter(|p| p.played_hns.is_some() || p.beep.target_hns <= stop_hns)
+            .filter(|p| p.beep.target_hns <= stop_hns)
             .collect()
     }
 }
@@ -442,6 +444,20 @@ mod tests {
             .map(|p| (p.beep.index, p.played_hns))
             .collect();
         assert_eq!(rest, [(1, Some(101)), (2, None)]);
+        // A beep the stream started in its last moments, after the stop, is left out too: it
+        // wasn't due, and the stream cut it short.
+        let mut order = InOrder::default();
+        for (i, t) in [(1, 100), (2, 260)] {
+            order.sent(beep(i, t));
+        }
+        for (i, t) in [(1, 100), (2, 260)] {
+            order.hold(Played {
+                beep: beep(i, t),
+                played_hns: Some(t),
+            });
+        }
+        let rest: Vec<u64> = order.rest(250).iter().map(|p| p.beep.index).collect();
+        assert_eq!(rest, [1]);
     }
 
     #[test]

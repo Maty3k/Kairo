@@ -701,8 +701,10 @@ fn vsync_loop(ctx: &mut Ctx<'_>, k: u32) -> Result<(), Stop> {
     let blocking = ctx.config.mode == Mode::Exclusive;
     let mut pacer = VsyncPacer::new(k, ctx.period, start, blocking);
     let result = vsync_frames(ctx, &mut pacer);
+    // The run stopped when the loop did: beeps for flashes it never drew aren't due.
+    let stopped = platform::now_hns();
     ctx.settle(pacer.shown(), Miss::Vblank);
-    ctx.stop_beeps(platform::now_hns());
+    ctx.stop_beeps(stopped);
     result
 }
 
@@ -813,8 +815,9 @@ fn timer_loop(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
     let mut pacer = TimerPacer::new(pace::next_whole_second(platform::now_hns()), ctx.fps);
     let mut shown = Shown::new(None, ctx.period);
     let result = timer_frames(ctx, &mut pacer, &mut shown);
+    let stopped = platform::now_hns();
     ctx.settle(&mut shown, Miss::Slot);
-    ctx.stop_beeps(platform::now_hns());
+    ctx.stop_beeps(stopped);
     result
 }
 

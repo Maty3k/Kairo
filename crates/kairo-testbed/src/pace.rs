@@ -71,6 +71,16 @@ const COMPOSED_LATENCY: i64 = 1;
 /// gap: this bounds how long that can be, to 89 ms at 180 Hz. A longer gap stays unknown.
 const FILL_IN_MAX_VBLANKS: i64 = 16;
 
+/// How many recent frames set the present delay and latency a timer beep is aimed by.
+const RECENT: usize = 16;
+
+/// The median of `values`, the upper one of an even count; 0 for none.
+fn median(values: impl Iterator<Item = i64>) -> i64 {
+    let mut v: Vec<i64> = values.collect();
+    v.sort_unstable();
+    v.get(v.len() / 2).copied().unwrap_or(0)
+}
+
 /// How far a grid's vblank times may have drifted, per unit of its age, at most a quarter of a
 /// period: a panel can run a few hundred ppm off the rate it reports. It loosens only the resume
 /// bound, an upper bound, so a fast panel's take isn't pulled below its real vblank. The
@@ -331,6 +341,9 @@ pub struct Shown {
     /// fullscreen can still be composed (fullscreen optimizations, with an overlay up) while it
     /// says it is in full screen, which `max_latency` alone would read as a late frame.
     first_by_resume: bool,
+    /// The newest frames reported, up to [`RECENT`], that made their slot: how long after it
+    /// each was presented, and how long after the first vblank following its present it showed.
+    recent: VecDeque<(i64, i64)>,
     presents: Widen,
     shown_vblanks: Widen,
     sync_vblanks: Widen,
@@ -350,6 +363,7 @@ impl Shown {
             stale: false,
             max_latency: COMPOSED_LATENCY,
             first_by_resume: false,
+            recent: VecDeque::new(),
             presents: Widen::default(),
             shown_vblanks: Widen::default(),
             sync_vblanks: Widen::default(),
@@ -366,21 +380,18 @@ impl Shown {
         self.last_shown
     }
 
-    /// How long after its slot the newest frame reported was presented (timer pacing: the wait
-    /// and the call itself); 0 before a report.
+    /// How long after its slot a frame is presented (timer pacing: the wait and the call
+    /// itself), as the recent frames that made their slot show it: their median, so one late
+    /// return doesn't move a beep. 0 before a report.
     pub fn present_delay_hns(&self) -> i64 {
-        self.last_shown
-            .map_or(0, |r| (r.present_hns - r.target_hns).max(0))
+        median(self.recent.iter().map(|&(delay, _)| delay))
     }
 
-    /// The display's latency, from the newest frame reported: how long after the first vblank
-    /// following its present it showed (a composed window shows a frame a vblank after it
-    /// takes it). 0 before a report.
+    /// The display's latency, as the recent frames that made their slot show it: how long after
+    /// the first vblank following its present each showed (a composed window shows a frame a
+    /// vblank after it takes it), their median. 0 before a report.
     pub fn latency_hns(&self) -> i64 {
-        match (self.last_shown, self.grid) {
-            (Some(r), Some(g)) => (r.shown_hns - g.time_of(g.next_after(r.present_hns))).max(0),
-            _ => 0,
-        }
+        median(self.recent.iter().map(|&(_, latency)| latency))
     }
 
     /// The statistics went away and came back (`DXGI_ERROR_FRAME_STATISTICS_DISJOINT`, as after
@@ -555,6 +566,14 @@ impl Shown {
                 .max(grid.next_after(p.queued_hns))
                 .min(shown_v);
             out.push(resolved(p, Some(shown_t), late));
+            if !p.missed && !late {
+                let delay = (p.present_hns - p.target_hns).max(0);
+                let latency = (shown_t - grid.time_of(grid.next_after(p.present_hns))).max(0);
+                if self.recent.len() == RECENT {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back((delay, latency));
+            }
             self.last_shown = Some(Reported {
                 frame: p.frame,
                 vblank: shown_v,
@@ -848,6 +867,15 @@ impl VsyncPacer {
     pub fn predict(&self, frame: u64) -> Option<i64> {
         let grid = self.grid()?;
         let (previous, taken) = self.last_taken()?;
+        // The frame just drawn was taken after its target: next() will number the frames after
+        // it from that take, which counting k vblanks a frame can't foresee. Aim from the next
+        // pass, once it has.
+        if self
+            .last
+            .is_some_and(|d| taken - d.target_hns > self.period.times(1) / 2)
+        {
+            return None;
+        }
         let ahead = i64::try_from(frame).ok()? - i64::try_from(previous).ok()?;
         let latency = self.shown.latency_vblanks().unwrap_or(0).max(0);
         let taken_v = grid.at_or_after(taken - self.period.times(1) / 2);
@@ -1202,6 +1230,9 @@ mod tests {
         run_loop_with(wait, k, frames, d, start, wake, slow, Loop::default())
     }
 
+    /// A look at the pacer after a frame is presented.
+    type AfterPresent = Box<dyn FnMut(&VsyncPacer, u64)>;
+
     /// What else a test loop does.
     #[derive(Default)]
     struct Loop {
@@ -1220,6 +1251,12 @@ mod tests {
         untold: bool,
         /// The first pass at or after this time (QPC) starts this much later.
         late_pass: Option<(i64, i64)>,
+        /// Called after each frame is presented, with the pacer and the frame: what a beep
+        /// aimed in that pass would see.
+        after_present: Option<AfterPresent>,
+        /// How much longer than usual frame n's draw takes, delaying its Present after the
+        /// pacer planned it (a thread preempted mid-draw).
+        draw_late: Option<Box<dyn Fn(u64) -> i64>>,
     }
 
     /// [`run_loop`], with `extra`.
@@ -1293,15 +1330,20 @@ mod tests {
                     skipped: s,
                 } => {
                     skipped.extend(s);
+                    let late = extra.draw_late.as_ref().map_or(0, |f| f(frame));
+                    let queued = queued.max(now + late);
                     // Present is called just before the frame is queued, and returns 1,000 hns
                     // after (blocking: once the frame before it is taken).
                     let call = match wait {
                         Wait::Waitable => queued,
-                        Wait::Blocking => now,
+                        Wait::Blocking => now + late,
                     };
                     let id = d.present(queued, i64::from(pacer.interval()), slow(frame));
                     let read = queued + 1_000 + extra.read_late.as_ref().map_or(0, |f| f(frame));
                     pacer.presented(frame, target_hns, id, call, read);
+                    if let Some(f) = extra.after_present.as_mut() {
+                        f(&pacer, frame);
+                    }
                     last_presented = Some(frame);
                     drawn += 1;
                 }
@@ -2345,8 +2387,80 @@ mod tests {
             sync_refresh: 4,
             sync_hns: HZ180.times(4),
         });
-        // Frame 1 showed at vblank 4 (taken at 3, a vblank late): frame 180 at 3 + 2 × 179 + 1.
-        assert!(near(pacer.predict(180).unwrap(), HZ180.times(362)));
+        // Frame 1 showed at vblank 4, taken at 3, a vblank after its target: the next frame is
+        // numbered from that take, so nothing is predicted until it is drawn.
+        assert_eq!(pacer.predict(180), None);
+        let Step::Frame {
+            frame, target_hns, ..
+        } = pacer.next(HZ180.times(4) + 1)
+        else {
+            panic!("warm-up")
+        };
+        // Aimed at vblank 5, in group 3: frame 2 is passed over, and frame 180 shows at
+        // 5 + 2 × 177 + 1.
+        assert_eq!((frame, near(target_hns, HZ180.times(5))), (3, true));
+        pacer.presented(3, target_hns, 3, HZ180.times(4) + 2, HZ180.times(4) + 2);
+        assert!(near(pacer.predict(180).unwrap(), HZ180.times(360)));
+    }
+
+    #[test]
+    fn a_beep_is_never_aimed_from_a_frame_presented_late() {
+        // One frame's draw runs a whole frame long (a thread preempted), so it is presented
+        // after its vblank, taken a vblank or more late, and the frames after it are numbered
+        // from that take. In that pass nothing is predicted; in every pass after it the flash's
+        // prediction is where it shows, at k = 1-4. (Those before it couldn't know of the miss.)
+        for k in [1, 2, 3, 4] {
+            let flash = (180 / k) as u64;
+            let late_frame = flash / 2;
+            let predictions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = predictions.clone();
+            let extra = Loop {
+                after_present: Some(Box::new(move |pacer: &VsyncPacer, frame: u64| {
+                    seen.borrow_mut().push((frame, pacer.predict(flash)));
+                })),
+                draw_late: Some(Box::new(
+                    move |n| {
+                        if n == late_frame { HZ180.times(k) } else { 0 }
+                    },
+                )),
+                ..Loop::default()
+            };
+            let d = Display::new(0, 0);
+            let run = run_loop_with(
+                Wait::Waitable,
+                k,
+                (400 / k) as usize,
+                d,
+                2 * HNS_PER_SECOND / 10,
+                |_| 20_000,
+                |_| 0,
+                extra,
+            );
+            let shown = run
+                .out
+                .iter()
+                .find(|r| r.record.frame == flash)
+                .and_then(|r| r.record.display_hns)
+                .unwrap();
+            let predictions = predictions.borrow();
+            let missed: Vec<u64> = predictions
+                .iter()
+                .filter(|(_, p)| p.is_none())
+                .map(|(f, _)| *f)
+                .collect();
+            assert_eq!(missed.len(), 1, "k {k}: {missed:?}");
+            for &(frame, p) in predictions
+                .iter()
+                .filter(|(f, _)| *f > late_frame && *f < flash)
+            {
+                if let Some(p) = p {
+                    assert!(
+                        near(p, shown),
+                        "k {k}: frame {frame} predicted {p}, shown {shown}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2521,6 +2635,36 @@ mod tests {
         // Frames passed over aren't late; the slot it missed stays marked.
         let missed: Vec<bool> = out.iter().map(|r| r.missed).collect();
         assert_eq!(missed, [false, false, true, false]);
+    }
+
+    #[test]
+    fn a_timer_beep_is_aimed_by_the_recent_frames_not_the_newest() {
+        // 60 fps on 180 Hz, each frame presented 3,000 hns after its slot and shown at the next
+        // vblank but one (composed), except the newest, whose Present returned 25,000 hns late:
+        // the delay and the latency a beep is aimed by are the recent frames' medians.
+        let mut shown = Shown::new(None, HZ180);
+        for n in 0..9_u32 {
+            let slot = HZ180.times(3 * i64::from(n));
+            let late = if n == 8 { 25_000 } else { 3_000 };
+            shown.presented(
+                u64::from(n),
+                slot,
+                n + 1,
+                slot + late,
+                slot + late,
+                false,
+                false,
+            );
+            let v = 3 * n + 2;
+            shown.on_stats(Stats {
+                present_count: n + 1,
+                present_refresh: v,
+                sync_refresh: v,
+                sync_hns: HZ180.times(i64::from(v)),
+            });
+        }
+        assert_eq!(shown.present_delay_hns(), 3_000);
+        assert!(near(shown.latency_hns(), HZ180.times(1)));
     }
 
     #[test]
