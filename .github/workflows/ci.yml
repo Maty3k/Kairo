@@ -84,6 +84,15 @@ jobs:
             exit 1
           fi
 
+      # Research 17 section 6: the bench scripts' tests and the scans of tools/**/*.ps1, under the
+      # runner's preinstalled PowerShell 7. run-all.ps1 runs each test file in its own process and
+      # exits 1 if one fails.
+      - name: Bench script tests and scans (tools/pc/bench/tests, PowerShell 7)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File tools/pc/bench/tests/run-all.ps1
+          exit $LASTEXITCODE
+
       - name: shellcheck (tools/mac)
         run: shellcheck tools/mac/pc tools/mac/keychain-askpass tools/mac/*.sh
 
@@ -268,6 +277,15 @@ jobs:
             }
           }
           if ($bad -gt 0) { exit 1 }
+
+      # Research 17 section 6: the bench scripts' tests and the scans of tools/**/*.ps1 under pwsh 7,
+      # the PowerShell the PC's elevated session runs them in. run-all.ps1 runs each test file in its
+      # own process and exits 1 if one fails.
+      - name: Bench script tests and scans (tools/pc/bench/tests, PowerShell 7)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File tools/pc/bench/tests/run-all.ps1
+          exit $LASTEXITCODE
 
       # Read-only; this also compiles the bootstrap's Add-Type C# block. Both scripts run from
       # RUNNER_TEMP: in the checkout, rust-toolchain.toml would make rustup download the toolchain.
