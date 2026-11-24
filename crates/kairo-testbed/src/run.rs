@@ -11,7 +11,7 @@
 //! the log.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,18 +23,22 @@ use kairo_core::testbed_log::{
 use kairo_core::testsig::{BEEP_PEAK_DBFS, Options, PATTERN_VERSION, Patches, Scene, Size, Tone};
 use kairo_core::timeline::HNS_PER_SECOND;
 use kairo_display::DisplayTarget;
+use kairo_window::gpu::{Gpu, HdrWatch, PresentError};
+use kairo_window::platform::{self, Frame, KeepDisplayOn, LockWait, Window};
 
 use crate::audio::{Audio, Report};
 use crate::beeps::{BEEP_HNS, Beep, InOrder, LEAD_HNS, Played};
 use crate::cli::{self, Config, Hdr, exit};
 use crate::draw::{self, Format, Plan};
-use crate::gpu::{Chain, Gpu, HdrWatch, Pacing, PresentError, Statistics, VblankClock};
+use crate::gpu::{Chain, Pacing, Statistics, VblankClock};
 use crate::pace::{self, Period, Resolved, Shown, Step, TimerPacer, VsyncPacer};
-use crate::platform::{self, Frame, KeepDisplayOn, Timer, Window};
+use crate::platform::Timer;
 use crate::ready::Ready;
 
-/// How long `--activate` keeps asking for the foreground (README §4.1).
-const ACTIVATE_FOR: Duration = Duration::from_secs(10);
+/// The window's class name.
+const WINDOW_CLASS: &str = "KairoTestbed";
+/// The window's title (M1's contract: "Its window is 'Kairo testbed'").
+const WINDOW_TITLE: &str = "Kairo testbed";
 /// How long the vsync loop waits for DXGI's frame statistics before it takes its vblanks from
 /// the monitor's own clock.
 const WARMUP_LIMIT_HNS: i64 = 3 * HNS_PER_SECOND;
@@ -310,8 +314,8 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
             rect.height() as i32,
         ),
     };
-    let window =
-        Window::create(frame, left, top, width, height).map_err(|e| Stop(exit::DEVICE, e))?;
+    let window = Window::create(WINDOW_CLASS, WINDOW_TITLE, frame, left, top, width, height)
+        .map_err(|e| Stop(exit::DEVICE, e))?;
     if config.mode == Mode::Windowed {
         // The framed window, still hidden, must sit inside the monitor, so the pattern never
         // spills onto a neighbour, which may be the OLED (README §4.11).
@@ -349,13 +353,13 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     let _display = KeepDisplayOn::new();
     let stdin_eof = Arc::new(AtomicBool::new(false));
     if config.stop_on_stdin_eof {
-        watch_stdin(Arc::clone(&stdin_eof));
+        kairo_window::stdin::watch_eof(Arc::clone(&stdin_eof));
     }
     if config.activate {
         if !wait_for_foreground_lock(&window, &stdin_eof, log) {
             return Ok(());
         }
-        let ok = take_foreground(&window);
+        let ok = platform::take_foreground(&window);
         log.event("activate", &[("result", if ok { "ok" } else { "failed" })]);
         if !ok {
             return Err(Stop(
@@ -372,9 +376,15 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
         (Pace::Vsync, Mode::Exclusive) => Pacing::Blocking,
         (Pace::Vsync, _) => Pacing::Waitable,
     };
-    let mut chain = gpu
-        .swap_chain(window.hwnd(), size.width(), size.height(), format, pacing)
-        .map_err(|e| Stop(exit::DEVICE, e))?;
+    let mut chain = Chain::new(
+        &gpu,
+        window.hwnd(),
+        size.width(),
+        size.height(),
+        format,
+        pacing,
+    )
+    .map_err(|e| Stop(exit::DEVICE, e))?;
     if config.mode == Mode::Exclusive {
         let entered = chain.enter_fullscreen();
         let result = if entered.is_ok() { "ok" } else { "failed" };
@@ -425,53 +435,19 @@ fn go(config: &Config, log: &mut Log) -> Result<(), Stop> {
     }
 }
 
-/// Reads standard input to its end, then sets `eof` (`--stop-on-stdin-eof`).
-fn watch_stdin(eof: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buffer = [0_u8; 256];
-        while let Ok(n) = stdin.read(&mut buffer) {
-            if n == 0 {
-                break;
-            }
-        }
-        eof.store(true, Ordering::Relaxed);
-    });
-}
-
 /// Waits until the session's last input is older than the foreground lock time-out plus 5 s
-/// (README §4.1). `false` if the run was closed or stopped meanwhile.
+/// (README §4.1). `false` if the run was closed or stopped meanwhile, with the log's end reason.
 fn wait_for_foreground_lock(window: &Window, stdin_eof: &AtomicBool, log: &mut Log) -> bool {
-    loop {
-        window.pump();
-        if platform::close_requested() {
+    match platform::wait_for_foreground_lock(window, stdin_eof) {
+        LockWait::Ready => true,
+        LockWait::Closed => {
             log.end_reason = "close";
-            return false;
+            false
         }
-        if stdin_eof.load(Ordering::Relaxed) {
+        LockWait::StdinEof => {
             log.end_reason = "stdin";
-            return false;
+            false
         }
-        let need = u64::from(platform::foreground_lock_timeout_ms()) + 5_000;
-        if u64::from(platform::idle_ms()) >= need {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// Asks for the foreground for up to [`ACTIVATE_FOR`]; never with input.
-fn take_foreground(window: &Window) -> bool {
-    let until = std::time::Instant::now() + ACTIVATE_FOR;
-    loop {
-        if window.take_foreground() {
-            return true;
-        }
-        window.pump();
-        if std::time::Instant::now() >= until {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

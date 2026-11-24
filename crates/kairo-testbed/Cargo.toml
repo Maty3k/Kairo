@@ -15,6 +15,7 @@ path = "src/bin/testbed.rs"
 [dependencies]
 kairo-core = { workspace = true }
 kairo-display = { workspace = true }
+kairo-window = { workspace = true }
 serde_json = { workspace = true }
 
 [[bin]]
@@ -23,22 +24,15 @@ path = "src/bin/kairo-tone.rs"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = { workspace = true }
+# The window, the device on the adapter, QPC and the foreground wait are kairo-window's.
 windows = { workspace = true, features = [
-    "Win32_Foundation",             # handles, HWND, LUID, RECT
-    "Win32_Graphics_Direct3D",      # driver types, feature levels
-    "Win32_Graphics_Direct3D11",    # the device, textures, clears and copies
-    "Win32_Graphics_Dxgi",          # factory, adapter by LUID, outputs, vblanks, swap chain
+    "Win32_Foundation",             # HWND, RECT, handles
+    "Win32_Graphics_Direct3D",      # WARP, in the tests
+    "Win32_Graphics_Direct3D11",    # textures, clears and copies
+    "Win32_Graphics_Dxgi",          # the swap chain, its statistics, vblanks
     "Win32_Graphics_Dxgi_Common",   # formats, colour spaces
-    "Win32_Graphics_Gdi",           # HMONITOR, the black brush, ClientToScreen
     "Win32_Security",               # CreateWaitableTimerExW's attributes
-    "Win32_System_LibraryLoader",   # GetModuleHandleW
-    "Win32_System_Performance",     # QPC
-    "Win32_System_Power",           # ES_DISPLAY_REQUIRED
-    "Win32_System_SystemInformation", # GetTickCount
-    "Win32_System_Threading",       # the timer, waits, EcoQoS
-    "Win32_UI_HiDpi",               # the framed window's size at its DPI
-    "Win32_UI_Input_KeyboardAndMouse", # GetLastInputInfo (the session's idle time only)
-    "Win32_UI_WindowsAndMessaging", # the window, its messages, the foreground
+    "Win32_System_Threading",       # the timer and its wait
 ] }
 
 [lints]
