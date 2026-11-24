@@ -13,10 +13,14 @@
 //! grey patches (`content.levels`, `hdr.curve_levels`), and in each audio track's (L+R)/2 the
 //! beeps, against the pictures and each other: `av.offset`, `av.offset_tight`,
 //! `av.inter_track`, `audio.tone_snr`, `audio.routing` and `audio.cue` (README §6.3–6.4).
-//! `source.stability`, which reads the testbed log, comes with research 16's PR 8: until then
-//! `capture` and `engine` clips that show the pattern end in `error`; `test`, `smoke` and the
-//! exports are judged on what runs, and so are clips without the pattern, such as a real game
-//! clip. A required check that can't be computed (no barcode line, a decoder that didn't start)
+//! With the testbed's log (`--testbed-log`) and `kairo-tone`'s (`--voice-log`), the rates, the
+//! run tag and the HDR levels come from the log, the events the testbed's own misses explain
+//! are set aside, `source.stability` judges the testbed, and A/V is exact where the log has
+//! display times (README §6.3). Without a testbed
+//! log `source.stability` can't run, so `capture` and `engine` clips that show the pattern end
+//! in `error`; `test`, `smoke` and the exports are judged on what runs, and so are clips without
+//! the pattern, such as a real game clip. [`logsum`] judges a testbed or tone log itself
+//! against README §4.12's acceptance rules (`kairo-verify log`). A required check that can't be computed (no barcode line, a decoder that didn't start)
 //! is an `error`, never a pass; a clip whose testbed frame never advances fails
 //! `cadence.drops_dups`.
 //!
@@ -46,6 +50,7 @@ pub mod decode;
 pub mod expect;
 pub mod h264;
 pub mod ipcm;
+pub mod logsum;
 pub mod mp4;
 pub mod mutate;
 pub mod profile;

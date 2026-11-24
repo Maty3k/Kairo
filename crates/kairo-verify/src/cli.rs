@@ -23,6 +23,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use kairo_core::testbed_log::{TestbedLog, ToneLog};
 use kairo_core::testsig::Curve;
 
 use crate::corpus::Encoder;
@@ -36,9 +37,11 @@ use crate::{Clip, boxes};
 #[cfg(feature = "dev-tools")]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
+                    [--testbed-log FILE [--voice-log FILE]]
                     [--cue FILE.wav] [--av-tight] [--voice-included]
                     [--decoder linked|cli|none] [--ffmpeg PATH] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
+       kairo-verify log <testbed.log|tone.log> [--json FILE|-]
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify synth --preset 1080p60|1440p60|WxH@fps [--source-hz 180] [--seconds 30]
@@ -61,8 +64,10 @@ linked LGPL FFmpeg on Windows; elsewhere, without --ffmpeg, only the structure i
 #[cfg(not(feature = "dev-tools"))]
 pub const USAGE: &str =
     "usage: kairo-verify check <clip.mp4> --profile PROFILE [--gate m3] [--expect FILE]
+                    [--testbed-log FILE [--voice-log FILE]]
                     [--decoder linked|none] [--json FILE|-] [--summary FILE|-]
        kairo-verify boxes <clip.mp4>
+       kairo-verify log <testbed.log|tone.log> [--json FILE|-]
        kairo-verify mutate undo-faststart|add-elst|set-colr P T M R|remove-colr
                            |set-default TRACK|perturb-stts S D  IN OUT
        kairo-verify --version | --help
@@ -91,8 +96,15 @@ enum Command {
         cue: Option<PathBuf>,
         av_tight: bool,
         voice_included: bool,
+        testbed_log: Option<PathBuf>,
+        voice_log: Option<PathBuf>,
     },
     Boxes(PathBuf),
+    /// `log FILE [--json FILE|-]`: a testbed or tone log's summary.
+    Log {
+        file: PathBuf,
+        json: Option<Output>,
+    },
     Mutate {
         op: Op,
         input: PathBuf,
@@ -182,18 +194,6 @@ fn safe_word(word: &str) -> bool {
     word.len() <= 32 && !word.contains(['/', '\\', ':']) && !word.chars().any(char::is_control)
 }
 
-/// Options README §6.1 documents that this build doesn't take yet, with what brings them.
-const LATER_OPTIONS: [(&str, &str); 2] = [
-    (
-        "--testbed-log",
-        "source.stability and the testbed and tone logs (research 16's PR 8)",
-    ),
-    (
-        "--voice-log",
-        "source.stability and the testbed and tone logs (research 16's PR 8)",
-    ),
-];
-
 /// Parses the arguments, without the program name.
 fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let Some((verb, rest)) = args.split_first() else {
@@ -206,6 +206,19 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             return match rest {
                 [clip] if !clip.is_empty() => Ok(Command::Boxes(PathBuf::from(clip))),
                 _ => Err(format!("boxes takes one clip\n{USAGE}")),
+            };
+        }
+        Some("log") => {
+            return match rest {
+                [file] if !file.is_empty() => Ok(Command::Log {
+                    file: PathBuf::from(file),
+                    json: None,
+                }),
+                [file, flag, target] if !file.is_empty() && flag == "--json" => Ok(Command::Log {
+                    file: PathBuf::from(file),
+                    json: Some(output(target)),
+                }),
+                _ => Err(format!("log takes one log file and --json\n{USAGE}")),
             };
         }
         Some("mutate") => return parse_mutate(rest),
@@ -226,6 +239,8 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut cue = None;
     let mut av_tight = false;
     let mut voice_included = false;
+    let mut testbed_log = None;
+    let mut voice_log = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         let flag = word.to_str().unwrap_or_default();
@@ -260,11 +275,8 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             "--av-tight" => av_tight = true,
             "--voice-included" => voice_included = true,
             "--summary" => summary = Some(output(value("--summary")?)),
-            _ if let Some((_, with)) = LATER_OPTIONS.iter().find(|(f, _)| *f == flag) => {
-                return Err(format!(
-                    "{flag} comes with {with}, which this build doesn't have yet"
-                ));
-            }
+            "--testbed-log" => testbed_log = Some(PathBuf::from(value("--testbed-log")?)),
+            "--voice-log" => voice_log = Some(PathBuf::from(value("--voice-log")?)),
             _ if flag.starts_with('-') && flag.len() > 1 => {
                 // Only the part before any `=`: what follows may be a path.
                 let name = OsStr::new(flag.split('=').next().unwrap_or_default());
@@ -292,6 +304,11 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             "--voice-included goes with a share export's profile: share, discord, whatsapp or reels\n{USAGE}"
         ));
     }
+    if voice_log.is_some() && testbed_log.is_none() {
+        return Err(format!(
+            "--voice-log needs --testbed-log: the tone log is placed on the clip by the testbed's display times\n{USAGE}"
+        ));
+    }
     if json == Some(Output::Stdout) && summary == Some(Output::Stdout) {
         return Err("--json - and --summary - can't both use stdout".to_owned());
     }
@@ -306,6 +323,8 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
         cue,
         av_tight,
         voice_included,
+        testbed_log,
+        voice_log,
     })
 }
 
@@ -725,6 +744,8 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         cue,
         av_tight,
         voice_included,
+        testbed_log,
+        voice_log,
     } = command
     else {
         return 4;
@@ -758,6 +779,36 @@ fn check(command: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     };
     plan.av_tight = av_tight;
     plan.voice_included = voice_included;
+    // The logs are read whole: a torn last line is dropped (README §4.9), anything else wrong
+    // refuses the command line.
+    let read_log = |path: &Path| {
+        let name = file_name(path).unwrap_or("the log").to_owned();
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("{name}: {e}"))
+            .map(|text| (name, text))
+    };
+    if let Some(path) = testbed_log {
+        match read_log(&path)
+            .and_then(|(name, text)| TestbedLog::parse(&text).map_err(|e| format!("{name}: {e}")))
+        {
+            Ok(log) => plan.testbed_log = Some(log),
+            Err(error) => {
+                say(err, &error);
+                return 2;
+            }
+        }
+    }
+    if let Some(path) = voice_log {
+        match read_log(&path)
+            .and_then(|(name, text)| ToneLog::parse(&text).map_err(|e| format!("{name}: {e}")))
+        {
+            Ok(log) => plan.voice_log = Some(log),
+            Err(error) => {
+                say(err, &error);
+                return 2;
+            }
+        }
+    }
     if let Some(path) = cue {
         let name = file_name(&path).unwrap_or("the cue file");
         match read_cue(&path) {
@@ -849,6 +900,33 @@ impl crate::decode::Decoder for NoDecoder {
             "this build has no such decoder".to_owned(),
         ))
     }
+}
+
+/// `log`: the summary on stdout (unless the JSON goes there); exit 0 when every rule of
+/// research 16 §4.12 that applies held, 1 when one didn't, 3 when the log can't be read.
+fn show_log(path: &Path, json: Option<&Output>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let name = file_name(path).unwrap_or("the log").to_owned();
+    let summary = match std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| crate::logsum::summarize(&text))
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            say(err, &format!("{name}: {error}"));
+            return 3;
+        }
+    };
+    if let Some(target) = json {
+        let text = serde_json::to_string(&summary).unwrap_or_default() + "\n";
+        if let Err(error) = write_to(target, &text, out) {
+            say(err, &format!("can't write the summary: {error}"));
+            return 4;
+        }
+    }
+    if json != Some(&Output::Stdout) && out.write_all(summary.to_text().as_bytes()).is_err() {
+        return 4;
+    }
+    if summary.passed() { 0 } else { 1 }
 }
 
 fn show_boxes(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -1151,6 +1229,7 @@ pub fn run_with(
             0
         }
         Ok(Command::Boxes(path)) => show_boxes(&path, out, err),
+        Ok(Command::Log { file, json }) => show_log(&file, json.as_ref(), out, err),
         Ok(Command::Mutate { op, input, output }) => mutate_file(&op, &input, &output, out, err),
         Ok(Command::Synth {
             synth,
@@ -1225,8 +1304,20 @@ mod tests {
                 cue: None,
                 av_tight: false,
                 voice_included: false,
+                testbed_log: None,
+                voice_log: None,
             })
         );
+        assert!(matches!(
+            parse_args(&args(
+                "check a.mp4 --profile capture --testbed-log t.log --voice-log v.log"
+            )),
+            Ok(Command::Check {
+                testbed_log: Some(_),
+                voice_log: Some(_),
+                ..
+            })
+        ));
         assert!(matches!(
             parse_args(&args("check a.mp4 --profile engine --cue c.wav --av-tight")),
             Ok(Command::Check {
@@ -1446,6 +1537,7 @@ mod tests {
             "check a.mp4 --profile",
             "check a.mp4 --profile test --av-tight",
             "check a.mp4 --profile engine --voice-included",
+            "check a.mp4 --profile engine --voice-log v.log",
             "boxes",
             "boxes a b",
             "mutate",
