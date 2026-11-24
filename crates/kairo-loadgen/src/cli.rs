@@ -35,7 +35,7 @@ load --warmup seconds (0 to 3600) before it measures. --texture-mib (a power of 
 1024) and --seed (decimal or 0x hex) are for bw. --bands 1 to 64, --buffers 2 to 4, --latency 1
 to 3. --detail off draws the picture without its grain. --activate waits until the foreground
 lock time-out has passed since the last input, then takes the foreground. The log, ready and
---out files must not exist yet; the ready file's folder must be on NTFS.
+--out files must not exist yet; the ready and --out files' folders must be on NTFS.
 Exit codes: 0 ok, 2 usage or a file that can't be made, 3 refused (monitor, HDR, no tearing,
 a window that doesn't cover the monitor, a TDR guard, a display change, a calibration that
 can't reach its target), 4 device, swap chain, shader or timestamps failed, or the device lost,

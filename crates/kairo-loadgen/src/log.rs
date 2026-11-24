@@ -301,8 +301,9 @@ pub enum Event {
         /// Its predicted GPU time per frame.
         predicted_ms: f64,
     },
-    /// `too_heavy count=<c> gpu_ms=<x>`: the run-time guard, three frames in a row over 250 ms;
-    /// `gpu_ms` is the third's.
+    /// `too_heavy count=<c> gpu_ms=<x>`: a step drawn over the guards, measured. In a run, the
+    /// run-time guard, three frames in a row over 250 ms (`gpu_ms` is the third's); in
+    /// `calibrate`, a step whose median passed the TDR guards.
     LongFrames {
         /// The run's count.
         count: u32,

@@ -11,13 +11,14 @@
 //!
 //! The reference follows the shader operation for operation in `f32`, so Windows CI's WARP test
 //! can hold the GPU's read-back to it within ±2 codes (research 17 §6, W tier; transcendentals
-//! differ between WARP and the CPU). Its tests hold the picture to Xbox Accessibility Guideline
-//! 118's thresholds at half or less (README §3.11) over a grid and a full colour cycle:
+//! differ between WARP and the CPU). Its tests hold the picture inside Xbox Accessibility
+//! Guideline 118's thresholds, with margin (README §3.11), over a grid and a full colour cycle:
 //!
-//! - its relative luminance spans less than 0.08 of white;
-//! - within any 1/3 s, no pixel changes by 0.05 or more and the screen average by 0.005 or more;
-//! - the red ratio R ÷ (R + G + B), on linear values, stays below 0.5;
-//! - no window of 20% of the screen holds a luminance difference of 0.08 or more.
+//! - its relative luminance spans less than 0.08 of white (XAG: 0.10);
+//! - within any 1/3 s, no pixel changes by 0.05 or more and the screen average by 0.005 or more
+//!   (XAG: 0.10);
+//! - the red ratio R ÷ (R + G + B), on linear values, stays below 0.5 (XAG: 0.8);
+//! - no window of 20% of the screen holds a luminance difference of 0.08 or more (XAG: 0.10).
 
 use std::f32::consts::TAU;
 
@@ -286,7 +287,8 @@ mod tests {
         }
     }
 
-    /// The contract's limits (README §3.11): half of XAG 118's, or tighter.
+    /// The contract's limits (README §3.11), each inside XAG 118's: the span and the window 0.08
+    /// (XAG 0.10), the changes within 1/3 s 0.05 and 0.005 (XAG 0.10), the red ratio 0.5 (XAG 0.8).
     const SPAN_LIMIT: f64 = 0.08;
     const PIXEL_CHANGE_LIMIT: f64 = 0.05;
     const AVERAGE_CHANGE_LIMIT: f64 = 0.005;

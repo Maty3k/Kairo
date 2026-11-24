@@ -643,6 +643,9 @@ impl Load<'_> {
                 count: heavy.count,
                 predicted_ms: heavy.predicted_ms,
             }),
+            Refusal::Overran { count, gpu_ms } => {
+                self.log.event(&Event::LongFrames { count, gpu_ms })
+            }
             _ => self.log.event(&Event::Refused {
                 reason: refusal.reason(),
             }),

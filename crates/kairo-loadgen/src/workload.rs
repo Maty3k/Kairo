@@ -709,6 +709,13 @@ pub struct Calibrated {
 pub enum Refusal {
     /// A TDR guard refused the next step.
     TooHeavy(TooHeavy),
+    /// A calibration step, once drawn, measured over the TDR guards.
+    Overran {
+        /// The count drawn.
+        count: u32,
+        /// Its median GPU ms.
+        gpu_ms: f64,
+    },
     /// The count reached the workload's cap while still below half the target.
     CapReached {
         /// The last count measured.
@@ -749,7 +756,7 @@ impl Refusal {
     /// Its name in the log's `e refused reason=` line (a guard's refusal is `e too_heavy`).
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::TooHeavy(_) => "too_heavy",
+            Self::TooHeavy(_) | Self::Overran { .. } => "too_heavy",
             Self::CapReached { .. } => "cap_reached",
             Self::NotLinear(_) => "not_linear",
             Self::OutOfReach { .. } => "out_of_reach",
@@ -766,6 +773,10 @@ impl Refusal {
                 "a frame at count {} is predicted to take {:.1} ms of GPU time, over the TDR \
                  guards ({FRAME_LIMIT_MS} ms a frame, {BAND_LIMIT_MS} ms a band)",
                 heavy.count, heavy.predicted_ms
+            ),
+            Self::Overran { count, gpu_ms } => format!(
+                "count {count} took {gpu_ms:.1} ms of GPU time, over the TDR guards \
+                 ({FRAME_LIMIT_MS} ms a frame, {BAND_LIMIT_MS} ms a band)"
             ),
             Self::CapReached { count, gpu_ms } => format!(
                 "the count reached its cap at {count} with {gpu_ms:.3} ms of GPU time, below half \
@@ -878,8 +889,12 @@ impl Calibrator {
         if !(gpu_ms.is_finite() && gpu_ms > 0.0) {
             return Err(Refusal::NoTiming);
         }
-        // What was just drawn must itself have stayed within the guards.
-        check(&self.geometry, self.count, gpu_ms).map_err(Refusal::TooHeavy)?;
+        // What was just drawn must itself have stayed within the guards: a measured overrun,
+        // logged with its measured time, not as a prediction.
+        check(&self.geometry, self.count, gpu_ms).map_err(|heavy| Refusal::Overran {
+            count: heavy.count,
+            gpu_ms: heavy.predicted_ms,
+        })?;
         match self.phase {
             Phase::Doubling => self.doubled(gpu_ms),
             Phase::Warm => self.warmed(gpu_ms),
@@ -1632,9 +1647,23 @@ mod tests {
                 predicted_ms: 120.0
             }))
         );
-        // A step that measured over the limits is refused too, before anything else runs on it.
+        // A step that measured over the limits is refused too, before anything else runs on it,
+        // with its measured time.
         let (_, done) = calibrate(Workload::Alu, SCREEN, |_, _, _| 150.0);
-        assert!(matches!(done, Err(Refusal::TooHeavy(_))), "{done:?}");
+        assert_eq!(
+            done,
+            Err(Refusal::Overran {
+                count: 16,
+                gpu_ms: 150.0
+            })
+        );
+        let overran = Refusal::Overran {
+            count: 16,
+            gpu_ms: 150.0,
+        };
+        assert_eq!(overran.reason(), "too_heavy");
+        assert_eq!(overran.exit_code(), exit::REFUSED);
+        assert!(overran.message().starts_with("count 16 took 150.0 ms"));
     }
 
     #[test]
