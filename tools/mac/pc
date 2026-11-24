@@ -343,6 +343,17 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
   cli ping|keys [--pipe NAME] [--force]
                            Run kairo-cli on the PC as a short \Kairo\Run job. It reaches a named-pipe
                            server running outside \Kairo\Run: refused while a pc run job holds it.
+  amd-diff before|after [--label NAME] [--driver] [--force]
+                           The AMD settings diff, read-only (research 17 section 5.5). "before"
+                           takes a snapshot of AMD's registry settings: the owner's Software\AMD,
+                           HKLM\SOFTWARE\AMD and its WOW6432Node twin, and with --driver AMD's
+                           display-class keys. The owner toggles one setting in AMD Software.
+                           "after" takes another with the same scopes and prints each changed value,
+                           "path\name: before -> after", then "N values changed"; a name or string
+                           that isn't plain prints as a hash. Keeps before.json, after-<label>.json
+                           and diff-<label>.txt in .dogfood/amd-diff/<stamp>/ (label: the next free
+                           number unless --label). Refuses over a fullscreen window even with
+                           --force.
   help                     This text.
 
 Exit codes: 0 ok, 1 failed, 2 usage or bad input, 3 refused: PC busy, 4 refused: busy state unknown,
@@ -1331,6 +1342,101 @@ cmd_cli() {
     run_ps cli
 }
 
+# --- amd-diff ------------------------------------------------------------------------------
+# research 17 section 5.5: AMD's registry settings before and after the owner toggles one in AMD
+# Software, two calls per toggle, read-only. tools/pc/bench/regdiff.ps1 travels in the prelude
+# (RegdiffB64) and remote/amd-diff.ps1 dot-sources it from memory, so nothing is deployed; "after"
+# sends the newest before snapshot back (BeforeB64). The snapshots and lines show hashes for
+# anything that isn't plain, but they name AMD's adapters by PCI id, so they stay in .dogfood/.
+is_label() { # an amd-diff label, part of a file name: ^[a-z0-9][a-z0-9_-]{0,31}$
+    case "$1" in '' | [!a-z0-9]* | *[!a-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 32 ]
+}
+
+# Decodes the fetched Base64 key $1 into the file $2, checked with jq program $3 (none for text).
+amd_diff_keep() {
+    local key=$1 file=$2 check=$3 value tmp
+    value=$(kv_get "$key")
+    [ -n "$value" ] || die "amd-diff: the PC sent no $key"
+    tmp=$(mktemp "${file%/*}/.${file##*/}.XXXXXX") || die "mktemp failed"
+    register_temp "$tmp"
+    printf '%s' "$value" | /usr/bin/base64 -D >"$tmp" 2>/dev/null || die "amd-diff: the $key isn't Base64"
+    if [ -n "$check" ] && [ -x /usr/bin/jq ]; then
+        /usr/bin/jq -e "$check" "$tmp" >/dev/null 2>&1 || die "amd-diff: the $key isn't a regdiff snapshot"
+    fi
+    mv -f "$tmp" "$file" || die "cannot write $file"
+}
+
+cmd_amd_diff() {
+    local mode='' label='' driver=0 force=0 base dir stamp marker last='' n rc encoded before_b64=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        before | after)
+            [ -z "$mode" ] || usage_error "amd-diff: name before or after, once"
+            mode=$1
+            ;;
+        --label)
+            need_value "$1" $#
+            is_label "$2" || usage_error "amd-diff: a label matches ^[a-z0-9][a-z0-9_-]{0,31}\$: $2"
+            label=$2
+            shift
+            ;;
+        --driver) driver=1 ;;
+        --force) force=1 ;;
+        *) usage_error "amd-diff: unknown argument $1" ;;
+        esac
+        shift
+    done
+    [ -n "$mode" ] || usage_error "amd-diff: name before or after"
+    [ "$mode" = after ] || [ -z "$label" ] || usage_error "amd-diff: --label goes with after"
+    base="$REPO_ROOT/.dogfood/amd-diff"
+    if [ "$mode" = before ]; then
+        stamp=$(date -u +%Y%m%d-%H%M%S)
+        dir="$base/$stamp"
+        [ ! -e "$dir" ] || die "amd-diff: .dogfood/amd-diff/$stamp exists already; try again in a second"
+    else
+        # The newest before snapshot: stamps sort by time.
+        for marker in "$base"/*/before.json; do
+            [ -f "$marker" ] && last=$marker
+        done
+        [ -n "$last" ] || usage_error "amd-diff: there is no before snapshot: run pc amd-diff before first"
+        dir=${last%/before.json}
+        stamp=${dir##*/}
+        if [ -z "$label" ]; then
+            n=1
+            while [ -e "$dir/after-$n.json" ] || [ -e "$dir/diff-$n.txt" ]; do n=$((n + 1)); done
+            label=$n
+        elif [ -e "$dir/after-$label.json" ] || [ -e "$dir/diff-$label.txt" ]; then
+            usage_error "amd-diff: .dogfood/amd-diff/$stamp has after-$label.json already: choose another --label"
+        fi
+        before_b64=$(/usr/bin/base64 <"$last" | tr -d '\n') || die "cannot read $last"
+        [ -n "$before_b64" ] || usage_error "amd-diff: .dogfood/amd-diff/$stamp/before.json is empty: run pc amd-diff before again"
+    fi
+    encoded=$(/usr/bin/base64 <"$REPO_ROOT/tools/pc/bench/regdiff.ps1" | tr -d '\n') || die "cannot read tools/pc/bench/regdiff.ps1"
+    [ -n "$encoded" ] || die "tools/pc/bench/regdiff.ps1 is empty"
+    pre_reset
+    pre_bool Force "$force"
+    pre_str Mode "$mode"
+    pre_bool Driver "$driver"
+    pre_str RegdiffB64 "$encoded"
+    [ "$mode" = before ] || pre_str BeforeB64 "$before_b64"
+    [ "$mode" = before ] || say "comparing with .dogfood/amd-diff/$stamp/before.json"
+    run_ps amd-diff
+    rc=$?
+    [ "$rc" = 0 ] || return "$rc"
+    [ -n "$(kv_get snapshot)" ] || die "amd-diff: the PC sent no snapshot"
+    (umask 077 && mkdir -p "$dir") || die "cannot create .dogfood/amd-diff/$stamp"
+    if [ "$mode" = before ]; then
+        amd_diff_keep snapshot "$dir/before.json" '.kairo_regdiff == 1'
+        say "kept .dogfood/amd-diff/$stamp/before.json: toggle one setting, then run pc amd-diff after"
+    else
+        amd_diff_keep snapshot "$dir/after-$label.json" '.kairo_regdiff == 1'
+        amd_diff_keep diff "$dir/diff-$label.txt" ''
+        say "kept .dogfood/amd-diff/$stamp/after-$label.json and diff-$label.txt"
+    fi
+    return 0
+}
+
 cmd_ssh() {
     # Gone: the SSH session is elevated, and an interactive shell would start in the owner's home
     # folder, run any program found there before PATH, and load the owner's PowerShell profile and
@@ -1364,6 +1470,7 @@ run) cmd_run "$@" ;;
 logs) cmd_logs "$@" ;;
 harness) cmd_harness "$@" ;;
 cli) cmd_cli "$@" ;;
+amd-diff) cmd_amd_diff "$@" ;;
 ssh) cmd_ssh "$@" ;;
 help | -h | --help) usage ;;
 *) usage_error "unknown verb: $verb" ;;

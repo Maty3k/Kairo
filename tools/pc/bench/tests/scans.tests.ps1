@@ -18,6 +18,8 @@
 # - the elevated scripts: the bench scripts and tools/mac/remote/*.ps1, the verb bodies the elevated
 #   SSH session runs;
 # - the elevated bench scripts: the bench scripts and the bench verbs, tools/mac/remote/bench*.ps1;
+# - the registry readers: tools/pc/bench/regdiff.ps1 and tools/mac/remote/amd-diff.ps1, the AMD
+#   settings diff;
 # - every script: tools/**/*.ps1, the tests included.
 #
 # A command's module qualifier is dropped before its name is matched, in every rule:
@@ -64,6 +66,14 @@
 #    &, `u{} escape or number suffix (y, uy, s, us, u, ul, n, also before a multiplier: 1ukb), which
 #    PowerShell 7 added. CI parses every script with 5.1 on Windows; this rule catches them on the
 #    Mac and on Linux too.
+#
+# R7 Registry writes, in the registry readers (research 17 section 5.5: AMD's settings are never
+#    written): no cmdlet that writes items or properties (Set-ItemProperty, New-Item,
+#    New-ItemProperty, Remove-Item, their kin and their aliases), no reg.exe, regedit or regini, by
+#    name or path, run or launched (Start-Process, cmd /c); no SetValue, CreateSubKey, DeleteValue, DeleteSubKey, DeleteSubKeyTree or
+#    SetAccessControl, on a key or on [Microsoft.Win32.Registry]; OpenSubKey only with $false as its
+#    second and last argument, since $true, a variable or a permission check can open a key for
+#    writing; and no member name computed at run time.
 #
 # Rules: ASCII only; Windows PowerShell 5.1 syntax (CI parses tools/** there); no Add-Type. The
 # snippets below are strings, which these rules never read as code, except R3's strings check,
@@ -624,12 +634,64 @@ function Find-ScanPowerShell7Syntax($Source) {
     return ,$found.ToArray()
 }
 
+# --- R7 registry writes --------------------------------------------------------------------------
+
+$script:RegistryWriteCommands = @('Set-ItemProperty', 'sp', 'New-Item', 'ni', 'mkdir', 'md', 'New-ItemProperty',
+    'Remove-Item', 'ri', 'rm', 'rmdir', 'del', 'erase', 'rd', 'Remove-ItemProperty', 'rp', 'Rename-ItemProperty', 'rnp',
+    'Copy-ItemProperty', 'cpp', 'Move-ItemProperty', 'mp', 'Clear-ItemProperty', 'clp', 'Set-Item', 'si', 'Clear-Item',
+    'cli', 'Rename-Item', 'rni', 'ren', 'Copy-Item', 'cpi', 'cp', 'copy', 'Move-Item', 'mi', 'mv', 'move', 'Set-Acl',
+    'reg', 'reg.exe', 'regedit', 'regedit.exe', 'regini', 'regini.exe')
+$script:RegistryTools = @('reg', 'reg.exe', 'regedit', 'regedit.exe', 'regini', 'regini.exe')
+$script:Launchers = @('Start-Process', 'saps', 'start', 'cmd', 'cmd.exe')
+$script:RegistryWriteMembers = @('SetValue', 'CreateSubKey', 'DeleteValue', 'DeleteSubKey', 'DeleteSubKeyTree', 'SetAccessControl')
+
+function Get-ScanLeaf([string] $Name) {
+    # A program named by its path counts by its file name (C:\Windows\System32\reg.exe is reg.exe),
+    # and a cmdlet by its name without a module (Microsoft.PowerShell.Management\New-Item).
+    return $Name.Substring($Name.LastIndexOfAny([char[]]@('\', '/')) + 1)
+}
+
+function Find-ScanRegistryWrites($Source) {
+    $found = [Collections.Generic.List[string]]::new()
+    foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
+        $command = $node.GetCommandName()
+        if ($null -eq $command) { continue }
+        $leaf = Get-ScanLeaf $command
+        if ($script:RegistryWriteCommands -contains $leaf) { $found.Add((New-ScanFinding $Source $node $command)) }
+        if ($script:Launchers -notcontains $leaf) { continue }
+        # A launcher's words: Start-Process reg.exe, cmd /c "reg add ...".
+        for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
+            foreach ($text in (Get-ScanStrings $node.CommandElements[$i])) {
+                foreach ($word in $text.Split([char[]]@(' ', [char]9), [StringSplitOptions]::RemoveEmptyEntries)) {
+                    if ($script:RegistryTools -contains (Get-ScanLeaf $word.Trim([char]34, [char]39))) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $word))) }
+                }
+            }
+        }
+    }
+    foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
+        $name = Get-ScanMemberName $node
+        if ($null -eq $name) {
+            $found.Add((New-ScanFinding $Source $node ('a member name computed at run time: ' + $node.Extent.Text)))
+        } elseif ($script:RegistryWriteMembers -contains $name) {
+            $found.Add((New-ScanFinding $Source $node ('.' + $name)))
+        } elseif ($name -eq 'OpenSubKey') {
+            $arguments = @()
+            if ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $null -ne $node.Arguments) { $arguments = @($node.Arguments) }
+            $readOnly = ($arguments.Count -eq 2 -and $arguments[1] -is [Management.Automation.Language.VariableExpressionAst] -and
+                $arguments[1].VariablePath.UserPath -eq 'false')
+            if (-not $readOnly) { $found.Add((New-ScanFinding $Source $node ('OpenSubKey without $false as its second and last argument: ' + $node.Extent.Text))) }
+        }
+    }
+    return ,$found.ToArray()
+}
+
 # --- The files -----------------------------------------------------------------------------------
 
 $script:AllFiles = @(Get-ChildItem -LiteralPath $script:ToolsDir -Recurse -File -Filter '*.ps1' | Sort-Object FullName | ForEach-Object { Read-ScanFile $_.FullName })
 $script:BenchFiles = @($script:AllFiles | Where-Object { $_.Name -match '^tools/pc/bench/[^/]+\.ps1\z' })
 $script:ElevatedFiles = @($script:AllFiles | Where-Object { $_.Name -match '^tools/pc/bench/[^/]+\.ps1\z' -or $_.Name -match '^tools/mac/remote/[^/]+\.ps1\z' })
 $script:ElevatedBenchFiles = @($script:AllFiles | Where-Object { $_.Name -match '^tools/pc/bench/[^/]+\.ps1\z' -or $_.Name -match '^tools/mac/remote/bench[^/]*\.ps1\z' })
+$script:RegistryFiles = @($script:AllFiles | Where-Object { $_.Name -eq 'tools/pc/bench/regdiff.ps1' -or $_.Name -eq 'tools/mac/remote/amd-diff.ps1' })
 
 function Assert-ScanClean([string[]] $Findings, [string] $What) {
     if (@($Findings).Count -gt 0) { throw ($What + ': ' + (@($Findings) -join ' | ')) }
@@ -661,7 +723,8 @@ function Assert-ScanPasses([scriptblock] $Scan, [string[]] $Snippets) {
 
 Test-Case 'the file sets hold the scripts the rules are for' {
     $bench = @($script:BenchFiles | ForEach-Object { $_.Name }) -join ','
-    Assert-Equal 'tools/pc/bench/ab-stats.ps1,tools/pc/bench/bench-rules.ps1,tools/pc/bench/encoder-usage.ps1,tools/pc/bench/pm-stats.ps1' $bench 'the bench scripts'
+    Assert-Equal 'tools/pc/bench/ab-stats.ps1,tools/pc/bench/bench-rules.ps1,tools/pc/bench/encoder-usage.ps1,tools/pc/bench/pm-stats.ps1,tools/pc/bench/regdiff.ps1' $bench 'the bench scripts'
+    Assert-Equal 'tools/mac/remote/amd-diff.ps1,tools/pc/bench/regdiff.ps1' (@($script:RegistryFiles | ForEach-Object { $_.Name }) -join ',') 'the registry readers'
     Assert-True (@($script:ElevatedFiles | Where-Object { $_.Name -eq 'tools/mac/remote/lib.ps1' }).Count -eq 1) 'lib.ps1 is an elevated script'
     Assert-True (@($script:AllFiles | Where-Object { $_.Name -eq 'tools/mac/remote/status.ps1' }).Count -eq 1) 'status.ps1 is scanned'
     Assert-True (@($script:AllFiles | Where-Object { $_.Name -eq 'tools/pc/bench/tests/scans.tests.ps1' -and $_.IsTest }).Count -eq 1) 'this file is scanned, as a test'
@@ -1052,6 +1115,68 @@ Test-Case 'R6 passes the 5.1 forms' {
         '"`n`t"',
         '$x = 10; $y = 10L; $z = 1kb; $w = 0x1F; $v = 2.5d; $u = 1e5; $t = 1PB; $s = 0x1b',
         '''$a ?? 1 in a string'''
+    )
+}
+
+# --- R7 --------------------------------------------------------------------------------------------
+
+$script:R7 = { param($Text) Find-ScanRegistryWrites (ConvertTo-ScanSource $Text) }
+
+Test-Case 'R7 the registry readers write nothing to the registry' {
+    foreach ($source in $script:RegistryFiles) { Assert-ScanClean (Find-ScanRegistryWrites $source) $source.Name }
+    # Their read-only opens are seen and passed, so the rule isn't vacuous.
+    $opens = 0
+    foreach ($source in $script:RegistryFiles) {
+        foreach ($node in (Find-ScanNodes $source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
+            if ((Get-ScanMemberName $node) -eq 'OpenSubKey') { $opens++ }
+        }
+    }
+    Assert-True ($opens -ge 5) ('OpenSubKey calls seen: ' + $opens)
+}
+
+Test-Case 'R7 flags registry writes by cmdlet, reg.exe and .NET, and keys opened for writing' {
+    Assert-ScanFlags $script:R7 @(
+        'Set-ItemProperty -LiteralPath ''HKCU:\Software\AMD\DVR'' -Name DvrEnabled -Value 0',
+        'New-Item -Path ''HKCU:\Software\Kairo''',
+        'New-ItemProperty -Path $key -Name x -Value 1',
+        'Remove-Item -LiteralPath ''HKCU:\Software\AMD'' -Recurse',
+        'Remove-ItemProperty -Path $key -Name x',
+        'sp HKCU:\Software\AMD x 1',
+        'Microsoft.PowerShell.Management\Set-ItemProperty -Path $key -Name x -Value 1',
+        'ri $key',
+        'reg add HKCU\Software\AMD /v x /d 1',
+        '& ''C:\Windows\System32\reg.exe'' delete HKCU\Software\AMD /f',
+        'regedit /s settings.reg',
+        'Start-Process -FilePath reg.exe -ArgumentList ''add HKCU\Software\AMD /v x /d 1''',
+        'cmd /c "reg add HKCU\Software\AMD /v x /d 1"',
+        '$key.SetValue(''DvrEnabled'', 0)',
+        '[Microsoft.Win32.Registry]::SetValue(''HKEY_CURRENT_USER\Software\AMD'', ''x'', 1)',
+        '$key.CreateSubKey(''x'')',
+        '$key.DeleteValue(''x'')',
+        '$key.DeleteSubKeyTree(''x'', $false)',
+        '$key.SetAccessControl($acl)',
+        '$key.OpenSubKey(''x'', $true)',
+        '$key.OpenSubKey(''x'', $writable)',
+        '$key.OpenSubKey(''x'', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)',
+        '$key.OpenSubKey(''x'', $false, [Security.AccessControl.RegistryRights]::FullControl)',
+        '$key.OpenSubKey(''x'')',
+        '$open = $key.OpenSubKey',
+        '$key.$method(''x'', 1)'
+    ) '^snippet\.ps1:1: '
+}
+
+Test-Case 'R7 passes read-only opens, reads, other members, and the words in strings and comments' {
+    Assert-ScanPasses $script:R7 @(
+        '$key.OpenSubKey(''Software\AMD'', $false)',
+        '[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64).OpenSubKey(''SOFTWARE\AMD'', $FALSE)',
+        '$key.GetValue(''x'', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)',
+        '$key.GetValueNames(); $key.GetSubKeyNames(); $key.GetValueKind(''x''); $key.Dispose()',
+        'Get-ItemProperty -LiteralPath ''HKLM:\SOFTWARE\AMD\DVR'' -Name InstantReplayEnabled',
+        'Get-ChildItem -LiteralPath ''HKCU:\Software\AMD''',
+        '$map.Remove(''x''); $list.Add(1); $set.Contains(''x'')',
+        'Start-Process -FilePath $exe -ArgumentList ''--register'', ''regular''',
+        '''Set-ItemProperty and $key.SetValue in a string''',
+        '# $key.SetValue(''x'', 1) in a comment'
     )
 }
 
