@@ -350,10 +350,13 @@ when its state is unknown (exit 4); --force overrides that, only with the owner'
                            display-class keys. The owner toggles one setting in AMD Software.
                            "after" takes another with the same scopes and prints each changed value,
                            "path\name: before -> after", then "N values changed"; a name or string
-                           that isn't plain prints as a hash. Keeps before.json, after-<label>.json
-                           and diff-<label>.txt in .dogfood/amd-diff/<stamp>/ (label: the next free
-                           number unless --label). Refuses over a fullscreen window even with
-                           --force.
+                           that isn't plain (one holding a path, a SID-shaped word, another
+                           program's .exe or .dll, a GUID in a string, or your account's or the
+                           PC's name or SID) prints as its length and a hash keyed with a random
+                           key that "before" makes. Keeps key (mode 0600), before.json,
+                           after-<label>.json and diff-<label>.txt in .dogfood/amd-diff/<stamp>/
+                           (label: the next free number unless --label). Refuses over a fullscreen
+                           window even with --force.
   help                     This text.
 
 Exit codes: 0 ok, 1 failed, 2 usage or bad input, 3 refused: PC busy, 4 refused: busy state unknown,
@@ -1347,10 +1350,36 @@ cmd_cli() {
 # Software, two calls per toggle, read-only. tools/pc/bench/regdiff.ps1 travels in the prelude
 # (RegdiffB64) and remote/amd-diff.ps1 dot-sources it from memory, so nothing is deployed; "after"
 # sends the newest before snapshot back (BeforeB64). The snapshots and lines show hashes for
-# anything that isn't plain, but they name AMD's adapters by PCI id, so they stay in .dogfood/.
+# anything that isn't plain, keyed with a random 16-byte key that "before" makes here (section
+# 5.5's 2026-11-24 correction): it stays in .dogfood/amd-diff/<stamp>/key, mode 0600, and travels
+# only in the prelude (RegdiffKey), with "before" and with "after". The snapshots also name AMD's
+# adapters by PCI id, so they stay in .dogfood/.
 is_label() { # an amd-diff label, part of a file name: ^[a-z0-9][a-z0-9_-]{0,31}$
     case "$1" in '' | [!a-z0-9]* | *[!a-z0-9_-]*) return 1 ;; esac
     [ "${#1}" -le 32 ]
+}
+
+is_regdiff_key() { # an amd-diff key: 16 bytes as 32 hex digits
+    case "$1" in '' | *[!0-9a-fA-F]*) return 1 ;; esac
+    [ "${#1}" -eq 32 ]
+}
+
+# Prints a new random key: 16 bytes from /dev/urandom, as 32 hex digits.
+amd_diff_new_key() {
+    local key
+    key=$(/usr/bin/od -An -vtx1 -N16 /dev/urandom | tr -d ' \n') || return 1
+    is_regdiff_key "$key" || return 1
+    printf '%s' "$key"
+}
+
+# Writes the key $2 to the file $1 with mode 0600, never printing it.
+amd_diff_keep_key() {
+    local file=$1 key=$2 tmp
+    tmp=$(mktemp "${file%/*}/.${file##*/}.XXXXXX") || die "mktemp failed"
+    register_temp "$tmp"
+    chmod 600 "$tmp" || die "cannot set the mode of $file"
+    printf '%s\n' "$key" >"$tmp" || die "cannot write $file"
+    mv -f "$tmp" "$file" || die "cannot write $file"
 }
 
 # Decodes the fetched Base64 key $1 into the file $2, checked with jq program $3 (none for text).
@@ -1368,7 +1397,7 @@ amd_diff_keep() {
 }
 
 cmd_amd_diff() {
-    local mode='' label='' driver=0 force=0 base dir stamp marker last='' n rc encoded before_b64=''
+    local mode='' label='' driver=0 force=0 base dir stamp marker last='' n rc encoded before_b64='' key=''
     while [ $# -gt 0 ]; do
         case "$1" in
         before | after)
@@ -1394,6 +1423,7 @@ cmd_amd_diff() {
         stamp=$(date -u +%Y%m%d-%H%M%S)
         dir="$base/$stamp"
         [ ! -e "$dir" ] || die "amd-diff: .dogfood/amd-diff/$stamp exists already; try again in a second"
+        key=$(amd_diff_new_key) || die "amd-diff: could not make a key from /dev/urandom"
     else
         # The newest before snapshot: stamps sort by time.
         for marker in "$base"/*/before.json; do
@@ -1402,6 +1432,10 @@ cmd_amd_diff() {
         [ -n "$last" ] || usage_error "amd-diff: there is no before snapshot: run pc amd-diff before first"
         dir=${last%/before.json}
         stamp=${dir##*/}
+        # Its key: the hashes of both snapshots compare only under the same one.
+        [ -f "$dir/key" ] || usage_error "amd-diff: .dogfood/amd-diff/$stamp has no key: run pc amd-diff before again"
+        key=$(cat "$dir/key") || die "cannot read .dogfood/amd-diff/$stamp/key"
+        is_regdiff_key "$key" || usage_error "amd-diff: .dogfood/amd-diff/$stamp/key isn't 32 hex digits: run pc amd-diff before again"
         if [ -z "$label" ]; then
             n=1
             while [ -e "$dir/after-$n.json" ] || [ -e "$dir/diff-$n.txt" ]; do n=$((n + 1)); done
@@ -1419,6 +1453,7 @@ cmd_amd_diff() {
     pre_str Mode "$mode"
     pre_bool Driver "$driver"
     pre_str RegdiffB64 "$encoded"
+    pre_str RegdiffKey "$key"
     [ "$mode" = before ] || pre_str BeforeB64 "$before_b64"
     [ "$mode" = before ] || say "comparing with .dogfood/amd-diff/$stamp/before.json"
     run_ps amd-diff
@@ -1427,8 +1462,10 @@ cmd_amd_diff() {
     [ -n "$(kv_get snapshot)" ] || die "amd-diff: the PC sent no snapshot"
     (umask 077 && mkdir -p "$dir") || die "cannot create .dogfood/amd-diff/$stamp"
     if [ "$mode" = before ]; then
+        # The key first: a before.json without its key could never be compared.
+        amd_diff_keep_key "$dir/key" "$key"
         amd_diff_keep snapshot "$dir/before.json" '.kairo_regdiff == 1'
-        say "kept .dogfood/amd-diff/$stamp/before.json: toggle one setting, then run pc amd-diff after"
+        say "kept .dogfood/amd-diff/$stamp/key and before.json: toggle one setting, then run pc amd-diff after"
     else
         amd_diff_keep snapshot "$dir/after-$label.json" '.kairo_regdiff == 1'
         amd_diff_keep diff "$dir/diff-$label.txt" ''

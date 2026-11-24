@@ -68,12 +68,24 @@
 #    Mac and on Linux too.
 #
 # R7 Registry writes, in the registry readers (research 17 section 5.5: AMD's settings are never
-#    written): no cmdlet that writes items or properties (Set-ItemProperty, New-Item,
-#    New-ItemProperty, Remove-Item, their kin and their aliases), no reg.exe, regedit or regini, by
-#    name or path, run or launched (Start-Process, cmd /c); no SetValue, CreateSubKey, DeleteValue, DeleteSubKey, DeleteSubKeyTree or
-#    SetAccessControl, on a key or on [Microsoft.Win32.Registry]; OpenSubKey only with $false as its
-#    second and last argument, since $true, a variable or a permission check can open a key for
-#    writing; and no member name computed at run time.
+#    written). No cmdlet that writes items or properties (Set-ItemProperty, New-Item,
+#    New-ItemProperty, Remove-Item, their kin and their aliases, such as si, clp, rni and cpi), nor
+#    Invoke-CimMethod or Invoke-WmiMethod (icim, iwmi), and no StdRegProv, WMI's registry class,
+#    anywhere outside a comment. No reg, regedit, regedt32 or regini, with or without .exe: not as a
+#    command, by name or path, and not as a word of any string, quoted, expandable or bare, whose
+#    leaf (after the last \, / or :) is one, words ending at white space, quotes and & | ; < > ( )
+#    , = and the backtick. So "$env:SystemRoot\System32\reg.exe", Join-Path ... 'System32\reg.exe'
+#    and cmd /c "echo x&reg add ..." are all flagged. No member named
+#    SetValue, CreateSubKey, DeleteValue, DeleteSubKey, DeleteSubKeyTree, SetAccessControl, RegWrite
+#    or RegDelete (WScript.Shell's), on anything; OpenSubKey only with $false as its second and last
+#    argument, since $true, a variable or a permission check can open a key for writing; and no
+#    member name computed at run time. Nor anything that runs code or a program it can't name: a
+#    command whose name is computed at run time (& $exe, & (Join-Path ...)), Invoke-Expression
+#    (iex), [scriptblock]::Create, InvokeScript or NewScriptBlock, which run code built from a
+#    string, and Invoke-Native (lib.ps1's launcher). One exception: amd-diff.ps1 loads regdiff.ps1's
+#    text from the prelude with exactly
+#    . ([scriptblock]::Create($Utf8NoBom.GetString([Convert]::FromBase64String([string]$Pc['RegdiffB64']))))
+#    and R7 scans that text as regdiff.ps1 itself.
 #
 # Rules: ASCII only; Windows PowerShell 5.1 syntax (CI parses tools/** there); no Add-Type. The
 # snippets below are strings, which these rules never read as code, except R3's strings check,
@@ -640,33 +652,55 @@ $script:RegistryWriteCommands = @('Set-ItemProperty', 'sp', 'New-Item', 'ni', 'm
     'Remove-Item', 'ri', 'rm', 'rmdir', 'del', 'erase', 'rd', 'Remove-ItemProperty', 'rp', 'Rename-ItemProperty', 'rnp',
     'Copy-ItemProperty', 'cpp', 'Move-ItemProperty', 'mp', 'Clear-ItemProperty', 'clp', 'Set-Item', 'si', 'Clear-Item',
     'cli', 'Rename-Item', 'rni', 'ren', 'Copy-Item', 'cpi', 'cp', 'copy', 'Move-Item', 'mi', 'mv', 'move', 'Set-Acl',
-    'reg', 'reg.exe', 'regedit', 'regedit.exe', 'regini', 'regini.exe')
-$script:RegistryTools = @('reg', 'reg.exe', 'regedit', 'regedit.exe', 'regini', 'regini.exe')
-$script:Launchers = @('Start-Process', 'saps', 'start', 'cmd', 'cmd.exe')
-$script:RegistryWriteMembers = @('SetValue', 'CreateSubKey', 'DeleteValue', 'DeleteSubKey', 'DeleteSubKeyTree', 'SetAccessControl')
+    'Invoke-CimMethod', 'icim', 'Invoke-WmiMethod', 'iwmi')
+$script:RegistryTools = @('reg', 'reg.exe', 'regedit', 'regedit.exe', 'regedt32', 'regedt32.exe', 'regini', 'regini.exe')
+# Commands that run code built from a string, or a program named at run time (lib.ps1's launcher).
+$script:CodeCommands = @('Invoke-Expression', 'iex', 'Invoke-Native')
+$script:RegistryWriteMembers = @('SetValue', 'CreateSubKey', 'DeleteValue', 'DeleteSubKey', 'DeleteSubKeyTree', 'SetAccessControl', 'RegWrite', 'RegDelete')
+$script:CodeMembers = @('InvokeScript', 'NewScriptBlock')
+# amd-diff.ps1's one load of code at run time: regdiff.ps1's text, which the Mac sends in the prelude.
+$script:RegdiffLoad = '. ([scriptblock]::Create($Utf8NoBom.GetString([Convert]::FromBase64String([string]$Pc[''RegdiffB64'']))))'
 
 function Get-ScanLeaf([string] $Name) {
-    # A program named by its path counts by its file name (C:\Windows\System32\reg.exe is reg.exe),
-    # and a cmdlet by its name without a module (Microsoft.PowerShell.Management\New-Item).
-    return $Name.Substring($Name.LastIndexOfAny([char[]]@('\', '/')) + 1)
+    # A program named by its path counts by its file name (C:\Windows\System32\reg.exe and C:reg.exe
+    # are reg.exe), and a cmdlet by its name without a module (Microsoft.PowerShell.Management\New-Item).
+    return $Name.Substring($Name.LastIndexOfAny([char[]]@('\', '/', ':')) + 1)
+}
+
+function Test-ScanRegdiffLoad($Command) {
+    # Whether a command is amd-diff.ps1's dot-sourcing of regdiff.ps1's text, written exactly so.
+    return ($Command.Extent.Text -ceq $script:RegdiffLoad)
+}
+
+function Test-ScanScriptBlockType([string] $TypeName) {
+    return ($TypeName -match '^((System\.)?Management\.Automation\.)?ScriptBlock\z')
+}
+
+function Get-ScanRegistryTool([string] $Text) {
+    # The first word of a string whose leaf names a registry tool, or $null. Words end at white
+    # space, quotes and the separators of PowerShell's and cmd's command lines.
+    foreach ($word in [regex]::Split($Text, '[\s"''`&|;<>(),=]+')) {
+        if ($word.Length -gt 0 -and $script:RegistryTools -contains (Get-ScanLeaf $word)) { return $word }
+    }
+    return $null
 }
 
 function Find-ScanRegistryWrites($Source) {
     $found = [Collections.Generic.List[string]]::new()
+    $loads = [Collections.Generic.List[object]]::new()
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
         $command = $node.GetCommandName()
-        if ($null -eq $command) { continue }
-        $leaf = Get-ScanLeaf $command
-        if ($script:RegistryWriteCommands -contains $leaf) { $found.Add((New-ScanFinding $Source $node $command)) }
-        if ($script:Launchers -notcontains $leaf) { continue }
-        # A launcher's words: Start-Process reg.exe, cmd /c "reg add ...".
-        for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
-            foreach ($text in (Get-ScanStrings $node.CommandElements[$i])) {
-                foreach ($word in $text.Split([char[]]@(' ', [char]9), [StringSplitOptions]::RemoveEmptyEntries)) {
-                    if ($script:RegistryTools -contains (Get-ScanLeaf $word.Trim([char]34, [char]39))) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $word))) }
-                }
+        if ($null -eq $command) {
+            if (Test-ScanRegdiffLoad $node) {
+                $loads.Add($node)
+            } else {
+                $found.Add((New-ScanFinding $Source $node ('a command whose name is computed at run time: ' + $node.Extent.Text)))
             }
+            continue
         }
+        $leaf = Get-ScanLeaf $command
+        if ($script:RegistryWriteCommands -contains $leaf -or $script:RegistryTools -contains $leaf) { $found.Add((New-ScanFinding $Source $node $command)) }
+        if ($script:CodeCommands -contains $leaf) { $found.Add((New-ScanFinding $Source $node ($command + ', which runs code or a program it can''t name'))) }
     }
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
         $name = Get-ScanMemberName $node
@@ -674,6 +708,13 @@ function Find-ScanRegistryWrites($Source) {
             $found.Add((New-ScanFinding $Source $node ('a member name computed at run time: ' + $node.Extent.Text)))
         } elseif ($script:RegistryWriteMembers -contains $name) {
             $found.Add((New-ScanFinding $Source $node ('.' + $name)))
+        } elseif ($script:CodeMembers -contains $name) {
+            $found.Add((New-ScanFinding $Source $node ('.' + $name + ', which runs code built from a string')))
+        } elseif ($name -eq 'Create' -and $node.Expression -is [Management.Automation.Language.TypeExpressionAst] -and
+            (Test-ScanScriptBlockType $node.Expression.TypeName.FullName)) {
+            $inLoad = $false
+            foreach ($load in $loads) { if (Test-ScanInside $node $load) { $inLoad = $true } }
+            if (-not $inLoad) { $found.Add((New-ScanFinding $Source $node ('[scriptblock]::Create, which runs code built from a string: ' + $node.Extent.Text))) }
         } elseif ($name -eq 'OpenSubKey') {
             $arguments = @()
             if ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $null -ne $node.Arguments) { $arguments = @($node.Arguments) }
@@ -681,6 +722,15 @@ function Find-ScanRegistryWrites($Source) {
                 $arguments[1].VariablePath.UserPath -eq 'false')
             if (-not $readOnly) { $found.Add((New-ScanFinding $Source $node ('OpenSubKey without $false as its second and last argument: ' + $node.Extent.Text))) }
         }
+    }
+    # Strings of every kind, bare words included: a registry tool by name or path.
+    foreach ($node in $Source.Ast.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -or $n -is [Management.Automation.Language.ExpandableStringExpressionAst] }, $true)) {
+        $tool = Get-ScanRegistryTool $node.Value
+        if ($null -ne $tool) { $found.Add((New-ScanFinding $Source $node ('a registry tool in a string: ' + $tool))) }
+    }
+    # StdRegProv, in any token but a comment: a string, a bare word, a member or a type.
+    foreach ($token in $Source.Tokens) {
+        if ([string]$token.Kind -ne 'Comment' -and $token.Text -match '(?i)StdRegProv') { $found.Add((New-ScanFinding $Source $token ('StdRegProv, WMI''s registry class: ' + $token.Text))) }
     }
     return ,$found.ToArray()
 }
@@ -1124,14 +1174,20 @@ $script:R7 = { param($Text) Find-ScanRegistryWrites (ConvertTo-ScanSource $Text)
 
 Test-Case 'R7 the registry readers write nothing to the registry' {
     foreach ($source in $script:RegistryFiles) { Assert-ScanClean (Find-ScanRegistryWrites $source) $source.Name }
-    # Their read-only opens are seen and passed, so the rule isn't vacuous.
+    # Their read-only opens are seen and passed, so the rule isn't vacuous; so is amd-diff.ps1's one
+    # load of regdiff.ps1's text.
     $opens = 0
+    $loads = 0
     foreach ($source in $script:RegistryFiles) {
         foreach ($node in (Find-ScanNodes $source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
             if ((Get-ScanMemberName $node) -eq 'OpenSubKey') { $opens++ }
         }
+        foreach ($node in (Find-ScanNodes $source.Ast ([Management.Automation.Language.CommandAst]))) {
+            if (Test-ScanRegdiffLoad $node) { $loads++ }
+        }
     }
     Assert-True ($opens -ge 5) ('OpenSubKey calls seen: ' + $opens)
+    Assert-Equal 1 $loads 'loads of regdiff.ps1''s text seen'
 }
 
 Test-Case 'R7 flags registry writes by cmdlet, reg.exe and .NET, and keys opened for writing' {
@@ -1163,6 +1219,86 @@ Test-Case 'R7 flags registry writes by cmdlet, reg.exe and .NET, and keys opened
         '$open = $key.OpenSubKey',
         '$key.$method(''x'', 1)'
     ) '^snippet\.ps1:1: '
+    # A registry tool run as a command is reported as the command, before the strings that name it.
+    Assert-ScanFlags $script:R7 @(
+        'reg add HKCU\Software\AMD /v x /d 1',
+        'regedit /s settings.reg',
+        'REGINI.EXE changes.txt',
+        '& ''C:\Windows\System32\reg.exe'' delete HKCU\Software\AMD /f'
+    ) '^snippet\.ps1:1: (reg|regedit|REGINI\.EXE|C:\\Windows\\System32\\reg\.exe)$'
+}
+
+Test-Case 'R7 flags the cmdlet aliases si, clp, rni and cpi, and the members DeleteSubKey, RegWrite and RegDelete' {
+    Assert-ScanFlags $script:R7 @(
+        'si HKCU:\Software\AMD\x 1',
+        'clp HKCU:\Software\AMD -Name x',
+        'rni HKCU:\Software\AMD\x y',
+        'cpi HKCU:\Software\AMD\x HKCU:\Software\AMD\y'
+    ) '^snippet\.ps1:1: (si|clp|rni|cpi)$'
+    Assert-ScanFlags $script:R7 @(
+        '$key.DeleteSubKey(''x'')',
+        '[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey(''Software\AMD'', $false)',
+        '(New-Object -ComObject WScript.Shell).RegWrite(''HKCU\Software\AMD\x'', 1, ''REG_DWORD'')',
+        '$shell.regwrite(''HKCU\Software\AMD\x'', 1)',
+        '$shell.RegDelete(''HKCU\Software\AMD\x'')'
+    ) '(?i)^snippet\.ps1:1: \.(DeleteSubKey|RegWrite|RegDelete)$'
+}
+
+Test-Case 'R7 flags a registry tool named in any string: quoted, expandable, bare, joined to a path or in a command line' {
+    Assert-ScanFlags $script:R7 @(
+        '$RegExe = Join-Path $env:SystemRoot ''System32\reg.exe''',
+        'Start-Process "$env:SystemRoot\System32\reg.exe" -ArgumentList ''add HKCU\Software\AMD /v x /d 1''',
+        'Start-Process -FilePath $cmd -ArgumentList ''/c reg add HKCU\Software\AMD''',
+        'cmd /c "echo x&reg add HKCU\Software\AMD /v $name /d 1 /f"',
+        'cmd /c reg add HKCU\Software\AMD',
+        '$tool = ''REGEDIT.EXE''',
+        '$tool = "regini"',
+        '$tool = ''C:reg.exe''',
+        '$tool = "x;regedt32"',
+        ('$tool = @''' + "`n" + 'regedt32.exe' + "`n" + '''@')
+    ) '^snippet\.ps1:1: a registry tool in a string: \S+$'
+}
+
+Test-Case 'R7 flags commands whose names are computed at run time, and code or programs it can''t name' {
+    Assert-ScanFlags $script:R7 @(
+        '& "$env:SystemRoot\System32\reg.exe" add HKCU\Software\AMD /v x /d 1 /f',
+        '$RegExe = Join-Path $env:SystemRoot $name; & $RegExe add HKCU\Software\AMD',
+        '& (Join-Path $env:SystemRoot $name) add HKCU\Software\AMD',
+        '. $script',
+        '& $block',
+        '. ([scriptblock]::Create($text))',
+        '& ([scriptblock]::Create($Utf8NoBom.GetString([Convert]::FromBase64String([string]$Pc[''RegdiffB64'']))))',
+        '. ([scriptblock]::Create($Utf8NoBom.GetString([Convert]::FromBase64String([string]$Pc[''RegdiffB64''])) + $more))'
+    ) '^snippet\.ps1:1: a command whose name is computed at run time: '
+    Assert-ScanFlags $script:R7 @(
+        'Invoke-Expression ''Set-ItemProperty -Path HKCU:\Software\AMD -Name x -Value 1''',
+        'iex $text',
+        'Microsoft.PowerShell.Utility\Invoke-Expression $text',
+        'Invoke-Native -Exe $RegExe -Arguments @(''add'')',
+        'Invoke-Native (Join-Path $env:SystemRoot $name) @(''add'')'
+    ) '^snippet\.ps1:1: (\S+\\)?(Invoke-Expression|iex|Invoke-Native), which runs code or a program it can''t name$'
+    Assert-ScanFlags $script:R7 @(
+        '$ExecutionContext.InvokeCommand.InvokeScript(''Set-ItemProperty x'')',
+        '$ExecutionContext.InvokeCommand.NewScriptBlock($text)',
+        '$sb = [scriptblock]::Create($text); $sb.Invoke()',
+        '[System.Management.Automation.ScriptBlock]::Create($text)',
+        '[ScriptBlock]::create($text)'
+    ) '^snippet\.ps1:1: .+, which runs code built from a string'
+}
+
+Test-Case 'R7 flags WMI''s registry methods: Invoke-CimMethod, Invoke-WmiMethod, and StdRegProv anywhere' {
+    Assert-ScanFlags $script:R7 @(
+        'Invoke-CimMethod -ClassName StdRegProv -MethodName SetDWORDValue -Arguments @{ sSubKeyName = ''Software\AMD''; sValueName = ''x''; uValue = 1 }',
+        'icim -ClassName StdRegProv -MethodName SetDWORDValue',
+        'Invoke-WmiMethod -Class StdRegProv -Name SetDWORDValue',
+        'iwmi -Class StdRegProv -Name SetDWORDValue'
+    ) '^snippet\.ps1:1: (Invoke-CimMethod|icim|Invoke-WmiMethod|iwmi)$'
+    Assert-ScanFlags $script:R7 @(
+        '([wmiclass]''root\default:StdRegProv'').SetDWORDValue(2147483649, ''Software\AMD'', ''x'', 1)',
+        '$class = Get-CimClass -ClassName StdRegProv -Namespace root/default',
+        '$name = "stdregprov"',
+        '$StdRegProv = 1'
+    ) '(?i)^snippet\.ps1:1: StdRegProv, WMI''s registry class: '
 }
 
 Test-Case 'R7 passes read-only opens, reads, other members, and the words in strings and comments' {
@@ -1176,7 +1312,13 @@ Test-Case 'R7 passes read-only opens, reads, other members, and the words in str
         '$map.Remove(''x''); $list.Add(1); $set.Contains(''x'')',
         'Start-Process -FilePath $exe -ArgumentList ''--register'', ''regular''',
         '''Set-ItemProperty and $key.SetValue in a string''',
-        '# $key.SetValue(''x'', 1) in a comment'
+        '# $key.SetValue(''x'', 1) in a comment',
+        '# reg add HKCU\Software\AMD, StdRegProv and regedit.exe in a comment',
+        '$text = ''the registry, regdiff.ps1, REG_SZ, a region, HKCU:\Software\AMD and C:\regs''',
+        '$text = "Registry: $name"',
+        'New-Object -ComObject ''Schedule.Service''',
+        '[Security.Cryptography.RandomNumberGenerator]::Create()',
+        $script:RegdiffLoad
     )
 }
 

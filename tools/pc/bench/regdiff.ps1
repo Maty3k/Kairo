@@ -3,16 +3,21 @@
 # tools/pc/bench/regdiff.ps1 - AMD's settings in the registry: a snapshot, and the values that changed
 # between two snapshots (the AMD settings diff's functions; pc amd-diff runs them).
 # Project: https://github.com/Maty3k/Kairo
-# Design: docs/research/17-loadgen-bench/README.md section 5.5. Contract: docs/milestones/M1.md, Formats.
+# Design: docs/research/17-loadgen-bench/README.md section 5.5, with its 2026-11-24 correction.
+# Contract: docs/milestones/M1.md, Formats.
 #
 # Command line:
 #   pwsh -NoProfile -File regdiff.ps1 -Before <snapshot.json> -After <snapshot.json>
-#   pwsh -NoProfile -File regdiff.ps1 -Snapshot [-Driver]
-# -Before and -After print the lines below for two snapshots, such as the ones pc amd-diff keeps in
-# .dogfood/amd-diff/. -Snapshot prints a snapshot of the scopes below as one JSON line, with this
-# account's hive as HKCU. Exit codes: 0 printed; 1 a hive couldn't be read (the owner's isn't loaded,
-# the display class key with -Driver, or this isn't Windows); 2 bad command line, a file that isn't a
-# regdiff snapshot, or two snapshots that can't be compared (one taken with -Driver and one without).
+#   pwsh -NoProfile -File regdiff.ps1 -Snapshot [-Driver] [-Key <32 hex digits>]
+# -Before and -After print the lines below for two snapshots taken with the same key, such as the
+# ones pc amd-diff keeps in .dogfood/amd-diff/. -Snapshot prints a snapshot of the scopes below as
+# one JSON line, with this account's hive as HKCU and its hashes keyed with -Key (16 bytes, written
+# as 32 hex digits). Without -Key it makes a random key, which it never prints, and says so on
+# stderr; that snapshot then compares with no other. Exit codes: 0 printed; 1 a hive couldn't be
+# read (the owner's isn't loaded, the display class key with -Driver, or this isn't Windows); 2 bad
+# command line (a -Key that isn't 32 hex digits included), a file that isn't a regdiff snapshot, or
+# two snapshots that can't be compared (taken with different keys, or one with -Driver and one
+# without).
 #
 # It never writes the registry. Every key is opened read-only, with
 # [Microsoft.Win32.RegistryKey]::OpenBaseKey(...).OpenSubKey(name, $false), and AMD's settings are
@@ -31,30 +36,47 @@
 # not opened. At 20,000 values it stops: the key whose values would pass the limit is
 # <stopped at 20000 values>, and nothing after it is read.
 #
-# What a line or a snapshot may show (section 5.5): never a SID, a path, or the account's or the PC's name.
-# - A key or value name shows as itself when it is plain: at most 64 of A-Z a-z 0-9, space and
-#   _ . , + = # : ; ( ) [ ] -, so no \, / or @, and holding none of the hidden names (this account,
-#   its domain, the PC's name and host name, the owner's account and both profile folders' names) in
-#   any case. Otherwise it shows as <name len=N sha256=8hex>: N characters, and the first 8 hex
-#   digits of the SHA-256 of its UTF-8 bytes. A key's unnamed value is <default>.
+# What a line or a snapshot may show (section 5.5 and its correction): a name or a string as it is
+# only when it is plain, and otherwise its length and a keyed hash.
+# - A key or value name is plain when it is at most 64 of A-Z a-z 0-9, space and _ . , + = # : ; ( )
+#   [ ] - (so no \, / or @); holds no SID-shaped word, (?i)\bS-1-[0-9]+(-[0-9]+)+; holds no
+#   program's name, (?i)\.(exe|dll)\b, other than Kairo's own kairo-<name>.exe (research 17's risk
+#   15 needs to see those); holds none of the hidden names, in any case (this account, its domain,
+#   the PC's name and host name, the owner's account, both profile folders' names, and the owner's
+#   and this session's SIDs); and isn't one of the member names PowerShell reserves (PSObject,
+#   PSBase, PSAdapted, PSExtended, PSTypeNames, in any case), which ConvertFrom-Json can't read back
+#   as a value's name. A GUID in a name shows as it is. A plain name shows as itself; any other as
+#   <name len=N hmac=8hex>: N characters, and the first 8 hex digits of the HMAC-SHA256 of its UTF-8
+#   bytes under the key. A key's unnamed value is <default>.
 # - REG_DWORD and REG_QWORD data shows as an unsigned number. A REG_SZ or REG_EXPAND_SZ string (read
 #   with DoNotExpandEnvironmentNames, so %USERPROFILE% never becomes a path with the account's name)
-#   shows in quotes when it passes the same test, a REG_MULTI_SZ as ["a","b"] when its strings
-#   joined by commas do. Any other string is <str len=N sha256=8hex> (a REG_MULTI_SZ hashed as its
-#   strings joined by NUL characters). Bytes (REG_BINARY, REG_NONE and the like) are
-#   <bin len=N sha256=8hex>, N bytes. Data .NET doesn't return (REG_LINK, resource lists) is <no data>.
+#   shows in quotes when it is plain by the names' test (the reserved names aside) and holds no GUID
+#   (8-4-4-4-12 hex digits with their hyphens, or 32 hex digits in a row: an install ID is a PC
+#   detail); a REG_MULTI_SZ shows as ["a","b"] when its strings joined by commas do. Any other
+#   string is <str len=N hmac=8hex> (a REG_MULTI_SZ hashed as its strings joined by NUL characters).
+#   Bytes (REG_BINARY, REG_NONE and the like) are <bin len=N hmac=8hex>, N bytes. Data .NET doesn't
+#   return (REG_LINK, resource lists) is <no data>.
 # - Types show as REG_SZ, REG_EXPAND_SZ, REG_MULTI_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_NONE,
 #   and REG_UNKNOWN for the kinds .NET doesn't name.
 #
+# The key. The hashes are HMAC-SHA256 under a random 16-byte key, so without the key a hash can't
+# be reversed by guessing its text, or matched with another session's (section 5.5's correction:
+# an unkeyed hash and the exact length gave a short name away). pc amd-diff before makes the key on
+# the Mac, keeps it in .dogfood/amd-diff/<stamp>/key and sends it with before and with after. A
+# snapshot holds the key's id, never the key: "key_id", the first 16 hex digits of the HMAC-SHA256
+# of "kairo-regdiff key id" under the key. Two snapshots compare only when their ids match.
+#
 # A snapshot is one JSON object (ConvertTo-RegdiffJson), holding only those shown forms:
-#   {"kairo_regdiff":1,"driver":false,"max_depth":8,"max_values":20000,"value_count":2,"cut":false,
+#   {"kairo_regdiff":1,"key_id":"0123456789abcdef","driver":false,"max_depth":8,"max_values":20000,
+#    "value_count":2,"cut":false,
 #    "scopes":["HKCU\\Software\\AMD","HKLM\\SOFTWARE\\AMD","HKLM\\SOFTWARE\\WOW6432Node\\AMD"],
 #    "keys":[{"key":"HKCU\\Software\\AMD","state":"read","values":{}},
 #      {"key":"HKCU\\Software\\AMD\\DVR","state":"read","values":{"DvrEnabled":"REG_DWORD 1",
-#        "<name len=21 sha256=0123abcd>":"REG_SZ <str len=33 sha256=89abcdef>"}},
+#        "<name len=21 hmac=0123abcd>":"REG_SZ <str len=33 hmac=89abcdef>"}},
 #      {"key":"HKLM\\SOFTWARE\\AMD","state":"absent"},{"key":"HKLM\\SOFTWARE\\WOW6432Node\\AMD","state":"absent"}]}
 # A key's state is read (with its values, name -> "TYPE shown"), absent (a scope that doesn't
-# exist), denied, deep or cut. Read-RegdiffSnapshot refuses a file that holds anything else.
+# exist), denied, deep or cut. Read-RegdiffSnapshot refuses a file that holds anything else: a
+# name or string the plain test would hash included.
 #
 # The lines (docs/milestones/M1.md, Formats), sorted by path, then the count:
 #   HKCU\Software\AMD\DVR\DvrEnabled: 1 -> 0
@@ -68,7 +90,8 @@
 # change. The count line always says "values".
 #
 # As a library (amd-diff.ps1 dot-sources the text the Mac sends; so do the tests):
-#   $s = Get-RegdiffSnapshot -OwnerSid (Get-RegdiffOwnerSid) [-Driver]   # the live registry
+#   $key = ConvertTo-RegdiffKey '<32 hex digits>'     # or New-RegdiffKey: 16 random bytes
+#   $s = Get-RegdiffSnapshot -OwnerSid (Get-RegdiffOwnerSid) -Key $key [-Driver]   # the live registry
 #   $json = ConvertTo-RegdiffJson $s; $back = Read-RegdiffSnapshot $json 'before.json'
 #   $d = Compare-RegdiffSnapshot $before $after       # $d.Lines (the count line last), $d.Changed
 #   Format-RegdiffSummary $s                          # the terminal's view: counts per scope
@@ -80,7 +103,9 @@
 #
 # Rules: ASCII only; Windows PowerShell 5.1 syntax and .NET Framework 4.x APIs (it runs on
 # PowerShell 7); no Add-Type; clean under Set-StrictMode -Version 3.0. No message names a file's
-# folder or anything read from the registry.
+# folder, the key or anything read from the registry. A dictionary keyed by registry names is
+# counted with get_Count() and listed with get_Keys() or GetEnumerator(), never .Count or .Keys,
+# which PowerShell answers with a value named Count or Keys.
 
 function New-RegdiffError([int] $Code, [string] $Message) {
     $exception = [Exception]::new($Message)
@@ -111,58 +136,120 @@ function Get-RegdiffDisplayClass {
 # --- What may be shown ---------------------------------------------------------------------------
 
 function Test-RegdiffPlain([string] $Text, [string[]] $Hidden) {
-    # Section 5.5's plain-text test. The pattern leaves out \, / and @; a hidden name fails it in any case.
+    # Section 5.5's plain-text test, with its 2026-11-24 correction, for names and data alike: the
+    # pattern, which leaves out \, / and @; no SID-shaped word; no program's name (.exe or .dll)
+    # other than Kairo's own kairo-<name>.exe; and no hidden name, in any case.
     if ($Text -cnotmatch '^[A-Za-z0-9 _.,+=#:;()\[\]-]{0,64}\z') { return $false }
+    if ([regex]::IsMatch($Text, '(?i)\bS-1-[0-9]+(-[0-9]+)+')) { return $false }
+    # Kairo's own programs, such as kairo-loadgen.exe, are taken out first; any other .exe or .dll fails.
+    $others = [regex]::Replace($Text, '(?i)(?<![A-Za-z0-9_.-])kairo-[A-Za-z0-9_-]+\.exe\b', '')
+    if ([regex]::IsMatch($others, '(?i)\.(exe|dll)\b')) { return $false }
     foreach ($name in $Hidden) {
         if (-not [string]::IsNullOrEmpty($name) -and $Text.IndexOf($name, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $false }
     }
     return $true
 }
 
-function Get-RegdiffHash([byte[]] $Bytes) {
-    # The first 8 hex digits of the bytes' SHA-256.
-    $sha = [Security.Cryptography.SHA256]::Create()
+function Get-RegdiffReservedNames {
+    # The member names PowerShell reserves: ConvertFrom-Json refuses an object that has one as a
+    # property, so a value of that name could never be read back from a snapshot.
+    return @('PSObject', 'PSBase', 'PSAdapted', 'PSExtended', 'PSTypeNames')
+}
+
+function Test-RegdiffPlainName([string] $Text, [string[]] $Hidden) {
+    # A key or value name: plain, and not a reserved member name in any case. A GUID in a name stays.
+    if ((Get-RegdiffReservedNames) -contains $Text) { return $false }
+    return (Test-RegdiffPlain $Text $Hidden)
+}
+
+function Test-RegdiffPlainData([string] $Text, [string[]] $Hidden) {
+    # A string value's data: plain, and holding no GUID, 8-4-4-4-12 hex digits with their hyphens
+    # or 32 hex digits in a row (an install ID is a PC detail).
+    if ([regex]::IsMatch($Text, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}')) { return $false }
+    return (Test-RegdiffPlain $Text $Hidden)
+}
+
+# --- The key ---------------------------------------------------------------------------------------
+
+function Test-RegdiffKey($Key) {
+    return ($Key -is [byte[]] -and $Key.Length -eq 16)
+}
+
+function New-RegdiffKey {
+    # 16 random bytes, for a snapshot taken without a given key.
+    $key = [byte[]]::new(16)
+    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
-        $digest = $sha.ComputeHash($Bytes)
+        $random.GetBytes($key)
     } finally {
-        $sha.Dispose()
+        $random.Dispose()
     }
-    return [BitConverter]::ToString($digest, 0, 4).Replace('-', '').ToLowerInvariant()
+    return ,$key
 }
 
-function Format-RegdiffToken([string] $Kind, [long] $Length, [byte[]] $Bytes) {
-    # <name|str|bin len=N sha256=8hex>.
-    return ('<' + $Kind + ' len=' + $Length.ToString([Globalization.CultureInfo]::InvariantCulture) + ' sha256=' + (Get-RegdiffHash $Bytes) + '>')
+function ConvertTo-RegdiffKey([string] $Text) {
+    # A key written as 32 hex digits, as 16 bytes. The message never quotes the text.
+    if ($Text -cnotmatch '^[0-9A-Fa-f]{32}\z') { throw (New-RegdiffError 2 'the key isn''t 32 hex digits (16 bytes)') }
+    $key = [byte[]]::new(16)
+    for ($i = 0; $i -lt 16; $i++) { $key[$i] = [Convert]::ToByte($Text.Substring(2 * $i, 2), 16) }
+    return ,$key
 }
 
-function Format-RegdiffName([string] $Name, [string[]] $Hidden) {
+function Get-RegdiffHmac([byte[]] $Key, [byte[]] $Bytes, [int] $Digits) {
+    # The first $Digits hex digits (an even number) of HMAC-SHA256(key, bytes).
+    if ($null -eq $Key -or $Key.Length -eq 0) { throw (New-RegdiffError 1 'internal: no key for the hashes') }
+    $hmac = [Security.Cryptography.HMACSHA256]::new($Key)
+    try {
+        $digest = $hmac.ComputeHash($Bytes)
+    } finally {
+        $hmac.Dispose()
+    }
+    return [BitConverter]::ToString($digest, 0, [int]($Digits / 2)).Replace('-', '').ToLowerInvariant()
+}
+
+function Get-RegdiffHash([byte[]] $Key, [byte[]] $Bytes) {
+    # A token's hash: the first 8 hex digits of HMAC-SHA256(key, bytes).
+    return (Get-RegdiffHmac $Key $Bytes 8)
+}
+
+function Get-RegdiffKeyId([byte[]] $Key) {
+    # What a snapshot holds of its key: the first 16 hex digits of HMAC-SHA256(key, "kairo-regdiff key id").
+    return (Get-RegdiffHmac $Key ([Text.Encoding]::UTF8.GetBytes('kairo-regdiff key id')) 16)
+}
+
+function Format-RegdiffToken([string] $Kind, [long] $Length, [byte[]] $Bytes, [byte[]] $Key) {
+    # <name|str|bin len=N hmac=8hex>.
+    return ('<' + $Kind + ' len=' + $Length.ToString([Globalization.CultureInfo]::InvariantCulture) + ' hmac=' + (Get-RegdiffHash $Key $Bytes) + '>')
+}
+
+function Format-RegdiffName([string] $Name, [string[]] $Hidden, [byte[]] $Key) {
     # A key or value name as it shows: itself when plain, <default> for a key's unnamed value, else
-    # <name len=N sha256=8hex>.
+    # <name len=N hmac=8hex>.
     if ($Name.Length -eq 0) { return '<default>' }
-    if (Test-RegdiffPlain $Name $Hidden) { return $Name }
-    return (Format-RegdiffToken 'name' $Name.Length ([Text.Encoding]::UTF8.GetBytes($Name)))
+    if (Test-RegdiffPlainName $Name $Hidden) { return $Name }
+    return (Format-RegdiffToken 'name' $Name.Length ([Text.Encoding]::UTF8.GetBytes($Name)) $Key)
 }
 
-function Format-RegdiffData($Data, [string[]] $Hidden) {
+function Format-RegdiffData($Data, [string[]] $Hidden, [byte[]] $Key) {
     # A value's data as it shows, by its .NET type: Int32 (DWORD) and Int64 (QWORD) as unsigned
-    # numbers, a string or a string array by the plain test, bytes always hashed.
+    # numbers, a string or a string array by the data's plain test, bytes always hashed.
     $inv = [Globalization.CultureInfo]::InvariantCulture
     if ($null -eq $Data) { return '<no data>' }
     if ($Data -is [int]) { return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Data), 0).ToString($inv) }
     if ($Data -is [long]) { return [BitConverter]::ToUInt64([BitConverter]::GetBytes([long]$Data), 0).ToString($inv) }
-    if ($Data -is [byte[]]) { return (Format-RegdiffToken 'bin' $Data.Length $Data) }
+    if ($Data -is [byte[]]) { return (Format-RegdiffToken 'bin' $Data.Length $Data $Key) }
     if ($Data -is [string]) {
-        if (Test-RegdiffPlain $Data $Hidden) { return ('"' + $Data + '"') }
-        return (Format-RegdiffToken 'str' $Data.Length ([Text.Encoding]::UTF8.GetBytes($Data)))
+        if (Test-RegdiffPlainData $Data $Hidden) { return ('"' + $Data + '"') }
+        return (Format-RegdiffToken 'str' $Data.Length ([Text.Encoding]::UTF8.GetBytes($Data)) $Key)
     }
     if ($Data -is [string[]]) {
-        if (Test-RegdiffPlain ([string]::Join(',', $Data)) $Hidden) {
+        if (Test-RegdiffPlainData ([string]::Join(',', $Data)) $Hidden) {
             $quoted = [Collections.Generic.List[string]]::new()
             foreach ($item in $Data) { $quoted.Add('"' + $item + '"') }
             return ('[' + [string]::Join(',', $quoted) + ']')
         }
         $whole = [string]::Join([string][char]0, $Data)
-        return (Format-RegdiffToken 'str' $whole.Length ([Text.Encoding]::UTF8.GetBytes($whole)))
+        return (Format-RegdiffToken 'str' $whole.Length ([Text.Encoding]::UTF8.GetBytes($whole)) $Key)
     }
     throw (New-RegdiffError 1 ('a value of an unexpected .NET type, ' + $Data.GetType().Name))
 }
@@ -181,26 +268,27 @@ function Get-RegdiffTypeName([string] $Kind) {
     return 'REG_UNKNOWN'
 }
 
-function Format-RegdiffValue([string] $Kind, $Data, [string[]] $Hidden) {
-    # "TYPE shown", as a snapshot holds a value: REG_DWORD 1, REG_SZ "abc", REG_BINARY <bin len=4 sha256=...>.
-    return ((Get-RegdiffTypeName $Kind) + ' ' + (Format-RegdiffData $Data $Hidden))
+function Format-RegdiffValue([string] $Kind, $Data, [string[]] $Hidden, [byte[]] $Key) {
+    # "TYPE shown", as a snapshot holds a value: REG_DWORD 1, REG_SZ "abc", REG_BINARY <bin len=4 hmac=...>.
+    return ((Get-RegdiffTypeName $Kind) + ' ' + (Format-RegdiffData $Data $Hidden $Key))
 }
 
 # --- Keys: the registry's, or the tests' synthetic ones ----------------------------------------------
 # A synthetic key is a dictionary: 'values' maps a value's name to @(kind, data), and 'keys' a
-# subkey's name to a synthetic key, or to 'denied' for one that may not be read.
+# subkey's name to a synthetic key, or to 'denied' for one that may not be read. Their names are
+# listed with get_Keys(): .Keys would give the entry of a value or subkey named Keys.
 
 function Get-RegdiffValueNames($Key) {
     if ($Key -is [Microsoft.Win32.RegistryKey]) { return ,[string[]]$Key.GetValueNames() }
     $names = [Collections.Generic.List[string]]::new()
-    if ($Key.Contains('values')) { foreach ($name in $Key['values'].Keys) { $names.Add([string]$name) } }
+    if ($Key.Contains('values')) { foreach ($name in $Key['values'].get_Keys()) { $names.Add([string]$name) } }
     return ,$names.ToArray()
 }
 
 function Get-RegdiffSubKeyNames($Key) {
     if ($Key -is [Microsoft.Win32.RegistryKey]) { return ,[string[]]$Key.GetSubKeyNames() }
     $names = [Collections.Generic.List[string]]::new()
-    if ($Key.Contains('keys')) { foreach ($name in $Key['keys'].Keys) { $names.Add([string]$name) } }
+    if ($Key.Contains('keys')) { foreach ($name in $Key['keys'].get_Keys()) { $names.Add([string]$name) } }
     return ,$names.ToArray()
 }
 
@@ -247,14 +335,14 @@ function Get-RegdiffText($Key, [string] $Name) {
 
 # --- The walk --------------------------------------------------------------------------------------
 
-function Get-RegdiffShownNames([string[]] $Names, [string[]] $Hidden) {
+function Get-RegdiffShownNames([string[]] $Names, [string[]] $Hidden, [byte[]] $Key) {
     # Each name with its shown form, in the order of the shown forms (ignoring case). A name shown
     # like one before it (two hashes alike in 32 bits) is left out.
     $shown = [string[]]::new($Names.Length)
     $raw = [string[]]::new($Names.Length)
     for ($i = 0; $i -lt $Names.Length; $i++) {
         $raw[$i] = $Names[$i]
-        $shown[$i] = Format-RegdiffName $Names[$i] $Hidden
+        $shown[$i] = Format-RegdiffName $Names[$i] $Hidden $Key
     }
     [Array]::Sort($shown, $raw, [StringComparer]::OrdinalIgnoreCase)
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -265,10 +353,12 @@ function Get-RegdiffShownNames([string[]] $Names, [string[]] $Hidden) {
     return ,$out.ToArray()
 }
 
-function New-RegdiffWalk([string[]] $Hidden) {
+function New-RegdiffWalk([string[]] $Hidden, [byte[]] $Key) {
+    if (-not (Test-RegdiffKey $Key)) { throw (New-RegdiffError 1 'internal: the key isn''t 16 bytes') }
     $limits = Get-RegdiffLimits
     return [pscustomobject]@{
         Hidden     = $Hidden
+        Key        = $Key
         MaxDepth   = $limits.Depth
         MaxValues  = $limits.Values
         ValueCount = 0
@@ -295,17 +385,18 @@ function Read-RegdiffTree($Walk, $Key, [string] $Label, [int] $Depth) {
         return
     }
     $values = [ordered]@{}
-    foreach ($item in (Get-RegdiffShownNames $valueNames $Walk.Hidden)) {
+    foreach ($item in (Get-RegdiffShownNames $valueNames $Walk.Hidden $Walk.Key)) {
         $value = Read-RegdiffValue $Key $item.Raw
         if ($null -eq $value) { continue }
-        $values[$item.Shown] = Format-RegdiffValue $value['Kind'] $value['Data'] $Walk.Hidden
+        $values[$item.Shown] = Format-RegdiffValue $value['Kind'] $value['Data'] $Walk.Hidden $Walk.Key
     }
-    $Walk.ValueCount += $values.Count
+    # get_Count(): .Count would give the data of a value named Count.
+    $Walk.ValueCount += $values.get_Count()
     Add-RegdiffEntry $Walk $Label 'read' $values
 
     $subNames = [string[]]@()
     try { $subNames = Get-RegdiffSubKeyNames $Key } catch [IO.IOException] { $subNames = [string[]]@() }
-    foreach ($item in (Get-RegdiffShownNames $subNames $Walk.Hidden)) {
+    foreach ($item in (Get-RegdiffShownNames $subNames $Walk.Hidden $Walk.Key)) {
         $childLabel = $Label + '\' + $item.Shown
         if ($Depth -ge $Walk.MaxDepth) {
             Add-RegdiffEntry $Walk $childLabel 'deep' $null
@@ -351,9 +442,10 @@ function Open-RegdiffScope($Base, [string] $SubKey, [string] $Label) {
 }
 
 function New-RegdiffSnapshot {
-    # The scopes walked in order into a snapshot: an ordered dictionary in the JSON's shape.
-    param([object[]] $Scopes, [string[]] $Hidden, [switch] $Driver)
-    $walk = New-RegdiffWalk $Hidden
+    # The scopes walked in order into a snapshot: an ordered dictionary in the JSON's shape. Its
+    # hashes are keyed with $Key, 16 bytes.
+    param([object[]] $Scopes, [string[]] $Hidden, [byte[]] $Key, [switch] $Driver)
+    $walk = New-RegdiffWalk $Hidden $Key
     $labels = [Collections.Generic.List[string]]::new()
     foreach ($scope in $Scopes) {
         $labels.Add($scope.Label)
@@ -366,6 +458,7 @@ function New-RegdiffSnapshot {
     }
     $snapshot = [ordered]@{}
     $snapshot['kairo_regdiff'] = 1
+    $snapshot['key_id'] = Get-RegdiffKeyId $Key
     $snapshot['driver'] = [bool]$Driver
     $snapshot['max_depth'] = $walk.MaxDepth
     $snapshot['max_values'] = $walk.MaxValues
@@ -432,11 +525,13 @@ function Read-RegdiffNamedText($Machine, [string] $SubKey, [string] $Name) {
     }
 }
 
-function Get-RegdiffHiddenNames($Machine, [string] $OwnerSid) {
+function Get-RegdiffHiddenNames($Machine, [string] $OwnerSid, [string] $SessionSid) {
     # The names no line or snapshot may show: this session's account, its domain and the PC's name;
-    # the PC's DNS host name; the owner's account (from its SID); and both accounts' profile folder
-    # names. They are compared, never shown.
+    # the PC's DNS host name; the owner's account (from its SID); both accounts' profile folder
+    # names; and both accounts' SIDs. They are compared, never shown.
     $names = [Collections.Generic.List[string]]::new()
+    Add-RegdiffHiddenName $names $OwnerSid
+    Add-RegdiffHiddenName $names $SessionSid
     Add-RegdiffHiddenName $names ([Environment]::UserName)
     Add-RegdiffHiddenName $names ([Environment]::MachineName)
     Add-RegdiffHiddenName $names (Get-RegdiffLeaf ([Environment]::GetFolderPath('UserProfile')))
@@ -496,10 +591,12 @@ function Get-RegdiffDriverScopes($Machine, $Opened) {
 }
 
 function Get-RegdiffSnapshot {
-    # A snapshot of section 5.5's scopes in the live registry, with the owner's hive found by its SID.
-    param([string] $OwnerSid, [switch] $Driver)
+    # A snapshot of section 5.5's scopes in the live registry, with the owner's hive found by its
+    # SID and the hashes keyed with $Key, 16 bytes.
+    param([string] $OwnerSid, [switch] $Driver, [byte[]] $Key)
     if (-not (Test-RegdiffWindows)) { throw (New-RegdiffError 1 'the registry exists only on Windows') }
     if ($OwnerSid -cnotmatch '^S-1-[0-9]+(-[0-9]+)+\z') { throw (New-RegdiffError 1 'the owner''s SID is not a SID') }
+    if (-not (Test-RegdiffKey $Key)) { throw (New-RegdiffError 1 'internal: the key isn''t 16 bytes') }
     $view = [Microsoft.Win32.RegistryView]::Registry64
     $opened = [Collections.Generic.List[object]]::new()
     try {
@@ -515,7 +612,7 @@ function Get-RegdiffSnapshot {
         }
         if ($null -eq $hive) { throw (New-RegdiffError 1 'the owner''s registry hive can''t be read: is the owner signed in?') }
         $opened.Add($hive)
-        $hidden = Get-RegdiffHiddenNames $machine $OwnerSid
+        $hidden = Get-RegdiffHiddenNames $machine $OwnerSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
         $scopes = [Collections.Generic.List[object]]::new()
         $scopes.Add((Open-RegdiffScope $hive 'Software\AMD' 'HKCU\Software\AMD'))
         $scopes.Add((Open-RegdiffScope $machine 'SOFTWARE\AMD' 'HKLM\SOFTWARE\AMD'))
@@ -524,7 +621,7 @@ function Get-RegdiffSnapshot {
         if ($Driver) {
             foreach ($scope in (Get-RegdiffDriverScopes $machine $opened)) { $scopes.Add($scope) }
         }
-        return (New-RegdiffSnapshot -Scopes $scopes.ToArray() -Hidden $hidden -Driver:$Driver)
+        return (New-RegdiffSnapshot -Scopes $scopes.ToArray() -Hidden $hidden -Key $Key -Driver:$Driver)
     } finally {
         foreach ($key in $opened) { Close-RegdiffKey $key }
     }
@@ -553,9 +650,10 @@ function ConvertTo-RegdiffInteger($Value) {
 }
 
 function Test-RegdiffShownName([string] $Text) {
-    # A value's name in a snapshot: plain, <default>, or a name token.
-    if ($Text -cmatch '^[A-Za-z0-9 _.,+=#:;()\[\]-]{1,64}\z') { return $true }
-    return ($Text -ceq '<default>' -or $Text -cmatch '^<name len=[0-9]{1,10} sha256=[0-9a-f]{8}>\z')
+    # A value's name in a snapshot: plain by the names' test (a snapshot holds no hidden name to
+    # compare), <default>, or a name token.
+    if ($Text.Length -gt 0 -and (Test-RegdiffPlainName $Text $null)) { return $true }
+    return ($Text -ceq '<default>' -or $Text -cmatch '^<name len=[0-9]{1,10} hmac=[0-9a-f]{8}>\z')
 }
 
 function Test-RegdiffShownKey([string] $Text) {
@@ -575,11 +673,23 @@ function Test-RegdiffShownKey([string] $Text) {
 }
 
 function Test-RegdiffShownValue([string] $Text) {
-    # "TYPE shown", as a snapshot holds a value.
+    # "TYPE shown", as a snapshot holds a value: a number, a token, <no data>, or a string or list
+    # whose text passes the data's plain test.
     if ($Text.Length -gt 300) { return $false }
-    $plain = '[A-Za-z0-9 _.,+=#:;()\[\]-]'
-    $shown = '([0-9]{1,20}|"' + $plain + '{0,64}"|\[("' + $plain + '{0,64}"(,"' + $plain + '{0,64}")*)?\]|<(str|bin) len=[0-9]{1,10} sha256=[0-9a-f]{8}>|<no data>)'
-    return ($Text -cmatch ('^REG_(SZ|EXPAND_SZ|MULTI_SZ|DWORD|QWORD|BINARY|NONE|UNKNOWN) ' + $shown + '\z'))
+    $match = [regex]::Match($Text, '^REG_(SZ|EXPAND_SZ|MULTI_SZ|DWORD|QWORD|BINARY|NONE|UNKNOWN) (.*)\z')
+    if (-not $match.Success) { return $false }
+    $shown = $match.Groups[2].Value
+    if ($shown -cmatch '^([0-9]{1,20}|<(str|bin) len=[0-9]{1,10} hmac=[0-9a-f]{8}>|<no data>)\z') { return $true }
+    $quoted = [regex]::Match($shown, '^"([^"]*)"\z')
+    if ($quoted.Success) { return (Test-RegdiffPlainData $quoted.Groups[1].Value $null) }
+    # A list, ["a","b"]: its strings hold no quote, so they split at ","; joined by commas, they
+    # must pass as the walk's did.
+    $list = [regex]::Match($shown, '^\[("[^"]*"(,"[^"]*")*)?\]\z')
+    if (-not $list.Success) { return $false }
+    $inner = $list.Groups[1].Value
+    if ($inner.Length -eq 0) { return $true }
+    $items = $inner.Substring(1, $inner.Length - 2).Split([string[]]@('","'), [StringSplitOptions]::None)
+    return (Test-RegdiffPlainData ([string]::Join(',', $items)) $null)
 }
 
 function Read-RegdiffSnapshot([string] $Text, [string] $What = 'the snapshot') {
@@ -600,6 +710,9 @@ function Read-RegdiffSnapshot([string] $Text, [string] $What = 'the snapshot') {
     # The fields in New-RegdiffSnapshot's order, so a snapshot read back writes the same JSON.
     $snapshot = [ordered]@{}
     $snapshot['kairo_regdiff'] = 1
+    $keyId = Get-RegdiffField $parsed 'key_id'
+    if ($keyId -isnot [string] -or $keyId -cnotmatch '^[0-9a-f]{16}\z') { throw (New-RegdiffError 2 ($bad + ': no "key_id" of 16 hex digits')) }
+    $snapshot['key_id'] = $keyId
     foreach ($name in @('driver', 'max_depth', 'max_values', 'value_count', 'cut')) {
         $field = Get-RegdiffField $parsed $name
         if ($name -ceq 'driver' -or $name -ceq 'cut') {
@@ -641,7 +754,7 @@ function Read-RegdiffSnapshot([string] $Text, [string] $What = 'the snapshot') {
                 if ($property.Value -isnot [string] -or -not (Test-RegdiffShownValue $property.Value)) { throw (New-RegdiffError 2 ($bad + ': a value isn''t a type and data as lines show them')) }
                 $map[$property.Name] = $property.Value
             }
-            $count += $map.Count
+            $count += $map.get_Count()
             $entry['values'] = $map
         } elseif ($null -ne $values) {
             throw (New-RegdiffError 2 ($bad + ': a key that wasn''t read has values'))
@@ -711,6 +824,9 @@ function Add-RegdiffLine($Sorted, [string] $Path, [string] $Line) {
 function Compare-RegdiffSnapshot($Before, $After) {
     # The lines of section 5.5 for two snapshots: one per changed value, one per key either didn't
     # read, sorted by path, then "N values changed". Returns Lines and Changed.
+    if ([string]$Before['key_id'] -cne [string]$After['key_id']) {
+        throw (New-RegdiffError 2 'the snapshots were taken with different keys, so their hashes don''t compare: take both with one key')
+    }
     if ([bool]$Before['driver'] -ne [bool]$After['driver']) {
         throw (New-RegdiffError 2 'the snapshots read different scopes: one was taken with --driver and one without')
     }
@@ -722,8 +838,8 @@ function Compare-RegdiffSnapshot($Before, $After) {
     $new = Get-RegdiffIndex $After
     $sorted = [Collections.Generic.List[object]]::new()
     $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in $old.Values.Keys) { [void]$paths.Add($path) }
-    foreach ($path in $new.Values.Keys) { [void]$paths.Add($path) }
+    foreach ($path in $old.Values.get_Keys()) { [void]$paths.Add($path) }
+    foreach ($path in $new.Values.get_Keys()) { [void]$paths.Add($path) }
     $changed = 0
     foreach ($path in $paths) {
         $was = $null
@@ -793,7 +909,7 @@ function Format-RegdiffSummary($Snapshot) {
             $own = [string]::Equals($label, $scope, [StringComparison]::OrdinalIgnoreCase)
             if (-not $own -and -not $label.StartsWith($scope + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
             if ($own) { $state = [string]$entry['state'] }
-            if ($entry['state'] -ceq 'read') { $keys++; $values += $entry['values'].Count }
+            if ($entry['state'] -ceq 'read') { $keys++; $values += $entry['values'].get_Count() }
             elseif ($entry['state'] -ceq 'denied') { $denied++ }
             elseif ($entry['state'] -ceq 'deep') { $deep++ }
             elseif ($entry['state'] -ceq 'cut') { $cut = $true }
@@ -837,7 +953,7 @@ function ConvertFrom-RegdiffArguments([object[]] $Arguments) {
     # pwsh -File passes every argument as text: -Name:value arrives as -Name and value, and
     # -Name:$false as -Name and a bool. & passes -Name: and the value, a switch's as a bool.
     # Names are matched whole, ignoring case; anything else is refused.
-    $values = @('Before', 'After')
+    $values = @('Before', 'After', 'Key')
     $switches = @('Snapshot', 'Driver')
     $parsed = @{}
     $i = 0
@@ -879,12 +995,25 @@ if ($MyInvocation.InvocationName -ne '.') {
         $regdiffArgs = ConvertFrom-RegdiffArguments $args
         if ($regdiffArgs.ContainsKey('Snapshot') -and [bool]$regdiffArgs['Snapshot']) {
             if ($regdiffArgs.ContainsKey('Before') -or $regdiffArgs.ContainsKey('After')) { throw (New-RegdiffError 2 '-Snapshot takes no -Before or -After') }
+            $regdiffKey = $null
+            if ($regdiffArgs.ContainsKey('Key')) {
+                try {
+                    $regdiffKey = ConvertTo-RegdiffKey ([string]$regdiffArgs['Key'])
+                } catch {
+                    throw (New-RegdiffError 2 '-Key must be 32 hex digits (16 bytes)')
+                }
+            }
             if (-not (Test-RegdiffWindows)) { throw (New-RegdiffError 1 'the registry exists only on Windows') }
+            if ($null -eq $regdiffKey) {
+                $regdiffKey = New-RegdiffKey
+                [Console]::Error.WriteLine('regdiff: no -Key, so this snapshot''s hashes use a random key that isn''t shown or kept: it compares with no other snapshot')
+            }
             $regdiffDriver = $regdiffArgs.ContainsKey('Driver') -and [bool]$regdiffArgs['Driver']
             $regdiffSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-            [Console]::Out.WriteLine((ConvertTo-RegdiffJson (Get-RegdiffSnapshot -OwnerSid $regdiffSid -Driver:$regdiffDriver)))
+            [Console]::Out.WriteLine((ConvertTo-RegdiffJson (Get-RegdiffSnapshot -OwnerSid $regdiffSid -Driver:$regdiffDriver -Key $regdiffKey)))
         } else {
             if ($regdiffArgs.ContainsKey('Driver')) { throw (New-RegdiffError 2 '-Driver goes with -Snapshot') }
+            if ($regdiffArgs.ContainsKey('Key')) { throw (New-RegdiffError 2 '-Key goes with -Snapshot: two snapshots compare by the key id they hold') }
             foreach ($required in @('Before', 'After')) {
                 if (-not $regdiffArgs.ContainsKey($required) -or [string]::IsNullOrEmpty([string]$regdiffArgs[$required])) {
                     throw (New-RegdiffError 2 ('missing -' + $required + ' (or -Snapshot)'))
