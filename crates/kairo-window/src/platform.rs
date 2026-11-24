@@ -742,6 +742,18 @@ mod tests {
         (rect.width() > 0 && rect.height() > 0).then_some(rect)
     }
 
+    /// Whether CI says it has a desktop (`KAIRO_CI_DESKTOP`, set by Windows CI's test step): there
+    /// a missing display or a refused exclusion fails, since a passing test's report never shows.
+    fn on_ci_desktop() -> bool {
+        std::env::var_os("KAIRO_CI_DESKTOP").is_some()
+    }
+
+    /// Reports `why` and skips the test, or fails it on CI's desktop.
+    fn skip(why: &str) {
+        assert!(!on_ci_desktop(), "KAIRO_CI_DESKTOP is set: {why}");
+        eprintln!("{why}: reported, not failed");
+    }
+
     fn styles(cover: &Cover) -> (u32, u32) {
         let window = HWND(cover.hwnd() as *mut _);
         // SAFETY: reads the cover's own window's styles.
@@ -768,8 +780,7 @@ mod tests {
     #[test]
     fn a_cover_is_black_topmost_never_in_front_and_goes_when_dropped() {
         let Some(rect) = a_display() else {
-            eprintln!("no usable desktop here: the cover test is reported, not failed");
-            return;
+            return skip("no usable desktop here");
         };
         let cover = Cover::show(rect, CaptureExclusion::Off).unwrap();
         let window = HWND(cover.hwnd() as *mut _);
@@ -806,8 +817,7 @@ mod tests {
     #[test]
     fn a_cover_can_be_hidden_from_capture() {
         let Some(rect) = a_display() else {
-            eprintln!("no usable desktop here: the cover test is reported, not failed");
-            return;
+            return skip("no usable desktop here");
         };
         match Cover::show(rect, CaptureExclusion::On) {
             Ok(cover) => {
@@ -818,10 +828,9 @@ mod tests {
                 assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0);
                 assert_eq!(cover.window_rect(), Some(rect));
             }
-            // A desktop that DWM doesn't compose refuses it: reported, not failed.
-            Err(CoverError::Exclusion(why)) => {
-                eprintln!("capture exclusion refused here ({why}): reported, not failed");
-            }
+            // A desktop that DWM doesn't compose refuses it, which is reported, not failed; on CI's
+            // desktop every exclusion error fails, a wrong read-back included.
+            Err(CoverError::Exclusion(why)) => skip(&format!("capture exclusion failed ({why})")),
             Err(e) => panic!("{e}"),
         }
     }

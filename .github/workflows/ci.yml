@@ -153,7 +153,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The runner has a desktop: kairo-window's cover tests fail here rather than report a skip.
       - name: Test
+        env:
+          KAIRO_CI_DESKTOP: "1"
         run: cargo test --workspace --locked
 
       # The shipped kairo-verify: the linked decoder and no dev-tools (research 16 §2 item 3).
