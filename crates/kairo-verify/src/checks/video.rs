@@ -369,6 +369,8 @@ pub(crate) fn params(ctx: &Ctx<'_>) -> Outcome {
         "cabac": pps.cabac, "vui_colour": vui.colour.map(|(p, t, m)| [p, t, m]),
         "vui_full_range": vui.full_range,
         "inband_sps": ctx.clip.scan.as_ref().map(|s| s.inband_sps),
+        "inband_pps": ctx.clip.scan.as_ref().map(|s| s.inband_pps),
+        "filler_nals": ctx.clip.scan.as_ref().map(|s| s.filler_nals),
     });
     outcome.detail = format!(
         "High {}x{} level {}, 4:2:0 8-bit, {}",
@@ -636,7 +638,14 @@ pub(crate) fn gop(ctx: &Ctx<'_>) -> Outcome {
             first_numbers(&recovery)
         )
     });
+    // IDR samples that carry their own SPS and PPS (AMF's `header_spacing`).
+    let idr_with_params = scan
+        .frames
+        .iter()
+        .filter(|f| f.is_idr() && f.sps && f.pps)
+        .count();
     outcome.value = json!({"gop_frames": gop, "sync": sync.len(), "idr": idr.len(),
+                           "idr_with_params": idr_with_params,
                            "sync_first": sync.iter().take(LIST).collect::<Vec<_>>()});
     outcome.detail = format!(
         "closed GOP of {} frames, {} IDRs",

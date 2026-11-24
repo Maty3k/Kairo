@@ -576,7 +576,7 @@ Statuses are `pass`, `fail`, `warn`, `skip` and `error`. The verdict is `fail` i
 - **Names.** The report holds the file *name* only, never a directory. Errors are written without paths: `io::Error`'s Display adds none, and kairo-verify adds none.
 - **No PC details.** No monitor, adapter or user names, no device paths, no wall-clock time, no refresh rate.
 - **No media content.** No pixels, thumbnails, waveforms or samples; statistics only (CLAUDE:16; M1:96).
-- **The harness.** It runs `ffmpeg` with relative file names in the run folder, so FFmpeg's logs hold no paths either. The device path appears only in the job file and in devrun.log, which logs the job's cmd (devrun/run.rs:96-100). Both are local and never committed.
+- **The harness.** It runs `ffmpeg` with relative file names in the run folder, so FFmpeg's logs hold no paths either. The device path appears only in the job file, which is local and never committed; devrun.log names only the program file and how many arguments a job has (devrun/run.rs `program_name`).
 
 ### 5.7 Performance
 
