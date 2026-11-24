@@ -327,8 +327,8 @@ impl Video {
     /// Its kbps on a lossy encoder: Recommended's 25/40 Mbps, or High's 36/50 for 1440p.
     pub fn rates(self) -> (&'static str, &'static str) {
         match self {
-            Self::High => ("36M", "50M"),
-            _ => ("25M", "40M"),
+            Self::High => kairo_core::ffmpeg_cli::HIGH_RATES,
+            _ => kairo_core::ffmpeg_cli::RECOMMENDED_RATES,
         }
     }
 }
@@ -366,7 +366,7 @@ pub struct Recipe {
 pub const GOOD: &str = "good-1080p60";
 
 /// VideoToolbox's `bframes` clip also fails these: its B-frames come with an irregular `stts`,
-/// 57-frame GOPs and an audio lead that no longer matches (README §7.3 [Mac]).
+/// 57-frame GOPs and an audio lead that no longer matches (README §7.3, measured on the Mac).
 const BFRAMES_MAY_FAIL: [&str; 3] = ["video.cfr", "video.gop", "av.start_alignment"];
 
 impl Recipe {

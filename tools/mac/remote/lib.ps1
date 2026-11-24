@@ -10,7 +10,8 @@
 # Output goes to stdout. "@@KV key=value" lines are data for the Mac and are not shown.
 # The last line is always "@@KAIRO-EXIT <code>": the Mac turns it back into its exit code (the last
 # such line counts, and log and job output is always printed indented, so it cannot fake one).
-# Exit codes: 0 ok, 1 failed, 2 bad input, 3 PC busy, 4 busy state unknown, 5 timed out, 6 job aborted.
+# Exit codes: 0 ok, 1 failed, 2 bad input, 3 PC busy, 4 busy state unknown, 5 timed out, 6 job aborted,
+# 7 a display-driver reset or an unexpected reboot during a harness run (harness-events.ps1).
 #
 # Contract: docs/PLAN.md section 3.1 and M0; crates/kairo-core/src/{layout,watch,job}.rs.
 # TODO(verify): no PowerShell has parsed or run these scripts yet (there is no pwsh on the Mac);
@@ -351,9 +352,15 @@ function Get-KairoWatch {
     return [pscustomobject]$watch
 }
 
-function Assert-PcIdle([string]$Verb) {
+function Assert-PcIdle([string]$Verb, [bool]$FullscreenRefuses = $false) {
     # Stops the script unless the owner is away, or --force was given (the owner said it is OK).
+    # With $FullscreenRefuses, a fullscreen window in front refuses even with --force: a harness
+    # capture never starts over a game.
     $watch = Get-KairoWatch
+    if ($FullscreenRefuses -and ($watch.Fullscreen -eq $true)) {
+        Say ('refused: a fullscreen window is in front, so "' + $Verb + '" did not run; --force does not override that for a harness capture.')
+        Exit-Pc 3
+    }
     if ($watch.State -eq 'idle') { return }
     if ($Pc['Force']) {
         Say ('warning: the PC is ' + $watch.State.ToUpperInvariant() + ' (' + $watch.Reason + '); going ahead with "' + $Verb + '" because of --force')

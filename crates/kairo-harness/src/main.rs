@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `kairo-harness`: the Windows orchestrator behind `tools/mac/pc harness`
-//! (docs/research/16-verify-testbed/architecture.md §1.6, README §8). It runs as a hidden
-//! `\Kairo\Run` job, so it is a console program that `kairo-devrun` starts without a window.
+//! `kairo-harness`'s program (docs/research/16-verify-testbed/README.md §8; the library holds
+//! the work).
 //!
-//! This version has one verb, `displays --out FILE`: it writes `displays.json` (every active
-//! display with its device path, GDI name, model name, rectangle, refresh rate, HDR state and
-//! whether it mirrors another, and every adapter with its LUID, DXGI index, PCI ids and model
-//! name) to FILE, through a temporary file and a rename, for `pc harness displays` to fetch
-//! into `.dogfood/pc/`. The file names the owner's monitors and GPU, so it stays local
-//! (CLAUDE.md), and standard output, which `kairo-devrun` keeps as the job's `.out.log` and
-//! `pc` prints, gets only a count. `run` (gate 2's capture, started by `pc harness capture`),
-//! `corpus` and `probe` come with research 16's PR 9.
+//! `displays --out FILE` writes `displays.json` (every active display with its device path, GDI
+//! name, model name, rectangle, refresh rate, HDR state and whether it mirrors another, and every
+//! adapter with its LUID, DXGI index, PCI ids and model name) to FILE, through a temporary file
+//! and a rename, for `pc harness displays` to fetch into `.dogfood/pc/`. The file names the
+//! owner's monitors and GPU, so it stays local (CLAUDE.md), and standard output, which
+//! `kairo-devrun` keeps as the job's `.out.log` and `pc` prints, gets only a count. `run` is gate
+//! 2's capture, started by `pc harness capture` (`kairo_harness::run`); `corpus` and `probe`
+//! come with research 16's PR 9b and 9c.
 //!
-//! Exit codes: 0 ok, 1 failed, 2 usage. On other systems `displays` fails.
+//! Exit codes: `displays` 0 ok, 1 failed, 2 usage; `run` as `kairo_harness::phases::exit`. On
+//! other systems both fail.
 
 #![deny(unsafe_code)]
 
@@ -20,30 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kairo_display::Displays;
-
-const USAGE: &str = "usage: kairo-harness displays --out FILE | --version | --help";
-
-/// What the command line asks for.
-#[derive(Debug, PartialEq, Eq)]
-enum Command {
-    Displays { out: PathBuf },
-    Version,
-    Help,
-}
-
-/// Parses the arguments, without the program name.
-fn parse_args(args: &[String]) -> Result<Command, String> {
-    match args {
-        [verb, flag, out] if verb == "displays" && flag == "--out" && !out.is_empty() => {
-            Ok(Command::Displays {
-                out: PathBuf::from(out),
-            })
-        }
-        [flag] if flag == "--version" || flag == "-V" => Ok(Command::Version),
-        [flag] if flag == "--help" || flag == "-h" => Ok(Command::Help),
-        _ => Err(USAGE.to_owned()),
-    }
-}
+use kairo_harness::cli::{self, Command, USAGE};
 
 #[cfg(windows)]
 fn displays() -> Result<Displays, String> {
@@ -84,11 +61,27 @@ fn write_displays(doc: &Displays, out: &Path) -> Result<String, String> {
     ))
 }
 
+#[cfg(windows)]
+fn run(request: &cli::Request) -> u8 {
+    kairo_harness::run::run(request)
+}
+
+#[cfg(not(windows))]
+fn run(_: &cli::Request) -> u8 {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "kairo-harness: run runs on the Windows PC"
+    );
+    kairo_harness::phases::exit::FAILED
+}
+
 fn main() -> ExitCode {
     use std::io::Write;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args) {
+    match cli::parse(&args) {
+        Ok(Command::Run(request)) => ExitCode::from(run(&request)),
         Ok(Command::Displays { out }) => {
             match displays().and_then(|doc| write_displays(&doc, &out)) {
                 Ok(line) => {
@@ -132,13 +125,13 @@ mod tests {
     #[test]
     fn parses_the_command_line() {
         assert_eq!(
-            parse_args(&args("displays --out d.json")),
+            cli::parse(&args("displays --out d.json")),
             Ok(Command::Displays {
                 out: PathBuf::from("d.json")
             })
         );
-        assert_eq!(parse_args(&args("--version")), Ok(Command::Version));
-        assert_eq!(parse_args(&args("-h")), Ok(Command::Help));
+        assert_eq!(cli::parse(&args("--version")), Ok(Command::Version));
+        assert_eq!(cli::parse(&args("-h")), Ok(Command::Help));
         for bad in [
             "",
             "displays",
@@ -149,7 +142,7 @@ mod tests {
             "capture",
             "--displays",
         ] {
-            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+            assert!(cli::parse(&args(bad)).is_err(), "{bad:?}");
         }
     }
 

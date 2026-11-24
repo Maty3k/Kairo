@@ -288,6 +288,8 @@ fn path_facts(path: &DISPLAYCONFIG_PATH_INFO) -> PathFacts {
 struct OutputFacts {
     monitor: isize,
     adapter: Luid,
+    /// Its `EnumOutputs` index on that adapter.
+    index: u32,
     hdr_active: bool,
     max_luminance: f64,
     bits_per_color: u32,
@@ -328,6 +330,7 @@ fn dxgi(factory: &IDXGIFactory1) -> Result<(Vec<AdapterInfo>, Vec<OutputFacts>),
                 outputs.push(OutputFacts {
                     monitor: d.Monitor.0 as isize,
                     adapter: id,
+                    index: output_index,
                     hdr_active: d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
                     max_luminance: f64::from(d.MaxLuminance),
                     bits_per_color: d.BitsPerColor,
@@ -405,6 +408,18 @@ pub fn targets() -> Result<Vec<DisplayTarget>, DisplayError> {
 /// Every adapter, in this process's DXGI order.
 pub fn adapters() -> Result<Vec<AdapterInfo>, DisplayError> {
     Ok(dxgi(&factory()?)?.0)
+}
+
+/// The DXGI output index, on the adapter with LUID `adapter`, of the monitor `hmonitor`: what
+/// FFmpeg's `ddagrab` takes as `output_idx`. Valid in this process only, like the adapter's own
+/// index.
+pub fn output_index(adapter: Luid, hmonitor: isize) -> Result<u32, DisplayError> {
+    dxgi(&factory()?)?
+        .1
+        .into_iter()
+        .find(|o| o.adapter == adapter && o.monitor == hmonitor)
+        .map(|o| o.index)
+        .ok_or(DisplayError::NoSuchOutput)
 }
 
 /// The adapter with LUID `luid`.
