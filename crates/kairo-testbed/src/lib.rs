@@ -8,11 +8,14 @@
 //! the vblank group or timer slot they are drawn for ([`pace`]), drawn from
 //! `kairo_core::testsig` with clears and copies only ([`draw`]), and logged with QPC times in
 //! `kairo_core::testbed_log`'s format. The command line, pacing maths, draw plan and ready file
-//! are pure and tested everywhere; the Win32, DXGI and D3D11 calls are in the Windows-only
-//! `platform` and `gpu` modules, the only ones allowed `unsafe` (CLAUDE.md), and `run` ties them
-//! together. The beeps ([`beeps`]) play through `wasapi`'s safe API on an audio thread (`audio`);
-//! `voice` is `kairo-tone`'s run. The testbed never sends input, hooks anything, opens a capture device or the
-//! microphone, or touches another process (CLAUDE.md, M1:15).
+//! are pure and tested everywhere. The window, the device on the monitor's adapter, QPC, the
+//! foreground wait, the stdin watcher and the ready file's writer are `kairo-window`'s, shared
+//! with loadgen and the harness (research 17 §3.1); the testbed's own Win32, DXGI and D3D11 calls
+//! (its swap chain, vblank clock, renderer and timer) are in the Windows-only `platform` and
+//! `gpu` modules, the only ones allowed `unsafe` (CLAUDE.md), and `run` ties them together. The
+//! beeps ([`beeps`]) play through `wasapi`'s safe API on an audio thread (`audio`); `voice` is
+//! `kairo-tone`'s run. The testbed never sends input, hooks anything, opens a capture device or
+//! the microphone, or touches another process (CLAUDE.md, M1:15).
 
 #![deny(unsafe_code)]
 

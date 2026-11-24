@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use kairo_core::layout::{DEFAULT_ROOT, Layout};
 use kairo_core::testbed_log::TestbedLog;
+use kairo_window::platform::KeepDisplayOn;
 use serde_json::Value;
 
 use crate::capture::{self, CLIP, Settings, Source};
@@ -23,7 +24,7 @@ use crate::expect::Expect;
 use crate::ffmpeg_log::{self, LogCheck};
 use crate::outcome::{self, Outcome};
 use crate::phases::{Phase, exit, testbed_seconds};
-use crate::platform::{self, CREATE_NO_WINDOW, KeepDisplayOn};
+use crate::platform::{self, CREATE_NO_WINDOW};
 use crate::readback;
 use crate::ready::{Expected, Ready};
 use crate::report::{

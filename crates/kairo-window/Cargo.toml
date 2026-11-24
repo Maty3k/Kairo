@@ -1,0 +1,33 @@
+[package]
+name = "kairo-window"
+description = "The Windows code M1's instruments share: the window, the D3D11 device on a LUID, QPC, the foreground wait, the ready writer and the black cover (research 17 §3.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+kairo-core = { workspace = true }
+kairo-display = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",             # handles, HWND, LUID, RECT, waits
+    "Win32_Graphics_Direct3D",      # driver types, feature levels
+    "Win32_Graphics_Direct3D11",    # the device, its context, the back buffer's view
+    "Win32_Graphics_Dxgi",          # factory, adapter by LUID, outputs, Present, the latency wait
+    "Win32_Graphics_Dxgi_Common",   # the HDR colour space
+    "Win32_Graphics_Gdi",           # HMONITOR, the black brush, ClientToScreen, UpdateWindow
+    "Win32_Security",               # CreateEventW's attributes (the cover's stop event)
+    "Win32_System_LibraryLoader",   # GetModuleHandleW
+    "Win32_System_Performance",     # QPC
+    "Win32_System_Power",           # ES_DISPLAY_REQUIRED
+    "Win32_System_SystemInformation", # GetTickCount
+    "Win32_System_Threading",       # EcoQoS, waits, the cover's stop event
+    "Win32_UI_HiDpi",               # the framed window's size at its DPI
+    "Win32_UI_Input_KeyboardAndMouse", # GetLastInputInfo (the session's idle time only)
+    "Win32_UI_WindowsAndMessaging", # windows, messages, the foreground, display affinity
+] }
+
+[lints]
+workspace = true

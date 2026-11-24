@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The Windows calls `run` needs (docs/research/16-verify-testbed/README.md §8.3 phase 0): the
-//! displays kept on, no error dialog from a child that can't load a DLL, the free space in the
-//! logs folder, and a count of running processes by image name, to refuse a second FFmpeg (one
-//! hardware encoder session at a time, M1:94). The snapshot lists processes only and reads
-//! their image names; no other process is ever opened (CLAUDE.md).
+//! The Windows calls `run` needs (docs/research/16-verify-testbed/README.md §8.3 phase 0): no
+//! error dialog from a child that can't load a DLL, the free space in the logs folder, and a
+//! count of running processes by image name, to refuse a second FFmpeg (one hardware encoder
+//! session at a time, M1:94). The snapshot lists processes only and reads their image names; no
+//! other process is ever opened (CLAUDE.md). The displays stay on through `kairo-window`'s
+//! `KeepDisplayOn`, which the testbed uses too (research 17 §3.1).
 
 use std::io;
 use std::path::Path;
@@ -16,32 +17,11 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 use windows::core::HSTRING;
 
 /// `CreateProcess`'s flag for a console program with no console window: FFmpeg, kairo-verify
 /// and kairo-tone, started from a hidden job, must never show one on the owner's screen.
 pub const CREATE_NO_WINDOW: u32 = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
-
-/// Keeps the screens on while it lives (`ES_DISPLAY_REQUIRED`, README §8.1). It never wakes a
-/// dark display with input.
-pub struct KeepDisplayOn;
-
-impl KeepDisplayOn {
-    /// Asks for the displays to stay on.
-    pub fn new() -> KeepDisplayOn {
-        // SAFETY: changes only this thread's execution-state request.
-        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED) };
-        KeepDisplayOn
-    }
-}
-
-impl Drop for KeepDisplayOn {
-    fn drop(&mut self) {
-        // SAFETY: clears this thread's request.
-        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
-    }
-}
 
 /// No critical-error or fault dialog for this process and the children it starts, which
 /// inherit the mode: a child that can't find a DLL then exits with an error code instead of
@@ -120,10 +100,9 @@ mod tests {
         assert_eq!(count_processes_named("no-such-image-kairo.exe").unwrap(), 0);
     }
 
+    // KeepDisplayOn's half of this test moved to kairo-window with the code.
     #[test]
-    fn the_display_request_comes_and_goes() {
-        let keep = KeepDisplayOn::new();
-        drop(keep);
+    fn error_dialogs_can_be_turned_off() {
         no_error_dialogs();
     }
 }

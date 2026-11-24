@@ -46,8 +46,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Test kairo-core, the mock engine, kairo-verify, and the testbed's and the harness's pure parts
-        run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify -p kairo-testbed -p kairo-harness --locked
+      - name: Test kairo-core, the mock engine, kairo-verify, and the pure parts of the testbed, the harness and kairo-window
+        run: cargo test -p kairo-core -p kairo-mock-engine -p kairo-verify -p kairo-testbed -p kairo-harness -p kairo-window --locked
 
       # The shipped kairo-verify has no dev-tools: it never spawns FFmpeg (research 16 §2 item 3).
       - name: kairo-verify without dev-tools
@@ -153,7 +153,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The runner has a desktop: kairo-window's cover tests fail here rather than report a skip.
       - name: Test
+        env:
+          KAIRO_CI_DESKTOP: "1"
         run: cargo test --workspace --locked
 
       # The shipped kairo-verify: the linked decoder and no dev-tools (research 16 §2 item 3).

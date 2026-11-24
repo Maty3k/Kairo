@@ -4,7 +4,6 @@
 //! names the window handle and the adapter of this run, which are details of the PC, so it stays
 //! local (`C:\kairo\logs`, `.dogfood/`), like the log.
 
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -59,23 +58,19 @@ impl Ready {
             + "\n"
     }
 
-    /// Writes the file whole, and only if it doesn't exist: the text goes into
-    /// `<path>.<pid>.partial`, which is linked in as `path` (a step that fails with
-    /// `AlreadyExists` if a file got there first, where a rename would replace it) and then
+    /// Writes the file whole, and only if it doesn't exist (`kairo_window::ready::write_new`):
+    /// the text goes into `<path>.<pid>.partial`, which is linked in as `path` (a step that fails
+    /// with `AlreadyExists` if a file got there first, where a rename would replace it) and then
     /// removed. A reader never sees half of it.
     pub fn write(&self, path: &Path) -> io::Result<()> {
-        let mut partial = path.as_os_str().to_owned();
-        partial.push(format!(".{}.partial", self.pid));
-        fs::write(&partial, self.json())?;
-        let linked = fs::hard_link(&partial, path);
-        let _ = fs::remove_file(&partial);
-        linked
+        kairo_window::ready::write_new(path, self.pid, &self.json())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn the_ready_file_is_one_json_object() {

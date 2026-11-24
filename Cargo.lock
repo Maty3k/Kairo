@@ -200,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "kairo-core",
  "kairo-display",
+ "kairo-window",
  "serde",
  "serde_json",
  "windows",
@@ -227,6 +228,7 @@ version = "0.1.0"
 dependencies = [
  "kairo-core",
  "kairo-display",
+ "kairo-window",
  "serde_json",
  "wasapi",
  "windows",
@@ -241,6 +243,15 @@ dependencies = [
  "kairo-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kairo-window"
+version = "0.1.0"
+dependencies = [
+ "kairo-core",
+ "kairo-display",
+ "windows",
 ]
 
 [[package]]

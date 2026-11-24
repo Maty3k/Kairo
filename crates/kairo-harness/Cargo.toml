@@ -15,12 +15,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# KeepDisplayOn.
+kairo-window = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",                 # handles, BOOL
     "Win32_Storage_FileSystem",         # GetDiskFreeSpaceExW
     "Win32_System_Diagnostics_Debug",   # SetErrorMode
     "Win32_System_Diagnostics_ToolHelp", # process snapshots, by name only
-    "Win32_System_Power",               # ES_DISPLAY_REQUIRED
     "Win32_System_Threading",           # CREATE_NO_WINDOW
 ] }
 
