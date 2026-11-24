@@ -30,11 +30,15 @@
 #    but a type literal ([IO.Path]::Combine is fine), whether written $p.Path, $p.'Path',
 #    $p.get_Path(), $p.PSObject.Properties['Path'] or as a cmdlet's property argument (Select-Object
 #    Path, ForEach-Object Path), a wildcard that matches one included (Select-Object *, P*); and no
-#    member name computed at run time. On a process the first eight go through MainModule, which
-#    opens it with memory-read rights and lists its modules, and CommandLine is a WMI query for its
-#    command line (research 17 section 5.3). Nor anything that gives a Process object, whose every
-#    property a whole-object read (Format-List *, ConvertTo-Json) would read: Get-Process (gps, ps),
-#    GetProcessById or GetProcessesByName. Get-ProcessIdAndName, R2's one helper, gives names.
+#    member name computed at run time. Where-Object (?, where) and ForEach-Object (%, foreach) read
+#    only the property or member they name, their first positional argument or -Property's or
+#    -MemberName's value: not the value Where-Object compares (Where-Object Name -like '*Version*'),
+#    nor the arguments ForEach-Object passes (ForEach-Object Trim '*'). On a process the first eight
+#    go through MainModule, which opens it with memory-read rights and lists its modules, and
+#    CommandLine is a WMI query for its command line (research 17 section 5.3). Nor anything that
+#    gives a Process object, whose every property a whole-object read (Format-List *,
+#    ConvertTo-Json) would read: Get-Process (gps, ps), GetProcessById or GetProcessesByName.
+#    Get-ProcessIdAndName, R2's one helper, gives names.
 # R2 Process lists, in every script: GetProcesses only in the one helper, a function that loops
 #    over it reading only Id and ProcessName (and Dispose) of each process and returns
 #    [pscustomobject]@{ Id; Name }; Get-Process only by name or id (status.ps1's LogonUI lookup
@@ -43,10 +47,16 @@
 #    since without one it lists every program's path and command line.
 # R3 Add-Type and Import-Csv, in the elevated scripts: Add-Type compiles in a folder the owner's
 #    programs can write (M1, Carried over from M0), and Import-Csv opens a path by its name, which a
-#    link in logs\ could redirect (research 17 section 2 item 16). The bootstrap, which the owner
-#    runs, keeps its Add-Type. Synthetic input (CLAUDE.md, Never 4: SendInput, SendKeys, SendWait,
-#    keybd_event, mouse_event) in every script, as a command or member name, and in strings outside
-#    the tests, where an Add-Type definition would carry it.
+#    link in logs\ could redirect (research 17 section 2 item 16). Add-Type -AssemblyName compiles
+#    nothing, so it passes when every name is written out and on R3's list: assemblies pwsh ships,
+#    which it loads from its own folder (System.IO.Compression.ZipFile unpacks the FFmpeg zip).
+#    pwsh 7 loads a path as it is, and looks for any other name in the current folder, which no
+#    elevated script sets; so another name, a path, a name computed at run time, a splat, a
+#    positional argument and every other parameter (-TypeDefinition, -MemberDefinition, -Path,
+#    -LiteralPath, -OutputAssembly) are flagged. The bootstrap, which the owner runs, keeps its
+#    Add-Type. Synthetic input (CLAUDE.md, Never 4: SendInput, SendKeys, SendWait, keybd_event,
+#    mouse_event) in every script, as a command or member name, and in strings outside the tests,
+#    where an Add-Type definition would carry it.
 # R4 File writes, in the elevated bench scripts: none, except Write-TextFileAtomic's decision file
 #    (research 17 sections 4.2 and 4.6), and only when its path (-Path, else the first positional
 #    argument) names that file: a string ending in .decision.json, or a variable named
@@ -56,7 +66,10 @@
 #    reading members; FileStream, StreamWriter or BinaryWriter in any form, a conversion
 #    ([IO.StreamWriter]$f creates the file), -as or a typed variable included; members that write,
 #    move or delete, Create among them; and Open, unless it is Open(Open, Read) written out
-#    (FileInfo.Open(mode) alone opens for reading and writing). A type may be written with or
+#    (FileInfo.Open(mode) alone opens for reading and writing). A member called by name counts as
+#    a call: the one ForEach-Object (%, foreach) calls, its first positional argument or
+#    -MemberName's value, a wildcard that matches one included (ForEach-Object Delete, Del*, Open
+#    Create), and .ForEach's first argument (.ForEach('Delete')). A type may be written with or
 #    without its namespace (using namespace System.IO).
 # R5 Dot-sourcing safely (research 17 section 2 item 1), in the bench scripts: function definitions
 #    and, last, one command line guarded by $MyInvocation.InvocationName -ne '.'; no script param
@@ -190,6 +203,88 @@ function Test-ScanIoType([string] $TypeName, [string[]] $Names) {
     return ($TypeName -match ('^((System\.)?IO\.)?(' + ($Names -join '|') + ')(\[\])?\z'))
 }
 
+function Get-ScanWildcardHits([string] $Name, [string[]] $Members) {
+    # The members a wildcard (*, P*, Pa?h, [P]ath) matches, ignoring case; one that doesn't parse
+    # matches them all. $null when the name holds no wildcard.
+    if ($Name.IndexOfAny([char[]]@('*', '?', '[')) -lt 0) { return $null }
+    $pattern = [Management.Automation.WildcardPattern]::new($Name, [Management.Automation.WildcardOptions]::IgnoreCase)
+    $hits = [Collections.Generic.List[string]]::new()
+    foreach ($member in $Members) {
+        $isMatch = $true
+        try { $isMatch = $pattern.IsMatch($member) } catch { $isMatch = $true }
+        if ($isMatch) { $hits.Add($member) }
+    }
+    return ,$hits.ToArray()
+}
+
+# Where-Object's and ForEach-Object's parameters that take a value, with the common ones and their
+# aliases. Any other is a switch (-like, -eq, -Not, -AsJob, -WhatIf, -Verbose), and a switch's
+# whole name wins over a valued name it begins: Where-Object's -In is a switch, not -InputObject.
+$script:CommonValued = @('ErrorAction', 'EA', 'WarningAction', 'WA', 'InformationAction', 'InfA', 'ProgressAction', 'proga',
+    'ErrorVariable', 'EV', 'WarningVariable', 'WV', 'InformationVariable', 'IV', 'OutVariable', 'OV', 'OutBuffer', 'OB',
+    'PipelineVariable', 'PV')
+$script:WhereCommands = @('Where-Object', '?', 'where')
+$script:WhereValued = @('Property', 'Value', 'InputObject', 'FilterScript') + $script:CommonValued
+$script:ForEachCommands = @('ForEach-Object', '%', 'foreach')
+$script:ForEachValued = @('MemberName', 'ArgumentList', 'Args', 'InputObject', 'Process', 'Begin', 'End', 'RemainingScripts',
+    'Parallel', 'ThrottleLimit', 'TimeoutSeconds') + $script:CommonValued
+
+function Test-ScanValuedParameter([string] $Given, [string[]] $Valued, [string[]] $Switches) {
+    # Whether a parameter as written takes the next element as its value: a valued parameter's name
+    # or alias, or the start of one (PowerShell takes a prefix), unless it is a switch's whole name.
+    if ($Switches -contains $Given) { return $false }
+    foreach ($name in $Valued) {
+        if ($name.StartsWith($Given, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-ScanCall($Command, [string] $NameParameter, [string[]] $Valued, [string[]] $Switches) {
+    # What Where-Object or ForEach-Object names, and what ForEach-Object passes, as PowerShell binds
+    # them. .Name: $NameParameter's value when it is written (its name or a prefix), else the first
+    # positional argument, or $null. .Arguments: -ArgumentList's items when it is written, else the
+    # positional arguments after the name. A splat binds by name, so it is neither.
+    $name = $null
+    $named = $false
+    $listed = $null
+    $positional = [Collections.Generic.List[object]]::new()
+    $elements = $Command.CommandElements
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -is [Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { continue }
+        if ($element -isnot [Management.Automation.Language.CommandParameterAst]) {
+            $positional.Add($element)
+            continue
+        }
+        $given = $element.ParameterName
+        $value = $element.Argument
+        if ($null -eq $value -and $i + 1 -lt $elements.Count -and (Test-ScanValuedParameter $given $Valued $Switches)) {
+            $i++
+            $value = $elements[$i]
+        }
+        if ($NameParameter.StartsWith($given, [StringComparison]::OrdinalIgnoreCase)) {
+            $name = $value
+            $named = $true
+        } elseif ('ArgumentList'.StartsWith($given, [StringComparison]::OrdinalIgnoreCase) -or $given -eq 'Args') {
+            $listed = $value
+        }
+    }
+    $first = 0
+    if (-not $named) {
+        if ($positional.Count -gt 0) { $name = $positional[0] }
+        $first = 1
+    }
+    $arguments = [Collections.Generic.List[object]]::new()
+    if ($listed -is [Management.Automation.Language.ArrayLiteralAst]) {
+        foreach ($item in $listed.Elements) { $arguments.Add($item) }
+    } elseif ($null -ne $listed) {
+        $arguments.Add($listed)
+    } else {
+        for ($j = $first; $j -lt $positional.Count; $j++) { $arguments.Add($positional[$j]) }
+    }
+    return [pscustomobject]@{ Name = $name; Arguments = $arguments.ToArray() }
+}
+
 # --- R1 module lists ---------------------------------------------------------------------------
 
 $script:ModuleMembers = @('Path', 'MainModule', 'Modules', 'Company', 'FileVersion', 'ProductVersion', 'Description', 'Product', 'CommandLine')
@@ -206,15 +301,8 @@ function Get-ScanPropertyProblem([string] $Name) {
     # $null unless a property argument reads a banned member: by its name, or as a wildcard that
     # matches one (*, P*, Pa?h, [P]ath). A wildcard that doesn't parse counts as matching.
     if ($script:ModuleMembers -contains $Name) { return $Name }
-    if ($Name.IndexOfAny([char[]]@('*', '?', '[')) -lt 0) { return $null }
-    $pattern = [Management.Automation.WildcardPattern]::new($Name, [Management.Automation.WildcardOptions]::IgnoreCase)
-    $hits = [Collections.Generic.List[string]]::new()
-    foreach ($member in $script:ModuleMembers) {
-        $isMatch = $true
-        try { $isMatch = $pattern.IsMatch($member) } catch { $isMatch = $true }
-        if ($isMatch) { $hits.Add($member) }
-    }
-    if ($hits.Count -eq 0) { return $null }
+    $hits = Get-ScanWildcardHits $Name $script:ModuleMembers
+    if ($null -eq $hits -or $hits.Count -eq 0) { return $null }
     return ($Name + ', which matches ' + ($hits -join ', '))
 }
 
@@ -250,8 +338,18 @@ function Find-ScanModuleMembers($Source) {
             continue
         }
         if ($script:PropertyCommands -notcontains $command) { continue }
-        for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
-            foreach ($name in (Get-ScanStrings $node.CommandElements[$i])) {
+        # Where-Object and ForEach-Object read only the property or member they name, not the value
+        # Where-Object compares or the arguments ForEach-Object passes; the others read every name.
+        if ($script:WhereCommands -contains $command) {
+            $arguments = @((Get-ScanCall $node 'Property' $script:WhereValued @('In')).Name)
+        } elseif ($script:ForEachCommands -contains $command) {
+            $arguments = @((Get-ScanCall $node 'MemberName' $script:ForEachValued @()).Name)
+        } else {
+            $arguments = @($node.CommandElements | Select-Object -Skip 1)
+        }
+        foreach ($argument in $arguments) {
+            if ($null -eq $argument) { continue }
+            foreach ($name in (Get-ScanStrings $argument)) {
                 $problem = Get-ScanPropertyProblem $name
                 if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $problem))) }
             }
@@ -394,13 +492,50 @@ function Find-ScanProcessLists([object[]] $Sources) {
 # --- R3 Add-Type, Import-Csv and synthetic input -----------------------------------------------
 
 $script:InputNames = @('SendInput', 'SendKeys', 'SendWait', 'keybd_event', 'mouse_event')
+# The assemblies Add-Type -AssemblyName may load in the elevated scripts: ones pwsh ships, so it
+# loads them from its own folder and never from the current one. A name joins only when pwsh
+# ships it; a test below checks the pwsh running it.
+$script:LoadableAssemblies = @('System.IO.Compression.ZipFile', 'System.IO.Compression.FileSystem')
+
+function Get-ScanAddTypeProblem($Command) {
+    # $null for Add-Type -AssemblyName (-AN, or a prefix of the name) whose every name is written out
+    # and on R3's list, which compiles nothing; else what is wrong.
+    $elements = $Command.CommandElements
+    $names = 0
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -is [Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { return 'with splatted arguments' }
+        if ($element -isnot [Management.Automation.Language.CommandParameterAst]) { return 'with a positional argument' }
+        $parameter = $element.ParameterName
+        if ($parameter -ne 'AN' -and -not 'AssemblyName'.StartsWith($parameter, [StringComparison]::OrdinalIgnoreCase)) { return ('-' + $parameter) }
+        $value = $element.Argument
+        if ($null -eq $value -and $i + 1 -lt $elements.Count) {
+            $i++
+            $value = $elements[$i]
+        }
+        if ($null -eq $value) { return '-AssemblyName without a name' }
+        $items = @($value)
+        if ($value -is [Management.Automation.Language.ArrayLiteralAst]) { $items = @($value.Elements) }
+        foreach ($item in $items) {
+            if ($item -isnot [Management.Automation.Language.StringConstantExpressionAst]) { return ('-AssemblyName ' + $item.Extent.Text + ', a name computed at run time') }
+            if ($script:LoadableAssemblies -notcontains $item.Value) { return ('-AssemblyName ' + $item.Value + ', which is not on R3''s list') }
+            $names++
+        }
+    }
+    if ($names -eq 0) { return 'without -AssemblyName' }
+    return $null
+}
 
 function Find-ScanBannedCalls($Source, [switch] $Elevated) {
     $found = [Collections.Generic.List[string]]::new()
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
         $command = Get-ScanCommandName $node
         if ($null -eq $command) { continue }
-        if ($Elevated -and @('Add-Type', 'Import-Csv', 'ipcsv') -contains $command) { $found.Add((New-ScanFinding $Source $node $command)) }
+        if ($Elevated -and @('Import-Csv', 'ipcsv') -contains $command) { $found.Add((New-ScanFinding $Source $node $command)) }
+        if ($Elevated -and $command -eq 'Add-Type') {
+            $problem = Get-ScanAddTypeProblem $node
+            if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ('Add-Type ' + $problem + ': only -AssemblyName with names on R3''s list passes'))) }
+        }
         if ($script:InputNames -contains $command) { $found.Add((New-ScanFinding $Source $node ('synthetic input: ' + $command))) }
     }
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
@@ -510,15 +645,36 @@ function Get-ScanEnumName($Node, [string] $Type) {
     return $null
 }
 
+function Test-ScanOpenToRead([object[]] $Arguments) {
+    # Whether Open's arguments only read: <FileMode> Open, <FileAccess> Read[, <FileShare>], written
+    # out. FileInfo.Open(mode) alone opens for reading and writing, and the other modes can create
+    # or empty the file.
+    return ($Arguments.Count -ge 2 -and (Get-ScanEnumName $Arguments[0] 'FileMode') -eq 'Open' -and (Get-ScanEnumName $Arguments[1] 'FileAccess') -eq 'Read')
+}
+
 function Get-ScanOpenProblem($Node) {
-    # $null for an Open call that only reads, Open(<FileMode> Open, <FileAccess> Read[, <FileShare>])
-    # written out, or for a member named Open that isn't called. FileInfo.Open(mode) alone opens
-    # for reading and writing, and the other modes can create or empty the file.
+    # $null for an Open call that only reads, or for a member named Open that isn't called.
     if ($Node -isnot [Management.Automation.Language.InvokeMemberExpressionAst]) { return $null }
     $arguments = @()
     if ($null -ne $Node.Arguments) { $arguments = @($Node.Arguments) }
-    if ($arguments.Count -ge 2 -and (Get-ScanEnumName $arguments[0] 'FileMode') -eq 'Open' -and (Get-ScanEnumName $arguments[1] 'FileAccess') -eq 'Read') { return $null }
+    if (Test-ScanOpenToRead $arguments) { return $null }
     return 'that can write: only Open(Open, Read), written out, only reads'
+}
+
+function Get-ScanCallByNameProblem([string] $Name, [object[]] $Arguments, [bool] $Wildcard) {
+    # $null unless a member called by name writes: one of WriteMembers, or Open with arguments other
+    # than Open, Read written out. ForEach-Object calls the one member a wildcard matches, so with
+    # $Wildcard one that matches any of them, Open included, counts; .ForEach takes the name as it is.
+    if ($Wildcard) {
+        $hits = Get-ScanWildcardHits $Name (@($script:WriteMembers) + @('Open'))
+        if ($null -ne $hits) {
+            if ($hits.Count -eq 0) { return $null }
+            return ($Name + ', which matches ' + ($hits -join ', '))
+        }
+    }
+    if ($script:WriteMembers -contains $Name) { return $Name }
+    if ($Name -eq 'Open' -and -not (Test-ScanOpenToRead $Arguments)) { return 'Open that can write: only Open(Open, Read), written out, only reads' }
+    return $null
 }
 
 function Find-ScanFileWrites($Source) {
@@ -541,6 +697,13 @@ function Find-ScanFileWrites($Source) {
                 foreach ($name in (Get-ScanStrings $node.CommandElements[$i])) {
                     if (Test-ScanIoType $name $script:WriterTypes) { $found.Add((New-ScanFinding $Source $node ('New-Object ' + $name))) }
                 }
+            }
+        } elseif ($script:ForEachCommands -contains $command) {
+            # The member it calls by name, on each item: ForEach-Object Delete is $_.Delete().
+            $call = Get-ScanCall $node 'MemberName' $script:ForEachValued @()
+            if ($call.Name -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                $problem = Get-ScanCallByNameProblem $call.Name.Value $call.Arguments $true
+                if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $problem))) }
             }
         }
     }
@@ -568,6 +731,14 @@ function Find-ScanFileWrites($Source) {
         } elseif ($name -eq 'Open') {
             $problem = Get-ScanOpenProblem $node
             if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ('.Open ' + $problem))) }
+        } elseif ($name -eq 'ForEach' -and $node -is [Management.Automation.Language.InvokeMemberExpressionAst]) {
+            # .ForEach('Delete') calls Delete on each item, as .ForEach({ $_.Delete() }) does.
+            $arguments = @()
+            if ($null -ne $node.Arguments) { $arguments = @($node.Arguments) }
+            if ($arguments.Count -gt 0 -and $arguments[0] -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                $problem = Get-ScanCallByNameProblem $arguments[0].Value @($arguments | Select-Object -Skip 1) $false
+                if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ('.ForEach ' + $problem))) }
+            }
         }
     }
     return ,$found.ToArray()
@@ -842,6 +1013,26 @@ Test-Case 'R1 flags a process''s Path, MainModule or CommandLine in every form' 
     Assert-ScanFlags $script:R1 @('$name = ''Path''; $p.$name', '$p."Pa$x"') 'computed at run time'
 }
 
+Test-Case 'R1 flags the property Where-Object names and the member ForEach-Object calls' {
+    # The name is -Property's or -MemberName's value, else the first positional argument, after the
+    # values that -Value, -EA and the like take; Where-Object's -In is a switch.
+    Assert-ScanFlags $script:R1 @(
+        '$all | Where-Object Path -like ''*x*''',
+        '$all | ? CommandLine -eq ''x''',
+        '$all | where -Property MainModule -Value $null -NE',
+        '$all | Where-Object -Prop:Company -EQ -Value x',
+        '$all | Where-Object -Value x Description -EQ',
+        '$all | Where-Object -EA Stop Path -eq 1',
+        '$all | Where-Object -In Path ''a'', ''b''',
+        '$all | Where-Object P* -eq 1',
+        '$all | ForEach-Object Path',
+        '$all | % -MemberName MainModule',
+        '$all | foreach -MemberName:Product',
+        '$all | ForEach-Object -ErrorAction Stop CommandLine',
+        '$all | ForEach-Object Comm*'
+    ) '^snippet\.ps1:1: (Where-Object|\?|where|ForEach-Object|%|foreach) (Path|CommandLine|MainModule|Company|Description|Product|P\*, which matches .+|Comm\*, which matches CommandLine)$'
+}
+
 Test-Case 'R1 passes type literals, parameters named Path and other members' {
     # [Environment]::CommandLine is a static member on a type literal: this process's own command line.
     Assert-ScanPasses $script:R1 @(
@@ -859,6 +1050,26 @@ Test-Case 'R1 passes type literals, parameters named Path and other members' {
         '# $p.Path in a comment',
         '''$p.Path in a string''',
         $script:Helper
+    )
+}
+
+Test-Case 'R1 passes the values Where-Object compares and the arguments ForEach-Object passes' {
+    Assert-ScanPasses $script:R1 @(
+        '$runs | Where-Object Name -like ''*Version*''',
+        '$lines | ForEach-Object Trim ''*''',
+        '$runs | Where-Object tag -like ''p*''',
+        '$runs | ? Status -like ''Pro*''',
+        '$runs | where Name -notlike ''*''',
+        '$runs | Where-Object Name -eq ''Path''',
+        '$runs | Where-Object -Property Name -Like -Value ''Pro*''',
+        '$runs | Where-Object -Value ''Path'' -Property Name -EQ',
+        '$runs | Where-Object -Property Name ''Path'' -EQ',
+        '$runs | Where-Object -EA SilentlyContinue Name -like ''C*''',
+        '$runs | Where-Object { $_.Name -like ''P*'' }',
+        '$lines | % Split ''Path''',
+        '$lines | foreach Replace ''Path'' ''x''',
+        '$lines | ForEach-Object -MemberName Trim -ArgumentList ''P*''',
+        '$lines | ForEach-Object { $_.Trim() }'
     )
 }
 
@@ -925,21 +1136,80 @@ Test-Case 'R2 passes the helper and lookups by name or id' {
 
 $script:R3 = { param($Text) Find-ScanBannedCalls (ConvertTo-ScanSource $Text) -Elevated }
 
-Test-Case 'R3 no Add-Type or Import-Csv in the elevated scripts, no synthetic input anywhere' {
+Test-Case 'R3 in the elevated scripts no Import-Csv, and Add-Type only to load a listed assembly; no synthetic input anywhere' {
     $elevated = @($script:ElevatedFiles | ForEach-Object { $_.Name })
     foreach ($source in $script:AllFiles) {
         Assert-ScanClean (Find-ScanBannedCalls $source -Elevated:($elevated -contains $source.Name)) $source.Name
     }
 }
 
-Test-Case 'R3 flags Add-Type, Import-Csv and synthetic input' {
+Test-Case 'R3 flags Add-Type in the elevated scripts, unless it is -AssemblyName with listed names' {
     Assert-ScanFlags $script:R3 @(
         'Add-Type -TypeDefinition $code',
+        'Microsoft.PowerShell.Utility\Add-Type -TypeDefinition $code',
+        'Add-Type -MemberDefinition $signature -Name Native -Namespace Kairo',
+        'Add-Type -Path $dll',
+        'Add-Type -Path System.IO.Compression.ZipFile',
+        'Add-Type -LiteralPath C:\kairo\helper.dll',
+        'Add-Type -TypeDefinition $code -OutputAssembly $dll',
+        'Add-Type -AssemblyName System.IO.Compression.ZipFile -OutputAssembly $dll',
+        'Add-Type -AssemblyName System.IO.Compression.ZipFile -PassThru',
+        'Add-Type @splat',
+        'Add-Type -AssemblyName System.IO.Compression.ZipFile @splat',
+        'Add-Type $code',
+        'Add-Type -AssemblyName $name',
+        'Add-Type -AssemblyName "System.IO.Compression.$name"',
+        'Add-Type -AssemblyName (''System.IO.Compression.'' + ''ZipFile'')',
+        'Add-Type -AssemblyName System.IO.Compression.ZipFile, $name',
+        'Add-Type -AssemblyName C:\Users\Public\helper.dll',
+        'Add-Type -AssemblyName helper',
+        'Add-Type -AssemblyName System.Helper',
+        'Add-Type -AN System.IO.Compression.ZipFile, helper',
+        'Add-Type -AssemblyName',
+        'Add-Type'
+    ) '^snippet\.ps1:1: Add-Type .+: only -AssemblyName with names on R3''s list passes$'
+    # Each finding says what is wrong.
+    $zip = 'Add-Type -AssemblyName System.IO.Compression.ZipFile'
+    Assert-ScanFlags $script:R3 @('Add-Type -TypeDefinition $code', ($zip + ' -OutputAssembly $dll')) '^snippet\.ps1:1: Add-Type -(TypeDefinition|OutputAssembly): '
+    Assert-ScanFlags $script:R3 @('Add-Type @splat', ($zip + ' @splat')) '^snippet\.ps1:1: Add-Type with splatted arguments: '
+    Assert-ScanFlags $script:R3 @('Add-Type $code') '^snippet\.ps1:1: Add-Type with a positional argument: '
+    Assert-ScanFlags $script:R3 @('Add-Type -AssemblyName $name', ($zip + ', $name')) '^snippet\.ps1:1: Add-Type -AssemblyName \$name, a name computed at run time: '
+    Assert-ScanFlags $script:R3 @('Add-Type -AssemblyName helper', 'Add-Type -AssemblyName C:\Users\Public\helper.dll') '^snippet\.ps1:1: Add-Type -AssemblyName \S+, which is not on R3''s list: '
+    Assert-ScanFlags $script:R3 @('Add-Type -AssemblyName') '^snippet\.ps1:1: Add-Type -AssemblyName without a name: '
+    Assert-ScanFlags $script:R3 @('Add-Type') '^snippet\.ps1:1: Add-Type without -AssemblyName: '
+}
+
+Test-Case 'R3 passes Add-Type -AssemblyName with names on its list, which compiles nothing' {
+    Assert-ScanPasses $script:R3 @(
+        # The FFmpeg deploy's line (tools/mac/remote/ffmpeg.ps1), which unpacks the pinned zip.
+        '    Add-Type -AssemblyName System.IO.Compression.ZipFile',
+        'Microsoft.PowerShell.Utility\Add-Type -AssemblyName ''System.IO.Compression.ZipFile''',
+        'Add-Type -AN "System.IO.Compression.FileSystem"',
+        'Add-Type -Assembly:System.IO.Compression.ZipFile',
+        'Add-Type -assemblyname system.io.compression.zipfile',
+        'Add-Type -AssemblyName System.IO.Compression.ZipFile, System.IO.Compression.FileSystem'
+    )
+}
+
+Test-Case 'R3''s assemblies ship with pwsh, which resolves them by name among its own' {
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Console]::Out.WriteLine('note: Windows PowerShell 5.1 loads these from the GAC; R3''s list is checked under pwsh')
+        return
+    }
+    $runtime = [IO.Path]::GetFullPath([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()).TrimEnd([char]'\', [char]'/')
+    foreach ($name in $script:LoadableAssemblies) {
+        $assembly = [Reflection.Assembly]::Load([Reflection.AssemblyName]::new($name))
+        Assert-Equal $name $assembly.GetName().Name ('pwsh resolves ' + $name)
+        Assert-Equal $runtime ([IO.Path]::GetDirectoryName($assembly.Location)) ($name + '''s folder')
+    }
+}
+
+Test-Case 'R3 flags Import-Csv and synthetic input' {
+    Assert-ScanFlags $script:R3 @(
         'Import-Csv -LiteralPath $file',
         'ipcsv x.csv',
-        'Microsoft.PowerShell.Utility\Add-Type -TypeDefinition $code',
         'Microsoft.PowerShell.Utility\Import-Csv -LiteralPath $file'
-    ) '^snippet\.ps1:1: (Add-Type|Import-Csv|ipcsv)$'
+    ) '^snippet\.ps1:1: (Import-Csv|ipcsv)$'
     Assert-ScanFlags $script:R3 @('Kairo.Input\SendInput 1 $inputs 40') '^snippet\.ps1:1: synthetic input: SendInput$'
     Assert-ScanFlags $script:R3 @(
         '[User32]::SendInput(1, $inputs, 40)',
@@ -947,8 +1217,8 @@ Test-Case 'R3 flags Add-Type, Import-Csv and synthetic input' {
         '(New-Object -ComObject WScript.Shell).SendKeys(''x'')',
         '$code = ''[DllImport("user32.dll")] public static extern uint SendInput(uint n, IntPtr p, int s);'''
     ) 'synthetic input'
-    # Outside the elevated scripts, Add-Type passes; synthetic input never does.
-    Assert-ScanClean (Find-ScanBannedCalls (ConvertTo-ScanSource 'Add-Type -AssemblyName System.IO.Compression.FileSystem')) 'Add-Type in the bootstrap'
+    # Outside the elevated scripts, Add-Type passes, the bootstrap's included; synthetic input never does.
+    Assert-ScanClean (Find-ScanBannedCalls (ConvertTo-ScanSource 'Add-Type -TypeDefinition $DisplayConfigCode -Language CSharp -IgnoreWarnings')) 'Add-Type in the bootstrap'
     Assert-Equal 1 (Find-ScanBannedCalls (ConvertTo-ScanSource '$shell.SendKeys(''x'')')).Count 'SendKeys outside the elevated scripts'
 }
 
@@ -1043,6 +1313,29 @@ Test-Case 'R4 flags Create, OpenWrite, an Open that can write, and the writer ty
     Assert-ScanFlags $script:R4 @('using namespace System.IO' + "`n" + '$w = [StreamWriter]$f') '^snippet\.ps1:2: \[StreamWriter\], a type that opens a file for writing$'
 }
 
+Test-Case 'R4 flags members called by name: ForEach-Object''s member and .ForEach''s first argument' {
+    Assert-ScanFlags $script:R4 @(
+        'Get-ChildItem $jobs -Filter ''*.decision.json'' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 | ForEach-Object Delete',
+        '(Get-ChildItem $jobs -Filter ''*.decision.json'').ForEach(''Delete'')',
+        'Get-Item $f | ForEach-Object Open Create',
+        'Get-Item $f | ForEach-Object -MemberName Create',
+        'Get-Item $f | % MoveTo $b',
+        'Get-Item $f | foreach Delete',
+        'Get-Item $f | ForEach-Object -MemberName OpenWrite',
+        'Get-Item $f | ForEach-Object -M:CopyTo $b',
+        'Get-Item $f | ForEach-Object -ErrorAction Stop Delete',
+        'Get-Item $f | ForEach-Object Del*',
+        'Get-Item $f | ForEach-Object Ope?',
+        'Get-Item $f | ForEach-Object Open',
+        'Get-Item $f | ForEach-Object Open Open Write',
+        'Get-Item $f | ForEach-Object Open -ArgumentList Append, Write',
+        '$files.ForEach(''MoveTo'', $b)',
+        '$files.ForEach(''Open'', ''Open'', ''ReadWrite'')',
+        '$files.forEach(''Open'')'
+    ) ('^snippet\.ps1:1: (ForEach-Object|%|foreach|\.ForEach) (Delete|Create|MoveTo|OpenWrite|CopyTo|Del\*, which matches Delete.*|' +
+        'Ope\?, which matches Open|Open that can write: only Open\(Open, Read\), written out, only reads)$')
+}
+
 Test-Case 'R4 lets Write-TextFileAtomic write only the decision file, named by its path' {
     Assert-ScanFlags $script:R4 @(
         'Write-TextFileAtomic $f $t',
@@ -1078,6 +1371,16 @@ Test-Case 'R4 passes reads, console output and the decision file' {
         'Get-Thing 2>&1',
         '$t.Replace(''a'', ''b'')',
         '[scriptblock]::Create($text)',
+        '$files | ForEach-Object Length',
+        '$files | % Name',
+        '$files | ForEach-Object { $_.Length }',
+        '$lines | ForEach-Object Trim ''Delete''',
+        'Get-Item $f | ForEach-Object Open Open Read',
+        'Get-Item $f | ForEach-Object -MemberName Open -ArgumentList Open, Read',
+        '$files.ForEach(''Open'', [IO.FileMode]::Open, [IO.FileAccess]::Read)',
+        '$files.ForEach(''Length'')',
+        '$files.ForEach(''Del*'')',
+        '$files.ForEach({ $_.Length })',
         'Write-TextFileAtomic (Join-Path $Kairo.Jobs ($id + ''.decision.json'')) $json',
         'Write-TextFileAtomic -Path $decisionFile -Text $json',
         'Write-TextFileAtomic -Text $json -Path (Join-Path $Kairo.Jobs "$id.decision.json")',

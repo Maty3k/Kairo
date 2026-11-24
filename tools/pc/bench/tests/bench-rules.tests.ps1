@@ -434,6 +434,40 @@ Test-Case 'rule 6: a run invalid for another rule does not vote' {
     for ($i = 3; $i -le 5; $i++) { Assert-BrInvalidFor $w.results[$i] 7 $w.results[$i].tag }
 }
 
+Test-Case 'rule 6: the share is rounded down, so a run below 99% never shows 99' {
+    # A 60 s run at 360 fps with 217 composed frames holds 98.995% of its frames in one mode, which
+    # the nearest hundredth would print as 99 beside the failure.
+    $modes = [ordered]@{ 'Hardware: Independent Flip' = 21383; 'Composed: Flip' = 217 }
+    $stats = New-BrStats 'alu-01' -Set @{ present_modes = $modes; frames = 21600; rows = 21600; avg_fps = 360.0; frame_types = [ordered]@{ 'Application' = 21600 } }
+    $reason = 'rule 6: the most common present mode holds 98.99% of frames, below 99%'
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats $stats -TimedS 60
+    Assert-BrInvalidFor $r 6 '98.995% in one mode'
+    Assert-Equal $reason ([string]$r['reasons'][0]) 'reason'
+    Assert-Equal 98.99 $r['present_mode_share_pct'] 'present_mode_share_pct'
+    $benchFile = Write-BrFile 'share-bench.json' (ConvertTo-BrJson (New-BrBench @((New-BrBlock 'alu' 1 @((New-BrRun 'alu-01'))))))
+    $statsFile = Write-BrFile 'share-stats.jsonl' ((ConvertTo-BrJson $stats) + "`n")
+    $run = Invoke-BrTool @('-Bench', $benchFile, '-Stats', $statsFile)
+    Assert-BrExit 0 $run 'through pwsh -File'
+    $result = (Get-BrWorkload $run.Json 'alu').results[0]
+    Assert-BrInvalidFor $result 6 'through pwsh -File'
+    Assert-Equal $reason ([string]$result.reasons[0]) 'reason through pwsh -File'
+    Assert-Equal 98.99 $result.present_mode_share_pct 'present_mode_share_pct through pwsh -File'
+    # A valid run's share and the workload's round down too: 21,599 of 21,600 frames, and 43,199
+    # of 43,200, read 99.99, not 100.
+    $whole = @{ present_modes = [ordered]@{ 'Hardware: Independent Flip' = 21600 } }
+    $nearly = @{ present_modes = [ordered]@{ 'Hardware: Independent Flip' = 21599; 'Composed: Flip' = 1 } }
+    $w = Invoke-BrModes @(
+        @{ Run = (New-BrRun 'alu-01' -N 1); Stats = (New-BrStats 'alu-01' -Set $whole) },
+        @{ Run = (New-BrRun 'alu-02' -N 2); Stats = (New-BrStats 'alu-02' -Set $nearly) }
+    )
+    Assert-Equal 2 $w.valid 'valid'
+    Assert-Equal 100.0 $w.results[0]['present_mode_share_pct'] 'one mode only'
+    Assert-Equal 99.99 $w.results[1]['present_mode_share_pct'] 'one composed frame'
+    Assert-Equal 99.99 $w.present_mode_share_pct 'the workload''s share'
+    $cases = @(@(7500, 7500, 100.0), @(7425, 7500, 99.0), @(21383, 21600, 98.99), @(2, 3, 66.66), @(1, 3, 33.33), @(0, 5, 0.0))
+    foreach ($case in $cases) { Assert-Equal $case[2] (Get-BenchRulesShare $case[0] $case[1]) ([string]$case[0] + ' of ' + $case[1]) }
+}
+
 Test-Case 'the workload pools both passes: extra runs keep the first pass''s mode' {
     $first = @()
     $second = @()

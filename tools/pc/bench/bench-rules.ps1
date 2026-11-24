@@ -40,8 +40,10 @@
 #      "results":[{"tag":"alu-01","n":1,"pass":1,"valid":true,"failed":[],"reasons":[],"job_retry":false,
 #        "present_mode":"Hardware: Independent Flip","present_mode_frames":7500,"frames":7500,
 #        "present_mode_share_pct":100.0,"flags":[]},..]}],"session_flags":{"other_encoder_use":0}}
-# A workload's share and flags are over its valid runs. A run on the elevated fallback's route
-# (section 4.2, "route":"elevated_stdout") can't be evaluated yet: its rule 1 is built with it.
+# present_mode_share_pct is rounded down to 2 decimals, as rule 6's reason prints it, so a share
+# below 99% never shows as 99. A workload's share and flags are over its valid runs. A run on the
+# elevated fallback's route (section 4.2, "route":"elevated_stdout") can't be evaluated yet: its
+# rule 1 is built with it.
 #
 # -Decide (section 4.7, at the job's one decision point), for one workload:
 #   6 valid runs and a CV of 1.00% or less: none; 6 valid runs and a CV above 1.00%: 6 more, the
@@ -203,6 +205,13 @@ function Get-BenchRulesRounded([double] $Value, [int] $Digits) {
     $rounded = [Math]::Round($Value, $Digits, [MidpointRounding]::AwayFromZero)
     if ($rounded -eq 0) { $rounded = 0.0 }
     return $rounded
+}
+
+function Get-BenchRulesShare([long] $Part, [long] $Whole) {
+    # A share of frames in percent, rounded down to 2 decimals, so one below 99% never shows as 99
+    # beside rule 6's verdict. Decimal arithmetic keeps the hundredths exact.
+    $hundredths = [Math]::Truncate([decimal]$Part * 10000 / [decimal]$Whole)
+    return ([double]$hundredths / 100.0)
 }
 
 function Format-BenchRulesCv([double] $Cv) {
@@ -380,7 +389,7 @@ function Test-BenchRun {
     if ($null -eq $top -or $total -le 0) {
         Add-BenchRulesFailure $result 6 'rule 6: no present mode recorded'
     } else {
-        $share = Get-BenchRulesRounded (100.0 * $top.Count / $total) 2
+        $share = Get-BenchRulesShare $top.Count $total
         $result['present_mode'] = $top.Key
         $result['present_mode_frames'] = $top.Count
         $result['frames'] = $total
@@ -467,7 +476,7 @@ function Test-BenchWorkload {
     $flags = [Collections.Generic.List[string]]::new()
     foreach ($flag in (Get-BenchRulesFlagNames)) { if ($seenFlags.Contains($flag)) { $flags.Add($flag) } }
     $share = $null
-    if ($allFrames -gt 0) { $share = Get-BenchRulesRounded (100.0 * $modeFrames / $allFrames) 2 }
+    if ($allFrames -gt 0) { $share = Get-BenchRulesShare $modeFrames $allFrames }
     $resultList = [Collections.Generic.List[object]]::new()
     foreach ($result in $Results) { $resultList.Add($result) }
 
