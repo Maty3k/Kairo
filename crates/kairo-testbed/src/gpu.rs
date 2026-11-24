@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! D3D11 and DXGI for the testbed (docs/research/16-verify-testbed/README.md §4.1–4.4, §4.8,
-//! §4.9): the device on the adapter that drives the monitor, chosen by LUID; a flip-discard swap
-//! chain paced one of three ways ([`Pacing`]); exclusive fullscreen on the monitor's own output,
-//! and the `ResizeBuffers` that losing it needs; the HDR colour space and a
-//! watch on the monitor's HDR state; frame statistics; the monitor's own vblank clock, for swap
-//! chains without statistics; and the renderer, which carries out a [`draw::Plan`] with
-//! `ClearRenderTargetView`, `ClearView`, `UpdateSubresource` and `CopySubresourceRegion` only.
-//! No shader runs.
+//! §4.9): a flip-discard swap chain paced one of three ways ([`Pacing`]); exclusive fullscreen on
+//! the monitor's own output, and the `ResizeBuffers` that losing it needs; the HDR colour space;
+//! frame statistics; the monitor's own vblank clock, for swap chains without statistics; and the
+//! renderer, which carries out a [`draw::Plan`] with `ClearRenderTargetView`, `ClearView`,
+//! `UpdateSubresource` and `CopySubresourceRegion` only. No shader runs. The device on the
+//! monitor's adapter, the HDR watch, the back buffer, `Present` and the frame-latency wait are
+//! `kairo-window`'s (research 17 §3.1).
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -14,272 +14,29 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kairo_display::Luid;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, HWND, LUID, RECT, WAIT_OBJECT_0};
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-};
+use kairo_window::gpu::{Gpu, LatencyWait, PresentError, back_buffer, new_factory, output_of};
+use kairo_window::platform::{now_hns, qpc_to_hns};
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    ID3D11DeviceContext1, ID3D11RenderTargetView, ID3D11Texture2D,
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext1,
+    ID3D11RenderTargetView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_FRAME_STATISTICS_DISJOINT, DXGI_FRAME_STATISTICS,
-    DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE,
-    DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_ERROR_FRAME_STATISTICS_DISJOINT, DXGI_FRAME_STATISTICS, DXGI_MWA_NO_ALT_ENTER,
+    DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice1, IDXGIFactory2,
-    IDXGIFactory4, IDXGIOutput, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain2, IDXGISwapChain3,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice1, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain3,
 };
-use windows::Win32::Graphics::Gdi::HMONITOR;
-use windows::Win32::System::Threading::WaitForSingleObject;
-use windows::core::{BOOL, HRESULT, Interface};
+use windows::core::{BOOL, Interface};
 
 use crate::draw::{self, Copy, Format, Plan};
 use crate::pace::{Period, Stats, WakeGrid};
-
-/// The monitor's output, as DXGI reports it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OutputHdr {
-    /// Whether the output is in HDR (PQ).
-    pub pq: bool,
-    /// Its peak, in nits.
-    pub max_nits: f32,
-}
-
-/// The device on the monitor's adapter.
-pub struct Gpu {
-    factory: IDXGIFactory2,
-    output: Option<IDXGIOutput>,
-    device: ID3D11Device,
-    context: ID3D11DeviceContext1,
-    /// The adapter's DXGI index, valid in this process only.
-    pub adapter_index: u32,
-    /// The monitor's output index on it, if DXGI lists it.
-    pub output_index: Option<u32>,
-}
-
-fn luid_of(luid: Luid) -> LUID {
-    LUID {
-        LowPart: luid.low,
-        HighPart: luid.high,
-    }
-}
-
-impl Gpu {
-    /// A D3D11 device on the adapter with `luid`, and the output that shows `hmonitor`.
-    pub fn on_adapter(luid: Luid, hmonitor: isize) -> Result<Gpu, String> {
-        let factory = new_factory().ok_or("no DXGI factory")?;
-        // SAFETY: looks the adapter up by the LUID kairo-display found for the monitor.
-        let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapterByLuid(luid_of(luid)) }
-            .map_err(|e| format!("no adapter with LUID {luid}: {e}"))?;
-        let mut adapter_index = 0;
-        for i in 0.. {
-            // SAFETY: enumeration ends with an error.
-            let Ok(a) = (unsafe { factory.EnumAdapters1(i) }) else {
-                break;
-            };
-            // SAFETY: reads the adapter's description.
-            if unsafe { a.GetDesc1() }.is_ok_and(|d| d.AdapterLuid == luid_of(luid)) {
-                adapter_index = i;
-                break;
-            }
-        }
-        let (output, output_index) = match find_output(&adapter, hmonitor) {
-            Some((output, index)) => (Some(output), Some(index)),
-            None => (None, None),
-        };
-        let plain: IDXGIAdapter = adapter.cast().map_err(|e| format!("adapter: {e}"))?;
-        let (device, context) = create_device(Some(&plain), D3D_DRIVER_TYPE_UNKNOWN)?;
-        Ok(Gpu {
-            factory: factory.cast().map_err(|e| format!("DXGI factory: {e}"))?,
-            output,
-            device,
-            context,
-            adapter_index,
-            output_index,
-        })
-    }
-
-    /// Whether the monitor's output is in HDR, and its peak (README §4.8).
-    pub fn output_hdr(&self) -> Option<OutputHdr> {
-        read_hdr(self.output.as_ref()?)
-    }
-
-    /// A swap chain for window `hwnd`'s client area of `width` × `height` in `format`, paced as
-    /// `pacing` says.
-    pub fn swap_chain(
-        &self,
-        hwnd: isize,
-        width: u32,
-        height: u32,
-        format: Format,
-        pacing: Pacing,
-    ) -> Result<Chain, String> {
-        let dxgi_format = dxgi_format(format);
-        let flags = if pacing == Pacing::Waitable {
-            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
-        } else {
-            0
-        };
-        let desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
-            Format: dxgi_format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: if pacing == Pacing::Timer { 3 } else { 2 },
-            Scaling: DXGI_SCALING_NONE,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: flags,
-            ..Default::default()
-        };
-        let window = HWND(hwnd as *mut _);
-        // SAFETY: our device, our window and a complete description.
-        let swap = unsafe {
-            self.factory
-                .CreateSwapChainForHwnd(&self.device, window, &desc, None, None)
-        }
-        .map_err(|e| format!("swap chain: {e}"))?;
-        // SAFETY: this factory made the swap chain for this live window. NO_ALT_ENTER stops only
-        // Alt+Enter; DXGI still leaves fullscreen when the window loses focus (leave_if_lost).
-        let _ = unsafe {
-            self.factory
-                .MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER)
-        };
-        let mut waitable_handle = None;
-        match pacing {
-            Pacing::Waitable => {
-                let swap2: IDXGISwapChain2 =
-                    swap.cast().map_err(|e| format!("swap chain 2: {e}"))?;
-                // SAFETY: the swap chain was made with the waitable flag.
-                unsafe { swap2.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
-                // SAFETY: as above; the handle is ours to close (Drop).
-                waitable_handle = Some(unsafe { swap2.GetFrameLatencyWaitableObject() });
-            }
-            Pacing::Blocking => {
-                let device: IDXGIDevice1 =
-                    self.device.cast().map_err(|e| format!("device: {e}"))?;
-                // SAFETY: our own device.
-                unsafe { device.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
-            }
-            Pacing::Timer => {}
-        }
-        if let Format::Fp16 { .. } = format {
-            let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swap chain 3: {e}"))?;
-            // SAFETY: asks whether this colour space can be presented.
-            let support =
-                unsafe { swap3.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
-                    .unwrap_or(0);
-            if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
-                return Err("the output can't present scRGB".to_owned());
-            }
-            // SAFETY: a supported colour space.
-            unsafe { swap3.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
-                .map_err(|e| format!("colour space: {e}"))?;
-        }
-        let (texture, rtv) = back_buffer(&self.device, &swap)?;
-        let renderer = Renderer::new(&self.device, width, height, format)?;
-        Ok(Chain {
-            swap,
-            waitable: waitable_handle,
-            flags,
-            format,
-            width,
-            height,
-            texture: Some(texture),
-            rtv: Some(rtv),
-            renderer,
-            context: self.context.clone(),
-            device: self.device.clone(),
-            output: self.output.clone(),
-            fullscreen: false,
-        })
-    }
-}
-
-/// The output of `adapter` that shows `hmonitor`, and its index.
-fn find_output(adapter: &IDXGIAdapter1, hmonitor: isize) -> Option<(IDXGIOutput, u32)> {
-    for i in 0.. {
-        // SAFETY: enumeration ends with an error.
-        let Ok(output) = (unsafe { adapter.EnumOutputs(i) }) else {
-            return None;
-        };
-        // SAFETY: reads the output's description.
-        if unsafe { output.GetDesc() }.is_ok_and(|d| d.Monitor == HMONITOR(hmonitor as *mut _)) {
-            return Some((output, i));
-        }
-    }
-    None
-}
-
-fn read_hdr(output: &IDXGIOutput) -> Option<OutputHdr> {
-    let output: IDXGIOutput6 = output.cast().ok()?;
-    // SAFETY: reads the output's description.
-    let desc = unsafe { output.GetDesc1() }.ok()?;
-    Some(OutputHdr {
-        pq: desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        max_nits: desc.MaxLuminance,
-    })
-}
-
-fn new_factory() -> Option<IDXGIFactory4> {
-    // SAFETY: plain factory creation.
-    unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()
-}
-
-/// The output of the adapter with `luid` that shows `hmonitor`, through `factory`.
-fn output_of(factory: &IDXGIFactory4, luid: Luid, hmonitor: isize) -> Option<IDXGIOutput> {
-    // SAFETY: looks the adapter up by its LUID.
-    let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapterByLuid(luid_of(luid)) }.ok()?;
-    Some(find_output(&adapter, hmonitor)?.0)
-}
-
-/// Watches the monitor's HDR state (README §4.8) through a DXGI factory of its own. A factory
-/// goes stale at the first display change and stays stale, so after each change the watch reads
-/// the state through a new one and keeps it: `IsCurrent` stays a cheap check until the next
-/// change.
-pub struct HdrWatch {
-    factory: IDXGIFactory4,
-    luid: Luid,
-    hmonitor: isize,
-}
-
-impl HdrWatch {
-    /// A watch on the monitor `hmonitor` of the adapter with `luid`.
-    pub fn new(luid: Luid, hmonitor: isize) -> Option<HdrWatch> {
-        Some(HdrWatch {
-            factory: new_factory()?,
-            luid,
-            hmonitor,
-        })
-    }
-
-    /// `None` while the displays haven't changed; after a change, whether the monitor's output
-    /// is in HDR (PQ) now (no, if it can't be read).
-    pub fn changed(&mut self) -> Option<bool> {
-        // SAFETY: reads our factory's state.
-        if unsafe { self.factory.IsCurrent() }.as_bool() {
-            return None;
-        }
-        let factory = new_factory()?;
-        let pq = output_of(&factory, self.luid, self.hmonitor)
-            .and_then(|output| read_hdr(&output))
-            .is_some_and(|o| o.pq);
-        self.factory = factory;
-        Some(pq)
-    }
-}
 
 /// `latest` before the first vblank.
 const NO_VBLANK: i64 = i64::MIN;
@@ -346,7 +103,7 @@ fn tick(luid: Luid, hmonitor: isize, period: Period, latest: &AtomicI64, stop: &
             continue;
         }
         failures = 0;
-        latest.store(grid.on_wake(crate::platform::now_hns()), Ordering::Relaxed);
+        latest.store(grid.on_wake(now_hns()), Ordering::Relaxed);
     }
 }
 
@@ -368,50 +125,6 @@ fn dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
         Format::Fp16 { .. } => DXGI_FORMAT_R16G16B16A16_FLOAT,
     }
-}
-
-/// A device on `adapter`, or of `driver` when there is none (WARP in the tests).
-fn create_device(
-    adapter: Option<&IDXGIAdapter>,
-    driver: D3D_DRIVER_TYPE,
-) -> Result<(ID3D11Device, ID3D11DeviceContext1), String> {
-    let mut device = None;
-    let mut context: Option<ID3D11DeviceContext> = None;
-    // SAFETY: out-pointers to locals; feature levels 11.1 then 11.0.
-    unsafe {
-        D3D11CreateDevice(
-            adapter,
-            driver,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )
-    }
-    .map_err(|e| format!("D3D11 device: {e}"))?;
-    let device = device.ok_or("D3D11 device: none")?;
-    let context = context
-        .ok_or("D3D11 context: none")?
-        .cast::<ID3D11DeviceContext1>()
-        .map_err(|e| format!("D3D11.1 context: {e}"))?;
-    Ok((device, context))
-}
-
-fn back_buffer(
-    device: &ID3D11Device,
-    swap: &IDXGISwapChain1,
-) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView), String> {
-    // SAFETY: buffer 0 is the current back buffer of a flip-model swap chain in D3D11.
-    let texture: ID3D11Texture2D =
-        unsafe { swap.GetBuffer(0) }.map_err(|e| format!("back buffer: {e}"))?;
-    let mut rtv = None;
-    // SAFETY: a view of our own texture; out-pointer to a local.
-    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv)) }
-        .map_err(|e| format!("render target: {e}"))?;
-    Ok((texture, rtv.ok_or("render target: none")?))
 }
 
 /// A texture of `width` × `height` in `format` that only copies use.
@@ -468,22 +181,10 @@ pub enum Statistics {
     Nothing,
 }
 
-/// `D3DDDIERR_DEVICEREMOVED`, which `Present` returns for a card removed or a driver upgraded.
-const D3DDDIERR_DEVICEREMOVED: HRESULT = HRESULT(0x8876_0870_u32 as i32);
-
-/// Why presenting failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PresentError {
-    /// The device was removed or reset (`e device_lost`).
-    DeviceLost(String),
-    /// Anything else.
-    Other(String),
-}
-
 /// A swap chain and what draws into it.
 pub struct Chain {
     swap: IDXGISwapChain1,
-    waitable: Option<HANDLE>,
+    waitable: Option<LatencyWait>,
     flags: u32,
     format: Format,
     width: u32,
@@ -498,6 +199,95 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// A swap chain on `gpu`'s device for window `hwnd`'s client area of `width` × `height` in
+    /// `format`, paced as `pacing` says.
+    pub fn new(
+        gpu: &Gpu,
+        hwnd: isize,
+        width: u32,
+        height: u32,
+        format: Format,
+        pacing: Pacing,
+    ) -> Result<Chain, String> {
+        let dxgi_format = dxgi_format(format);
+        let flags = if pacing == Pacing::Waitable {
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
+        } else {
+            0
+        };
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: width,
+            Height: height,
+            Format: dxgi_format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: if pacing == Pacing::Timer { 3 } else { 2 },
+            Scaling: DXGI_SCALING_NONE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: flags,
+            ..Default::default()
+        };
+        let window = HWND(hwnd as *mut _);
+        // SAFETY: our device, our window and a complete description.
+        let swap = unsafe {
+            gpu.factory()
+                .CreateSwapChainForHwnd(gpu.device(), window, &desc, None, None)
+        }
+        .map_err(|e| format!("swap chain: {e}"))?;
+        // SAFETY: this factory made the swap chain for this live window. NO_ALT_ENTER stops only
+        // Alt+Enter; DXGI still leaves fullscreen when the window loses focus (leave_if_lost).
+        let _ = unsafe {
+            gpu.factory()
+                .MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER)
+        };
+        let mut waitable = None;
+        match pacing {
+            // The swap chain was made with the waitable flag.
+            Pacing::Waitable => waitable = Some(LatencyWait::new(&swap, 1)?),
+            Pacing::Blocking => {
+                let device: IDXGIDevice1 =
+                    gpu.device().cast().map_err(|e| format!("device: {e}"))?;
+                // SAFETY: our own device.
+                unsafe { device.SetMaximumFrameLatency(1) }.map_err(|e| format!("latency: {e}"))?;
+            }
+            Pacing::Timer => {}
+        }
+        if let Format::Fp16 { .. } = format {
+            let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swap chain 3: {e}"))?;
+            // SAFETY: asks whether this colour space can be presented.
+            let support =
+                unsafe { swap3.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
+                    .unwrap_or(0);
+            if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
+                return Err("the output can't present scRGB".to_owned());
+            }
+            // SAFETY: a supported colour space.
+            unsafe { swap3.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
+                .map_err(|e| format!("colour space: {e}"))?;
+        }
+        let (texture, rtv) = back_buffer(gpu.device(), &swap)?;
+        let renderer = Renderer::new(gpu.device(), width, height, format)?;
+        Ok(Chain {
+            swap,
+            waitable,
+            flags,
+            format,
+            width,
+            height,
+            texture: Some(texture),
+            rtv: Some(rtv),
+            renderer,
+            context: gpu.context().clone(),
+            device: gpu.device().clone(),
+            output: gpu.output().cloned(),
+            fullscreen: false,
+        })
+    }
+
     /// The swap chain's format.
     pub fn format(&self) -> Format {
         self.format
@@ -505,9 +295,8 @@ impl Chain {
 
     /// Waits up to `ms` for the swap chain to take another frame; `true` if it will.
     pub fn wait(&self, ms: u32) -> bool {
-        match self.waitable {
-            // SAFETY: the swap chain's own waitable object, open until Drop.
-            Some(handle) => (unsafe { WaitForSingleObject(handle, ms) }) == WAIT_OBJECT_0,
+        match &self.waitable {
+            Some(waitable) => waitable.wait(ms),
             None => true,
         }
     }
@@ -522,27 +311,7 @@ impl Chain {
     /// `Present(interval, 0)`. A failure is a lost device when the device says it was removed
     /// or reset, whatever code `Present` gave.
     pub fn present(&self, interval: u32) -> Result<(), PresentError> {
-        // SAFETY: presents our own swap chain; no flags.
-        let result = unsafe { self.swap.Present(interval, DXGI_PRESENT(0)) };
-        // DXGI_STATUS_OCCLUDED is a success: the frame still counts.
-        if result.is_ok() {
-            return Ok(());
-        }
-        // SAFETY: reads whether, and why, the device went away.
-        let removed = unsafe { self.device.GetDeviceRemovedReason() };
-        let lost = [
-            DXGI_ERROR_DEVICE_REMOVED,
-            DXGI_ERROR_DEVICE_RESET,
-            D3DDDIERR_DEVICEREMOVED,
-        ];
-        if removed.is_err() || lost.contains(&result) {
-            return Err(PresentError::DeviceLost(format!(
-                "{result:?} ({removed:?})"
-            )));
-        }
-        result
-            .ok()
-            .map_err(|e| PresentError::Other(format!("present: {e}")))
+        kairo_window::gpu::present(&self.device, &self.swap, interval, DXGI_PRESENT(0))
     }
 
     /// The number of `Present` calls so far (`GetLastPresentCount`).
@@ -560,7 +329,7 @@ impl Chain {
                 present_count: s.PresentCount,
                 present_refresh: s.PresentRefreshCount,
                 sync_refresh: s.SyncRefreshCount,
-                sync_hns: crate::platform::qpc_to_hns(s.SyncQPCTime),
+                sync_hns: qpc_to_hns(s.SyncQPCTime),
             }),
             Err(e) if e.code() == DXGI_ERROR_FRAME_STATISTICS_DISJOINT => Statistics::Disjoint,
             Err(_) => Statistics::Nothing,
@@ -644,10 +413,8 @@ impl Drop for Chain {
             // SAFETY: our swap chain; no output.
             let _ = unsafe { self.swap.SetFullscreenState(false, None) };
         }
-        if let Some(handle) = self.waitable.take() {
-            // SAFETY: the waitable object's handle, which the swap chain gave us to close.
-            let _ = unsafe { CloseHandle(handle) };
-        }
+        // Then the frame-latency wait's handle, before the swap chain is released.
+        drop(self.waitable.take());
     }
 }
 
@@ -738,6 +505,7 @@ impl Renderer {
 mod tests {
     use super::*;
     use kairo_core::testsig::{Load, Options, Patches, Pattern, Scene, Size};
+    use kairo_window::gpu::create_device;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,

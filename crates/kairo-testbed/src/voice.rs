@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use kairo_core::testbed_log::{Event, TONE_LOG_HEADER, ToneHeader, ToneRecord, VoiceRecord};
 use kairo_core::timeline::HNS_PER_SECOND;
+use kairo_window::platform;
 
 use crate::audio::{Audio, Report};
 use crate::beeps::{self, BEEP_HNS, Beep, InOrder, LEAD_HNS, Played};
 use crate::cli::{self, ToneConfig, exit};
-use crate::{pace, platform};
+use crate::pace;
 
 /// Plays the beeps; returns the exit code.
 pub fn run(config: &ToneConfig) -> u8 {
@@ -60,17 +61,7 @@ pub fn run(config: &ToneConfig) -> u8 {
     write(header.line());
     let stdin_eof = Arc::new(AtomicBool::new(false));
     if config.stop_on_stdin_eof {
-        let eof = Arc::clone(&stdin_eof);
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buffer = [0_u8; 256];
-            while let Ok(n) = std::io::Read::read(&mut stdin, &mut buffer) {
-                if n == 0 {
-                    break;
-                }
-            }
-            eof.store(true, Ordering::Relaxed);
-        });
+        kairo_window::stdin::watch_eof(Arc::clone(&stdin_eof));
     }
     platform::opt_out_of_power_throttling();
     let audio = Audio::start(config.hz, config.dbfs);
