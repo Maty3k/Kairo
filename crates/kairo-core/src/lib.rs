@@ -11,7 +11,8 @@
 //! a clip, the aligner that places each audio source on the 48 kHz timeline, and the mixer
 //! with its limiter and meters. These modules take times as arguments and never read a clock.
 //! It also holds pattern v1, the test signal the testbed draws and `kairo-verify` reads back,
-//! and the logs the testbed and `kairo-tone` write as ground truth.
+//! the logs the testbed and `kairo-tone` write as ground truth, and the FFmpeg command lines
+//! and log lines `kairo-verify`'s corpus and the harness share.
 //! The crate has no Windows code, so its tests run on the Mac and on Linux CI.
 
 #![forbid(unsafe_code)]
@@ -20,6 +21,7 @@ pub mod aligner;
 pub mod args;
 pub mod cadence;
 pub mod cut;
+pub mod ffmpeg_cli;
 pub mod hello;
 pub mod job;
 pub mod layout;

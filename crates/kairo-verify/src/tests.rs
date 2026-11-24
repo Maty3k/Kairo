@@ -1201,19 +1201,35 @@ mod cli {
             assert_eq!(code, 2, "{args:?}");
             assert!(!err.contains("someone"), "{err}");
         }
-        let (code, _, err) = run(&[
-            os("check"),
-            os("a.mp4"),
-            os("--profile"),
-            os("engine"),
-            os("--testbed-log"),
-            os("t.log"),
-        ]);
-        assert_eq!(code, 2);
-        assert!(
-            err.contains("--testbed-log comes with source.stability and the testbed and tone logs (research 16's PR 8)"),
-            "{err}"
-        );
+        // A log that can't be read or isn't one refuses the command line, naming the file only.
+        let dir = Dir::new();
+        let not_a_log = dir.0.join("t.log");
+        std::fs::write(&not_a_log, "f 0 1 2 3\n").unwrap();
+        let testbed = dir.0.join("testbed.log");
+        std::fs::write(
+            &testbed,
+            "# kairo-testbed 1\nh pattern=1 run=5 mode=borderless pace=vsync fps=180 F=180 \
+             size=1920x1080 refresh_mhz=180000 hdr=0 sdr_white_nits=- max_nits=- start_hns=0\n",
+        )
+        .unwrap();
+        for (flag, file, with_testbed) in [
+            ("--testbed-log", dir.0.join("missing.log"), false),
+            ("--testbed-log", not_a_log.clone(), false),
+            ("--voice-log", not_a_log.clone(), true),
+        ] {
+            let mut words = vec![os("check"), os("a.mp4"), os("--profile"), os("engine")];
+            if with_testbed {
+                words.extend([os("--testbed-log"), testbed.as_os_str()]);
+            }
+            words.extend([os(flag), file.as_os_str()]);
+            let (code, _, err) = run(&words);
+            assert_eq!(code, 2, "{flag}: {err}");
+            assert!(
+                err.contains("t.log") || err.contains("missing.log"),
+                "{err}"
+            );
+            assert!(!err.contains(&*dir.0.to_string_lossy()), "{err}");
+        }
     }
 
     #[test]
