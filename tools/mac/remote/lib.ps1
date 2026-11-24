@@ -355,10 +355,10 @@ function Get-KairoWatch {
 function Assert-PcIdle([string]$Verb, [bool]$FullscreenRefuses = $false) {
     # Stops the script unless the owner is away, or --force was given (the owner said it is OK).
     # With $FullscreenRefuses, a fullscreen window in front refuses even with --force: a harness
-    # capture never starts over a game.
+    # capture or an AMD settings diff never runs over a game.
     $watch = Get-KairoWatch
     if ($FullscreenRefuses -and ($watch.Fullscreen -eq $true)) {
-        Say ('refused: a fullscreen window is in front, so "' + $Verb + '" did not run; --force does not override that for a harness capture.')
+        Say ('refused: a fullscreen window is in front, so "' + $Verb + '" did not run; --force does not override that.')
         Exit-Pc 3
     }
     if ($watch.State -eq 'idle') { return }
