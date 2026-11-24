@@ -1,0 +1,3 @@
+# HLSL is embedded with include_str!, so the bytes a build compiles and hashes must not depend on
+# how Git checked the file out: LF everywhere, Windows CI included.
+*.hlsl text eol=lf
