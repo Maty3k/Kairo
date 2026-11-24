@@ -17,6 +17,7 @@
 use kairo_core::timeline::HNS_PER_SECOND;
 
 use crate::cli::exit;
+use crate::summary::{GpuTime, GpuTimes};
 
 /// Every shader, as HLSL (README §3.5, §3.7): compiled at run time with `D3DCompile` from the
 /// inbox `d3dcompiler_47.dll`, never shipped as bytecode. Written for Kairo; no third-party shader
@@ -407,6 +408,110 @@ impl Ramp {
         guard_step(&self.geometry, (from, gpu_ms), to).map_err(Refusal::TooHeavy)?;
         self.at += 1;
         Ok(to)
+    }
+}
+
+/// How long past its own length a ramp or calibration step may go on without the timed frames it
+/// needs, in 100 ns: then the GPU's timestamps count as broken (exit 4, `e refused
+/// reason=no_timing`). 10 s is 100 frames at the 100 ms frame guard, so a step the guards allow
+/// always gets its frames in time.
+pub const STEP_LIMIT_HNS: i64 = 10 * HNS_PER_SECOND;
+
+/// Where a step's timing stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTiming {
+    /// Still drawing: too few frames timed yet, or too short.
+    Running,
+    /// Enough: the median GPU time of the step's timed frames (nearest rank), and how many there
+    /// were.
+    Done {
+        /// The median, in µs.
+        median_us: u64,
+        /// The frames timed.
+        frames: u32,
+    },
+    /// [`STEP_LIMIT_HNS`] past the step's length, still without enough timed frames.
+    NoTiming,
+}
+
+/// Times one ramp step or calibration step (README §3.6, §3.10): a step is done once at least
+/// `frames` of its frames have a GPU time and it has lasted at least `seconds`, and its time is
+/// their median. Frames carry the id of the step they were drawn for ([`StepTimer::start`]), so a
+/// frame of an earlier step that resolves late never counts for the next one, whose count
+/// differs. The times go into a histogram allocated once ([`GpuTimes`]), so a frame allocates
+/// nothing.
+#[derive(Debug, Clone)]
+pub struct StepTimer {
+    id: u32,
+    frames: u32,
+    until_hns: i64,
+    limit_hns: i64,
+    times: GpuTimes,
+}
+
+impl Default for StepTimer {
+    fn default() -> StepTimer {
+        StepTimer::new()
+    }
+}
+
+impl StepTimer {
+    /// A timer with no step yet: id 0 is never a step's, so frames drawn outside a step can
+    /// carry it.
+    pub fn new() -> StepTimer {
+        StepTimer {
+            id: 0,
+            frames: 1,
+            until_hns: i64::MAX,
+            limit_hns: i64::MAX,
+            times: GpuTimes::new(),
+        }
+    }
+
+    /// Starts a step at `now_hns` that needs `frames` timed frames (at least one) and `seconds`;
+    /// returns its id, which the frames drawn for it carry. Forgets the step before.
+    pub fn start(&mut self, now_hns: i64, frames: u32, seconds: u32) -> u32 {
+        self.id = match self.id.wrapping_add(1) {
+            0 => 1,
+            id => id,
+        };
+        self.frames = frames.max(1);
+        self.until_hns = now_hns.saturating_add(i64::from(seconds) * HNS_PER_SECOND);
+        self.limit_hns = self.until_hns.saturating_add(STEP_LIMIT_HNS);
+        self.times.clear();
+        self.id
+    }
+
+    /// The current step's id (0 before the first).
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// One resolved frame drawn for step `id`: counted if that is the current step and its time
+    /// is known.
+    pub fn add(&mut self, id: u32, time: GpuTime) {
+        if let (true, GpuTime::Us(us)) = (id == self.id && id != 0, time) {
+            self.times.add(us);
+        }
+    }
+
+    /// Where the step stands at `now_hns`.
+    pub fn timing(&self, now_hns: i64) -> StepTiming {
+        let timed = self.times.count();
+        if timed >= u64::from(self.frames)
+            && now_hns >= self.until_hns
+            && let Some(median_us) = self.times.median_us()
+        {
+            return StepTiming::Done {
+                median_us,
+                frames: u32::try_from(timed).unwrap_or(u32::MAX),
+            };
+        }
+        if now_hns >= self.limit_hns {
+            StepTiming::NoTiming
+        } else {
+            StepTiming::Running
+        }
     }
 }
 
@@ -1183,6 +1288,82 @@ mod tests {
         assert!(check(&three, 1, 75.1).is_err());
         assert!(check(&SCREEN, 1, f64::NAN).is_err());
         assert!(check(&SCREEN, 1, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn a_step_is_timed_by_its_own_frames() {
+        let second = HNS_PER_SECOND;
+        let mut timer = StepTimer::new();
+        assert_eq!(timer.id(), 0);
+        // Nothing started: frames drawn outside a step carry id 0 and never count.
+        timer.add(0, GpuTime::Us(5));
+        let ramp = timer.start(100 * second, RAMP_FRAMES, 0);
+        assert_ne!(ramp, 0);
+        assert_eq!(timer.timing(100 * second), StepTiming::Running);
+        for us in [900, 1_000, 950, 1_100, 1_050, 980, 1_020, 990, 1_010] {
+            timer.add(ramp, GpuTime::Us(us));
+        }
+        // Nine timed frames, a disjoint one, one that never resolved, and one of step 0.
+        timer.add(ramp, GpuTime::Disjoint);
+        timer.add(ramp, GpuTime::Unknown);
+        timer.add(0, GpuTime::Us(1));
+        assert_eq!(timer.timing(101 * second), StepTiming::Running);
+        timer.add(ramp, GpuTime::Us(1_005));
+        assert_eq!(
+            timer.timing(101 * second),
+            StepTiming::Done {
+                median_us: 1_000,
+                frames: 10
+            }
+        );
+        // The next step forgets the last; a late frame of the last one doesn't count.
+        let verify = timer.start(102 * second, 2, VERIFY_SECONDS);
+        assert_ne!(verify, ramp);
+        timer.add(ramp, GpuTime::Us(1_000));
+        timer.add(verify, GpuTime::Us(8_000));
+        timer.add(verify, GpuTime::Us(8_200));
+        // Enough frames, but not yet five seconds.
+        assert_eq!(timer.timing(106 * second), StepTiming::Running);
+        assert_eq!(
+            timer.timing(107 * second),
+            StepTiming::Done {
+                median_us: 8_000,
+                frames: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_step_without_its_timed_frames_gives_up() {
+        let second = HNS_PER_SECOND;
+        let mut timer = StepTimer::new();
+        let id = timer.start(0, CALIBRATE_FRAMES, 0);
+        for _ in 0..1_000 {
+            timer.add(id, GpuTime::Disjoint);
+        }
+        timer.add(id, GpuTime::Us(8_000));
+        assert_eq!(timer.timing(STEP_LIMIT_HNS - 1), StepTiming::Running);
+        assert_eq!(timer.timing(STEP_LIMIT_HNS), StepTiming::NoTiming);
+        // A step's own length comes first.
+        timer.start(0, 1, VERIFY_SECONDS);
+        assert_eq!(
+            timer.timing(STEP_LIMIT_HNS + 4 * second),
+            StepTiming::Running
+        );
+        assert_eq!(
+            timer.timing(STEP_LIMIT_HNS + 5 * second),
+            StepTiming::NoTiming
+        );
+        // One timed frame is the least a step can need.
+        let id = timer.start(0, 0, 0);
+        timer.add(id, GpuTime::Us(3));
+        assert_eq!(
+            timer.timing(0),
+            StepTiming::Done {
+                median_us: 3,
+                frames: 1
+            }
+        );
     }
 
     #[test]

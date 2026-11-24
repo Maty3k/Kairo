@@ -3,11 +3,15 @@
 //! written for the testbed, research 16 §4.1, §4.8): the device on the adapter that drives the
 //! monitor, chosen by LUID, with the adapter's DXGI index and the output that shows the monitor;
 //! the output's HDR state, and a watch on it; a swap chain's back buffer 0 and its render target
-//! view; `Present` with a lost device told apart; and a swap chain's frame-latency wait. Each
-//! program makes its own swap chain and draws its own way.
+//! view; `Present` with an occluded window and a lost device told apart; and a swap chain's
+//! frame-latency wait. Each program makes its own swap chain and draws its own way.
+
+use std::fmt;
 
 use kairo_display::Luid;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, LUID, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, DXGI_STATUS_OCCLUDED, HANDLE, HMODULE, LUID, S_OK, WAIT_OBJECT_0,
+};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -236,13 +240,43 @@ pub fn back_buffer(
 /// `D3DDDIERR_DEVICEREMOVED`, which `Present` returns for a card removed or a driver upgraded.
 const D3DDDIERR_DEVICEREMOVED: HRESULT = HRESULT(0x8876_0870_u32 as i32);
 
-/// Why presenting failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a `Present` that succeeded returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presented {
+    /// The frame was queued (`S_OK`).
+    Queued,
+    /// `DXGI_STATUS_OCCLUDED`: none of the window can be seen. A success: the frame still
+    /// counts, and loadgen counts these (`occluded=`).
+    Occluded,
+}
+
+/// Why presenting failed, with the HRESULTs a log records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentError {
-    /// The device was removed or reset (the testbed's `e device_lost`).
-    DeviceLost(String),
-    /// Anything else.
-    Other(String),
+    /// The device was removed or reset (the testbed's and loadgen's `e device_lost`).
+    DeviceLost {
+        /// What `Present` returned.
+        hr: HRESULT,
+        /// Why the device went: `GetDeviceRemovedReason`'s HRESULT (`S_OK` if it says the device
+        /// is still there).
+        reason: HRESULT,
+    },
+    /// Anything else, with what `Present` returned: `DXGI_ERROR_INVALID_CALL` when a condition
+    /// of the present flags broke, for one (loadgen's `e present_failed`).
+    Other(HRESULT),
+}
+
+impl fmt::Display for PresentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceLost { hr, reason } => write!(
+                f,
+                "Present returned {:#010x}, and the device's removed reason is {:#010x}",
+                hr.0 as u32, reason.0 as u32
+            ),
+            Self::Other(hr) => write!(f, "Present returned {:#010x}", hr.0 as u32),
+        }
+    }
 }
 
 /// `Present(interval, flags)` on `swap`, a swap chain made on `device`. A failure is a lost
@@ -252,12 +286,15 @@ pub fn present(
     swap: &IDXGISwapChain1,
     interval: u32,
     flags: DXGI_PRESENT,
-) -> Result<(), PresentError> {
+) -> Result<Presented, PresentError> {
     // SAFETY: presents the program's own swap chain, with the flags it asked for.
     let result = unsafe { swap.Present(interval, flags) };
-    // DXGI_STATUS_OCCLUDED is a success: the frame still counts.
     if result.is_ok() {
-        return Ok(());
+        return Ok(if result == DXGI_STATUS_OCCLUDED {
+            Presented::Occluded
+        } else {
+            Presented::Queued
+        });
     }
     // SAFETY: reads whether, and why, the device went away.
     let removed = unsafe { device.GetDeviceRemovedReason() };
@@ -267,13 +304,12 @@ pub fn present(
         D3DDDIERR_DEVICEREMOVED,
     ];
     if removed.is_err() || lost.contains(&result) {
-        return Err(PresentError::DeviceLost(format!(
-            "{result:?} ({removed:?})"
-        )));
+        return Err(PresentError::DeviceLost {
+            hr: result,
+            reason: removed.map_or_else(|e| e.code(), |()| S_OK),
+        });
     }
-    result
-        .ok()
-        .map_err(|e| PresentError::Other(format!("present: {e}")))
+    Err(PresentError::Other(result))
 }
 
 /// A swap chain's frame-latency waitable object: the swap chain takes another frame when it is

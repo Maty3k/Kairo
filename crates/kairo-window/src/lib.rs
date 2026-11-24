@@ -6,12 +6,13 @@
 //! - `gpu` (Windows): the D3D11 device on the adapter with a given LUID (feature level 11.1 or
 //!   11.0, BGRA support), the adapter's DXGI index and the output that shows the monitor; the
 //!   output's HDR state and a watch on it; a swap chain's back buffer 0 and its render target
-//!   view; `Present` with the caller's flags and a lost device told apart; the frame-latency
-//!   wait. Each program makes its own swap chain and draws its own way.
-//! - `platform` (Windows): QPC time, the EcoQoS opt-out, `KeepDisplayOn`, the session's idle time,
-//!   the foreground lock time-out and the `--activate` wait; the window (its class name and title
-//!   given by the program) with its panic-safe window procedure; and `Cover`, a black, topmost
-//!   window over one display that never takes focus (research 17 §4.3).
+//!   view; `Present` with the caller's flags, and an occluded window and a lost device told
+//!   apart, with their HRESULTs; the frame-latency wait. Each program makes its own swap chain
+//!   and draws its own way.
+//! - `platform` (Windows): QPC time and its frequency, the EcoQoS opt-out, `KeepDisplayOn`, the
+//!   session's idle time, the foreground lock time-out and the `--activate` wait; the window (its
+//!   class name and title given by the program) with its panic-safe window procedure; and
+//!   `Cover`, a black, topmost window over one display that never takes focus (research 17 §4.3).
 //! - [`ready`]: the ready file, written whole and only if it doesn't exist.
 //! - [`stdin`]: the `--stop-on-stdin-eof` watcher.
 //!
