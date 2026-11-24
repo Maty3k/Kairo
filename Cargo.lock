@@ -215,6 +215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kairo-loadgen"
+version = "0.1.0"
+dependencies = [
+ "kairo-core",
+ "kairo-display",
+ "kairo-window",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "kairo-mock-engine"
 version = "0.1.0"
 dependencies = [

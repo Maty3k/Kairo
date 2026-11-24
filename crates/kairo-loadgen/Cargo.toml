@@ -1,0 +1,43 @@
+[package]
+name = "kairo-loadgen"
+description = "kairo-loadgen.exe: a deterministic GPU load (ALU or bandwidth), borderless with tearing on a chosen monitor, for the bench (M1, research 17 §3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kairo-loadgen"
+path = "src/bin/kairo-loadgen.rs"
+
+[dependencies]
+kairo-core = { workspace = true }
+kairo-display = { workspace = true }
+kairo-window = { workspace = true }
+serde_json = { workspace = true }
+
+# Research 17 §3.1's list. The window, QPC time, the display request and the foreground wait are
+# kairo-window's calls; loadgen's own are its swap chain, shaders, queries and D3DKMT read-outs.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Wdk_Graphics_Direct3D",            # D3DKMT: preemption granularity and HAGS, read-only (§3.10)
+    "Win32_Foundation",                 # handles, HWND, BOOL, HRESULT
+    "Win32_Graphics_Direct3D",          # blobs, shader macros, the primitive topology
+    "Win32_Graphics_Direct3D_Fxc",      # D3DCompile from the inbox d3dcompiler_47.dll (§3.7)
+    "Win32_Graphics_Direct3D11",        # shaders, the constant buffer, the texture, queries, draws
+    "Win32_Graphics_Dxgi",              # the swap chain with tearing, Present, the hints
+    "Win32_Graphics_Dxgi_Common",       # formats
+    "Win32_Graphics_Gdi",               # HMONITOR
+    "Win32_System_LibraryLoader",       # module handles (the window's, through kairo-window)
+    "Win32_System_Performance",         # QPC's frequency, for the header's qpc_hz
+    "Win32_System_Power",               # the display request (kairo-window's KeepDisplayOn)
+    "Win32_System_SystemInformation",   # the tick count behind the idle time (kairo-window)
+    "Win32_System_Threading",           # waits, the EcoQoS opt-out
+    "Win32_UI_Input_KeyboardAndMouse",  # the session's idle time for --activate (kairo-window)
+    "Win32_UI_WindowsAndMessaging",     # the window and its messages (kairo-window)
+] }
+
+[lints]
+workspace = true
