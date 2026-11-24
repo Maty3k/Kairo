@@ -623,7 +623,9 @@ function Get-RegdiffSnapshot {
         }
         return (New-RegdiffSnapshot -Scopes $scopes.ToArray() -Hidden $hidden -Key $Key -Driver:$Driver)
     } finally {
-        foreach ($key in $opened) { Close-RegdiffKey $key }
+        # Not $key: PowerShell's names ignore case, so that would assign each RegistryKey to the
+        # [byte[]] $Key parameter, and the conversion would throw.
+        foreach ($openKey in $opened) { Close-RegdiffKey $openKey }
     }
 }
 
