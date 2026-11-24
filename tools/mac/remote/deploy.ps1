@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # pc deploy: copy the executables of the last successful "pc build" into C:\kairo\bin\<build-id>,
-# point the junction C:\kairo\bin\current at it, restart the watch agent from the new build and
-# keep the newest 3 builds. Refuses while the PC is busy or a \Kairo\Run job is running.
+# with the pinned FFmpeg's DLLs beside the programs that import them, point the junction
+# C:\kairo\bin\current at it, restart the watch agent from the new build and keep the newest 3
+# builds. Refuses while the PC is busy or a \Kairo\Run job is running.
 # <build-id> is <UTC yyyyMMdd-HHmmss>-<first 12 hex digits of the built commit>.
 
 Assert-PcIdle 'deploy'
+$pin = [string]$Pc['FfmpegSha256']
+if ($pin -cnotmatch '^[0-9a-f]{64}\z') { Fail 'internal: the Mac sent no FFmpeg pin' 2 }
 if ((Test-RunTaskBusy) -and -not $Pc['Force']) {
     Fail 'a \Kairo\Run job is running right now; wait for it (tools/mac/pc logs) or re-run with --force' 3
 }
@@ -96,6 +99,45 @@ foreach ($file in $files) {
         Fail ($problem + '; nothing was deployed (run tools/mac/pc build again)')
     }
 }
+
+# FFmpeg's DLLs that the deployed programs import, directly or through each other, read from their
+# import tables (research 16 section 3.4: kairo-verify.exe's avcodec, avformat, avutil and
+# swresample). They come from C:\kairo\tools\ffmpeg\bin, which only Administrators can change, and
+# only while its KAIRO-PIN.json names the build tools/pc/bootstrap.ps1 pins (the Mac sends the pin).
+# Without them the build still deploys; a program that links FFmpeg then can't start until
+# pc ffmpeg and another deploy.
+$ffmpeg = $null
+$ffmpegNotes = @()
+$ffmpegBin = Join-Path $Kairo.Ffmpeg 'bin'
+$installed = Read-JsonFile (Join-Path $Kairo.Ffmpeg 'KAIRO-PIN.json')
+if (([string](Get-Field $installed 'sha256') -ceq $pin) -and [IO.Directory]::Exists($ffmpegBin)) {
+    $images = @($files | Where-Object { @('.exe', '.dll') -contains $_.Extension.ToLowerInvariant() } |
+            ForEach-Object { Join-Path $destination $_.Name })
+    try {
+        $dlls = @(Get-FfmpegDlls $images $ffmpegBin)
+        foreach ($dll in $dlls) {
+            [IO.File]::Copy((Join-Path $ffmpegBin $dll), (Join-Path $destination $dll), $false)
+        }
+        # A program built against another FFmpeg (other library versions in the names) imports DLLs
+        # the pinned build lacks; Windows would only say so when it starts.
+        $missing = @($images | ForEach-Object { Get-PeImports $_ } | Where-Object {
+                ($_ -match '^(avcodec|avformat|avutil|avfilter|avdevice|swresample|swscale|postproc)-[0-9]+\.dll\z') -and
+                -not [IO.File]::Exists((Join-Path $ffmpegBin $_)) } | Sort-Object -Unique)
+    } catch {
+        Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        Fail ('FFmpeg''s DLLs: ' + $_.Exception.Message + '; nothing was deployed')
+    }
+    $ffmpeg = [ordered]@{ asset = [string](Get-Field $installed 'asset'); sha256 = $pin; dlls = $dlls }
+    if ($dlls.Count -gt 0) { $ffmpegNotes += 'with FFmpeg''s ' + ($dlls -join ', ') + ' (' + $ffmpeg.asset + ')' }
+    if ($missing.Count -gt 0) {
+        $ffmpegNotes += 'warning: this build imports ' + ($missing -join ', ') + ', which the pinned FFmpeg lacks, so ' +
+            'what imports them can''t start: it was built against another FFmpeg (run tools/mac/pc build, then deploy again)'
+    }
+} elseif ($files | Where-Object { $_.Name -ieq 'kairo-verify.exe' }) {
+    $ffmpegNotes += 'warning: kairo-verify.exe has no FFmpeg DLLs beside it, so it can''t start: ' + $Kairo.Ffmpeg +
+        ' is not the build tools/pc/bootstrap.ps1 pins (run tools/mac/pc ffmpeg, then build and deploy again)'
+}
+
 $info = [ordered]@{
     build_id      = $id
     commit        = $commit
@@ -103,6 +145,7 @@ $info = [ordered]@{
     built_utc     = (Get-Field $last 'ended_utc')
     deployed_utc  = $now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $invariant)
     files         = @($files | ForEach-Object { $_.Name })
+    ffmpeg        = $ffmpeg
 }
 Write-TextFileAtomic (Join-Path $destination 'build.json') ($info | ConvertTo-Json -Compress -Depth 4)
 # Only the \Kairo\ tasks run these, as the owner (nothing elevated runs a build: build.ps1); Administrators
@@ -114,6 +157,7 @@ Set-CurrentBuild $id
 $was = 'none'
 if ($previous) { $was = $previous }
 Say ('deployed ' + $id + ' (' + $files.Count + ' files: ' + (@($exes | ForEach-Object { $_.Name }) -join ', ') + ')')
+foreach ($note in $ffmpegNotes) { Say $note }
 Say ('C:\kairo\bin\current -> ' + $id + ' (was ' + $was + ')')
 Restart-WatchAgent
 Remove-OldBuilds
