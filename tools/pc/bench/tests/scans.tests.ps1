@@ -20,13 +20,19 @@
 # - the elevated bench scripts: the bench scripts and the bench verbs, tools/mac/remote/bench*.ps1;
 # - every script: tools/**/*.ps1, the tests included.
 #
+# A command's module qualifier is dropped before its name is matched, in every rule:
+# Microsoft.PowerShell.Management\Get-Process is Get-Process.
+#
 # R1 Module lists (CLAUDE.md, Never 3), in the bench scripts: no member named Path, MainModule,
 #    Modules, Company, FileVersion, ProductVersion, Description, Product or CommandLine on anything
 #    but a type literal ([IO.Path]::Combine is fine), whether written $p.Path, $p.'Path',
-#    $p.PSObject.Properties['Path'] or as a cmdlet's property argument (Select-Object Path,
-#    ForEach-Object Path); and no member name computed at run time. On a process the first eight go
-#    through MainModule, which opens it with memory-read rights and lists its modules, and
-#    CommandLine is a WMI query for its command line (research 17 section 5.3).
+#    $p.get_Path(), $p.PSObject.Properties['Path'] or as a cmdlet's property argument (Select-Object
+#    Path, ForEach-Object Path), a wildcard that matches one included (Select-Object *, P*); and no
+#    member name computed at run time. On a process the first eight go through MainModule, which
+#    opens it with memory-read rights and lists its modules, and CommandLine is a WMI query for its
+#    command line (research 17 section 5.3). Nor anything that gives a Process object, whose every
+#    property a whole-object read (Format-List *, ConvertTo-Json) would read: Get-Process (gps, ps),
+#    GetProcessById or GetProcessesByName. Get-ProcessIdAndName, R2's one helper, gives names.
 # R2 Process lists, in every script: GetProcesses only in the one helper, a function that loops
 #    over it reading only Id and ProcessName (and Dispose) of each process and returns
 #    [pscustomobject]@{ Id; Name }; Get-Process only by name or id (status.ps1's LogonUI lookup
@@ -40,16 +46,24 @@
 #    keybd_event, mouse_event) in every script, as a command or member name, and in strings outside
 #    the tests, where an Add-Type definition would carry it.
 # R4 File writes, in the elevated bench scripts: none, except Write-TextFileAtomic's decision file
-#    (research 17 sections 4.2 and 4.6). Cmdlets that write files, items or properties; a > or >>
-#    redirection other than to $null; [IO.File] and [IO.Directory] beyond their reading members;
-#    FileStream, StreamWriter or BinaryWriter; members that write, move or delete.
+#    (research 17 sections 4.2 and 4.6), and only when its path (-Path, else the first positional
+#    argument) names that file: a string ending in .decision.json, or a variable named
+#    $decisionFile or $decisionPath. Cmdlets that write files, items or properties; Start-Process
+#    (start, saps) with -RedirectStandardOutput or -RedirectStandardError (RSO, RSE) or splatted
+#    arguments; a > or >> redirection other than to $null; [IO.File] and [IO.Directory] beyond their
+#    reading members; FileStream, StreamWriter or BinaryWriter in any form, a conversion
+#    ([IO.StreamWriter]$f creates the file), -as or a typed variable included; members that write,
+#    move or delete, Create among them; and Open, unless it is Open(Open, Read) written out
+#    (FileInfo.Open(mode) alone opens for reading and writing). A type may be written with or
+#    without its namespace (using namespace System.IO).
 # R5 Dot-sourcing safely (research 17 section 2 item 1), in the bench scripts: function definitions
 #    and, last, one command line guarded by $MyInvocation.InvocationName -ne '.'; no script param
 #    block (dot-sourcing would bind it), no begin or process block, no exit outside the guard, no
 #    Mandatory parameter and no Read-Host (-NonInteractive can't prompt).
 # R6 Windows PowerShell 5.1's grammar, in every script: no ?:, &&, ||, ??, ??=, ?., ?[, background
-#    &, `u{} escape or number suffix (y, uy, s, us, u, ul, n), which PowerShell 7 added. CI parses
-#    every script with 5.1 on Windows; this rule catches them on the Mac and on Linux too.
+#    &, `u{} escape or number suffix (y, uy, s, us, u, ul, n, also before a multiplier: 1ukb), which
+#    PowerShell 7 added. CI parses every script with 5.1 on Windows; this rule catches them on the
+#    Mac and on Linux too.
 #
 # Rules: ASCII only; Windows PowerShell 5.1 syntax (CI parses tools/** there); no Add-Type. The
 # snippets below are strings, which these rules never read as code, except R3's strings check,
@@ -139,6 +153,21 @@ function Get-ScanFunction($Node) {
     return $parent
 }
 
+function Get-ScanCommandName($Command) {
+    # A command's name without its module qualifier, the text after the last '\'
+    # (Microsoft.PowerShell.Management\Get-Process runs Get-Process), or $null when the name is
+    # computed at run time.
+    $name = $Command.GetCommandName()
+    if ($null -eq $name) { return $null }
+    return $name.Substring($name.LastIndexOf([char]'\') + 1)
+}
+
+function Test-ScanIoType([string] $TypeName, [string[]] $Names) {
+    # Whether a type name is one of these System.IO types, or an array of one, written with its
+    # namespace, with IO. alone, or bare after 'using namespace System.IO'.
+    return ($TypeName -match ('^((System\.)?IO\.)?(' + ($Names -join '|') + ')(\[\])?\z'))
+}
+
 # --- R1 module lists ---------------------------------------------------------------------------
 
 $script:ModuleMembers = @('Path', 'MainModule', 'Modules', 'Company', 'FileVersion', 'ProductVersion', 'Description', 'Product', 'CommandLine')
@@ -147,16 +176,43 @@ $script:PropertyCommands = @('ForEach-Object', '%', 'foreach', 'Select-Object', 
     'Group-Object', 'group', 'Where-Object', '?', 'where', 'Measure-Object', 'measure', 'Format-Table', 'ft',
     'Format-List', 'fl', 'Format-Wide', 'fw', 'Format-Custom', 'fc', 'Compare-Object', 'compare', 'diff',
     'Export-Csv', 'epcsv', 'ConvertTo-Csv', 'ConvertTo-Html', 'Out-GridView', 'ogv')
+# What gives a Process object, other than R2's one helper, which reads only Id and ProcessName.
+$script:ProcessCommands = @('Get-Process', 'gps', 'ps')
+$script:ProcessGetters = @('GetProcessById', 'GetProcessesByName')
+
+function Get-ScanPropertyProblem([string] $Name) {
+    # $null unless a property argument reads a banned member: by its name, or as a wildcard that
+    # matches one (*, P*, Pa?h, [P]ath). A wildcard that doesn't parse counts as matching.
+    if ($script:ModuleMembers -contains $Name) { return $Name }
+    if ($Name.IndexOfAny([char[]]@('*', '?', '[')) -lt 0) { return $null }
+    $pattern = [Management.Automation.WildcardPattern]::new($Name, [Management.Automation.WildcardOptions]::IgnoreCase)
+    $hits = [Collections.Generic.List[string]]::new()
+    foreach ($member in $script:ModuleMembers) {
+        $isMatch = $true
+        try { $isMatch = $pattern.IsMatch($member) } catch { $isMatch = $true }
+        if ($isMatch) { $hits.Add($member) }
+    }
+    if ($hits.Count -eq 0) { return $null }
+    return ($Name + ', which matches ' + ($hits -join ', '))
+}
 
 function Find-ScanModuleMembers($Source) {
     $found = [Collections.Generic.List[string]]::new()
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
-        if ($node.Expression -is [Management.Automation.Language.TypeExpressionAst]) { continue }
         $name = Get-ScanMemberName $node
+        if ($null -ne $name -and $script:ProcessGetters -contains $name) {
+            # [Diagnostics.Process]::GetProcessById: on a type literal too.
+            $found.Add((New-ScanFinding $Source $node ('.' + $name + ', which gives Process objects: Get-ProcessIdAndName gives names')))
+            continue
+        }
+        if ($node.Expression -is [Management.Automation.Language.TypeExpressionAst]) { continue }
         if ($null -eq $name) {
             $found.Add((New-ScanFinding $Source $node ('a member name computed at run time: ' + $node.Extent.Text)))
         } elseif ($script:ModuleMembers -contains $name) {
             $found.Add((New-ScanFinding $Source $node ('.' + $name)))
+        } elseif ($name -match '^get_(.+)\z' -and $script:ModuleMembers -contains $Matches[1]) {
+            # A property's getter, $p.get_MainModule(), reads it as the property does.
+            $found.Add((New-ScanFinding $Source $node ('.' + $name + '()')))
         }
     }
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.IndexExpressionAst]))) {
@@ -165,11 +221,17 @@ function Find-ScanModuleMembers($Source) {
         }
     }
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
-        $command = $node.GetCommandName()
-        if ($null -eq $command -or $script:PropertyCommands -notcontains $command) { continue }
+        $command = Get-ScanCommandName $node
+        if ($null -eq $command) { continue }
+        if ($script:ProcessCommands -contains $command) {
+            $found.Add((New-ScanFinding $Source $node ($command + ', which gives Process objects: Get-ProcessIdAndName gives names')))
+            continue
+        }
+        if ($script:PropertyCommands -notcontains $command) { continue }
         for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
             foreach ($name in (Get-ScanStrings $node.CommandElements[$i])) {
-                if ($script:ModuleMembers -contains $name) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $name))) }
+                $problem = Get-ScanPropertyProblem $name
+                if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $problem))) }
             }
         }
     }
@@ -284,7 +346,7 @@ function Find-ScanProcessLists([object[]] $Sources) {
             }
         }
         foreach ($node in (Find-ScanNodes $source.Ast ([Management.Automation.Language.CommandAst]))) {
-            $command = $node.GetCommandName()
+            $command = Get-ScanCommandName $node
             $problem = $null
             if (@('Get-Process', 'gps', 'ps') -contains $command) {
                 $problem = Get-ScanGetProcessProblem $node
@@ -314,7 +376,7 @@ $script:InputNames = @('SendInput', 'SendKeys', 'SendWait', 'keybd_event', 'mous
 function Find-ScanBannedCalls($Source, [switch] $Elevated) {
     $found = [Collections.Generic.List[string]]::new()
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
-        $command = $node.GetCommandName()
+        $command = Get-ScanCommandName $node
         if ($null -eq $command) { continue }
         if ($Elevated -and @('Add-Type', 'Import-Csv', 'ipcsv') -contains $command) { $found.Add((New-ScanFinding $Source $node $command)) }
         if ($script:InputNames -contains $command) { $found.Add((New-ScanFinding $Source $node ('synthetic input: ' + $command))) }
@@ -339,38 +401,123 @@ $script:WriteCommands = @('Set-Content', 'sc', 'Add-Content', 'ac', 'Clear-Conte
     'Clear-Item', 'cli', 'New-ItemProperty', 'Set-ItemProperty', 'sp', 'Remove-ItemProperty', 'rp', 'Rename-ItemProperty',
     'rnp', 'Copy-ItemProperty', 'cpp', 'Move-ItemProperty', 'mp', 'Clear-ItemProperty', 'clp', 'Set-Acl', 'Start-Transcript',
     'Compress-Archive', 'Expand-Archive', 'New-TemporaryFile', 'Export-Alias', 'epal', 'Export-FormatData', 'Export-PSSession', 'epsn')
+# Start-Process writes a file when it sends the program's output or errors to one.
+$script:StartCommands = @('Start-Process', 'start', 'saps')
 # [IO.File] and [IO.Directory] may only read.
-$script:FileTypes = @('IO.File', 'System.IO.File', 'IO.Directory', 'System.IO.Directory')
+$script:FileTypes = @('File', 'Directory')
 $script:FileReads = @('ReadAllText', 'ReadAllBytes', 'ReadAllLines', 'ReadLines', 'Exists', 'OpenRead', 'GetAttributes',
     'GetLastWriteTime', 'GetLastWriteTimeUtc', 'GetCreationTime', 'GetCreationTimeUtc', 'GetLastAccessTime',
     'GetLastAccessTimeUtc', 'EnumerateFiles', 'EnumerateDirectories', 'EnumerateFileSystemEntries', 'GetFiles',
     'GetDirectories', 'GetFileSystemEntries', 'GetCurrentDirectory')
-$script:WriterTypes = '^(System\.)?IO\.(FileStream|StreamWriter|BinaryWriter)\z'
+# Types that open a file for writing, used in any form: [IO.StreamWriter]$f creates the file.
+$script:WriterTypes = @('FileStream', 'StreamWriter', 'BinaryWriter')
 # Members that write, move or delete, whatever they are called on: files (FileInfo and the like),
 # and the registry keys and values the scripts never change.
 $script:WriteMembers = @('WriteAllText', 'WriteAllBytes', 'WriteAllLines', 'AppendAllText', 'AppendAllLines', 'AppendText',
-    'CreateText', 'OpenWrite', 'CreateDirectory', 'CreateSubdirectory', 'MoveTo', 'CopyTo', 'Delete', 'Encrypt', 'Decrypt',
-    'SetAccessControl', 'SetAttributes', 'SetLastWriteTime', 'SetLastWriteTimeUtc', 'SetCreationTime', 'SetCreationTimeUtc',
-    'CreateSymbolicLink', 'SetValue', 'DeleteValue', 'DeleteSubKey', 'DeleteSubKeyTree', 'CreateSubKey')
+    'Create', 'CreateText', 'OpenWrite', 'CreateDirectory', 'CreateSubdirectory', 'MoveTo', 'CopyTo', 'Delete', 'Encrypt',
+    'Decrypt', 'SetAccessControl', 'SetAttributes', 'SetLastWriteTime', 'SetLastWriteTimeUtc', 'SetCreationTime',
+    'SetCreationTimeUtc', 'CreateSymbolicLink', 'SetValue', 'DeleteValue', 'DeleteSubKey', 'DeleteSubKeyTree', 'CreateSubKey')
+
+function Get-ScanStartProblem($Command) {
+    # $null unless Start-Process sends the program's output or errors to a file: by
+    # -RedirectStandardOutput or -RedirectStandardError (an unambiguous prefix, or RSO and RSE), or
+    # through splatted arguments, which could. -RedirectStandardInput only reads.
+    foreach ($element in $Command.CommandElements) {
+        if ($element -is [Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { return 'with splatted arguments, which could redirect to a file' }
+        if ($element -isnot [Management.Automation.Language.CommandParameterAst]) { continue }
+        $parameter = $element.ParameterName
+        $redirects = (@('RSO', 'RSE') -contains $parameter)
+        if ($parameter.Length -gt 'RedirectStandard'.Length) {
+            foreach ($full in @('RedirectStandardOutput', 'RedirectStandardError')) {
+                if ($full.StartsWith($parameter, [StringComparison]::OrdinalIgnoreCase)) { $redirects = $true }
+            }
+        }
+        if ($redirects) { return ('-' + $parameter + ', a redirection to a file') }
+    }
+    return $null
+}
+
+function Get-ScanAtomicPath($Command) {
+    # The argument that Write-TextFileAtomic([string]$Path, [string]$Text) (lib.ps1) binds to
+    # $Path: -Path's, under any prefix of the name, else the first positional one. $null when there
+    # is none, or when splatted arguments hide it.
+    $elements = $Command.CommandElements
+    $positional = $null
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -is [Management.Automation.Language.CommandParameterAst]) {
+            $value = $element.Argument
+            if ($null -eq $value -and $i + 1 -lt $elements.Count) {
+                $i++
+                $value = $elements[$i]
+            }
+            if ('Path'.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { return $value }
+            continue
+        }
+        if ($element -is [Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { return $null }
+        if ($null -eq $positional) { $positional = $element }
+    }
+    return $positional
+}
+
+function Test-ScanDecisionPath($Node) {
+    # Whether Write-TextFileAtomic's path names the decision file, C:\kairo\jobs\<id>.decision.json:
+    # a variable named for it ($decisionFile, $script:DecisionPath), or an expression holding a
+    # string that ends in .decision.json.
+    if ($null -eq $Node) { return $false }
+    if ($Node -is [Management.Automation.Language.VariableExpressionAst]) {
+        return ($Node.VariablePath.UserPath -match '(?i)(^|:)decision(file|path)\z')
+    }
+    $strings = @($Node.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -or $n -is [Management.Automation.Language.ExpandableStringExpressionAst] }, $true))
+    foreach ($string in $strings) {
+        if ($string.Value -match '(?i)\.decision\.json\z') { return $true }
+    }
+    return $false
+}
+
+function Get-ScanEnumName($Node, [string] $Type) {
+    # An argument's System.IO enum value when it is written out ([IO.FileMode]::Open, 'Open' or
+    # [IO.FileMode]'Open'); $null otherwise.
+    if ($Node -is [Management.Automation.Language.MemberExpressionAst] -and $Node -isnot [Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $Node.Expression -is [Management.Automation.Language.TypeExpressionAst]) {
+        if (Test-ScanIoType $Node.Expression.TypeName.FullName @($Type)) { return (Get-ScanMemberName $Node) }
+        return $null
+    }
+    if ($Node -is [Management.Automation.Language.ConvertExpressionAst] -and (Test-ScanIoType $Node.Type.TypeName.FullName @($Type))) { $Node = $Node.Child }
+    if ($Node -is [Management.Automation.Language.StringConstantExpressionAst]) { return $Node.Value }
+    return $null
+}
+
+function Get-ScanOpenProblem($Node) {
+    # $null for an Open call that only reads, Open(<FileMode> Open, <FileAccess> Read[, <FileShare>])
+    # written out, or for a member named Open that isn't called. FileInfo.Open(mode) alone opens
+    # for reading and writing, and the other modes can create or empty the file.
+    if ($Node -isnot [Management.Automation.Language.InvokeMemberExpressionAst]) { return $null }
+    $arguments = @()
+    if ($null -ne $Node.Arguments) { $arguments = @($Node.Arguments) }
+    if ($arguments.Count -ge 2 -and (Get-ScanEnumName $arguments[0] 'FileMode') -eq 'Open' -and (Get-ScanEnumName $arguments[1] 'FileAccess') -eq 'Read') { return $null }
+    return 'that can write: only Open(Open, Read), written out, only reads'
+}
 
 function Find-ScanFileWrites($Source) {
     $found = [Collections.Generic.List[string]]::new()
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.CommandAst]))) {
-        $command = $node.GetCommandName()
+        $command = Get-ScanCommandName $node
         if ($null -eq $command) { continue }
         if ($script:WriteCommands -contains $command) {
             $found.Add((New-ScanFinding $Source $node $command))
+        } elseif ($script:StartCommands -contains $command) {
+            $problem = Get-ScanStartProblem $node
+            if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ($command + ' ' + $problem))) }
         } elseif ($command -eq 'Write-TextFileAtomic') {
-            # The decision file's writer, and only for that file: an argument must name it.
-            $named = $false
-            for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
-                if ($node.CommandElements[$i].Extent.Text -match '(?i)decision') { $named = $true }
+            # The decision file's writer, and only for that file: its path must name it.
+            if (-not (Test-ScanDecisionPath (Get-ScanAtomicPath $node))) {
+                $found.Add((New-ScanFinding $Source $node 'Write-TextFileAtomic on a file other than the decision file'))
             }
-            if (-not $named) { $found.Add((New-ScanFinding $Source $node 'Write-TextFileAtomic on a file other than the decision file')) }
         } elseif ($command -eq 'New-Object') {
             for ($i = 1; $i -lt $node.CommandElements.Count; $i++) {
                 foreach ($name in (Get-ScanStrings $node.CommandElements[$i])) {
-                    if ($name -match $script:WriterTypes) { $found.Add((New-ScanFinding $Source $node ('New-Object ' + $name))) }
+                    if (Test-ScanIoType $name $script:WriterTypes) { $found.Add((New-ScanFinding $Source $node ('New-Object ' + $name))) }
                 }
             }
         }
@@ -379,18 +526,26 @@ function Find-ScanFileWrites($Source) {
         $toNull = ($node.Location -is [Management.Automation.Language.VariableExpressionAst] -and $node.Location.VariablePath.UserPath -eq 'null')
         if (-not $toNull) { $found.Add((New-ScanFinding $Source $node ('a redirection to a file: ' + $node.Extent.Text))) }
     }
+    # A writer type in any form: [IO.StreamWriter]::new, a conversion, -as, a typed variable or
+    # parameter. Type literals are TypeExpressionAst nodes, and conversions and type constraints
+    # TypeConstraintAst ones.
+    foreach ($node in $Source.Ast.FindAll({ param($n) $n -is [Management.Automation.Language.TypeExpressionAst] -or $n -is [Management.Automation.Language.TypeConstraintAst] }, $true)) {
+        $type = $node.TypeName.FullName
+        if (Test-ScanIoType $type $script:WriterTypes) { $found.Add((New-ScanFinding $Source $node ('[' + $type + '], a type that opens a file for writing'))) }
+    }
     foreach ($node in (Find-ScanNodes $Source.Ast ([Management.Automation.Language.MemberExpressionAst]))) {
         $name = Get-ScanMemberName $node
         if ($null -eq $name) { continue }
         if ($node.Expression -is [Management.Automation.Language.TypeExpressionAst]) {
             $type = $node.Expression.TypeName.FullName
-            if ($script:FileTypes -contains $type -and $script:FileReads -notcontains $name) {
-                $found.Add((New-ScanFinding $Source $node ('[' + $type + ']::' + $name)))
-            } elseif ($type -match $script:WriterTypes) {
+            if ((Test-ScanIoType $type $script:FileTypes) -and $script:FileReads -notcontains $name) {
                 $found.Add((New-ScanFinding $Source $node ('[' + $type + ']::' + $name)))
             }
         } elseif ($script:WriteMembers -contains $name) {
             $found.Add((New-ScanFinding $Source $node ('.' + $name)))
+        } elseif ($name -eq 'Open') {
+            $problem = Get-ScanOpenProblem $node
+            if ($null -ne $problem) { $found.Add((New-ScanFinding $Source $node ('.Open ' + $problem))) }
         }
     }
     return ,$found.ToArray()
@@ -429,7 +584,7 @@ function Find-ScanLibraryShape($Source) {
         if ($node.ArgumentName -eq 'Mandatory') { $found.Add((New-ScanFinding $Source $node 'a Mandatory parameter, which would prompt')) }
     }
     foreach ($node in (Find-ScanNodes $ast ([Management.Automation.Language.CommandAst]))) {
-        if ($node.GetCommandName() -eq 'Read-Host') { $found.Add((New-ScanFinding $Source $node 'Read-Host, which would prompt')) }
+        if ((Get-ScanCommandName $node) -eq 'Read-Host') { $found.Add((New-ScanFinding $Source $node 'Read-Host, which would prompt')) }
     }
     return ,$found.ToArray()
 }
@@ -461,7 +616,8 @@ function Find-ScanPowerShell7Syntax($Source) {
         if (($kind -eq 'StringExpandable' -or $kind -eq 'HereStringExpandable') -and $token.Text.Contains('`u{')) {
             $found.Add((New-ScanFinding $Source $token 'a `u{} escape, which PowerShell 5.1 reads as u{}'))
         }
-        if ($kind -eq 'Number' -and $token.Text -match '(?i)[ysun]\z') {
+        # A type suffix, before a multiplier or not (10ul, 1ukb); 5.1's own L, D and kb..pb pass.
+        if ($kind -eq 'Number' -and $token.Text -match '(?i)(u[lsy]?|[nsy])(kb|mb|gb|tb|pb)?\z') {
             $found.Add((New-ScanFinding $Source $token ('the number ' + $token.Text + ', whose suffix PowerShell 5.1 lacks')))
         }
     }
@@ -514,10 +670,47 @@ Test-Case 'the file sets hold the scripts the rules are for' {
 
 # --- R1 --------------------------------------------------------------------------------------------
 
+# R2's one helper, which R1 must pass too.
+$script:Helper = @'
+function Get-ProcessIdAndName {
+    $list = [Collections.Generic.List[object]]::new()
+    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
+        try { $list.Add([pscustomobject]@{ Id = [long]$process.Id; Name = [string]$process.ProcessName }) } finally { $process.Dispose() }
+    }
+    return ,$list.ToArray()
+}
+'@
 $script:R1 = { param($Text) Find-ScanModuleMembers (ConvertTo-ScanSource $Text) }
 
 Test-Case 'R1 the bench scripts read no member that lists modules or reads a command line' {
     foreach ($source in $script:BenchFiles) { Assert-ScanClean (Find-ScanModuleMembers $source) $source.Name }
+}
+
+Test-Case 'R1 flags whatever would give a bench script a Process object' {
+    Assert-ScanFlags $script:R1 @(
+        'Get-Process -Name game',
+        'gps -Id 4',
+        'ps game',
+        'Get-Process -Name game | Select-Object Id',
+        'Microsoft.PowerShell.Management\Get-Process -Name game',
+        '[Diagnostics.Process]::GetProcessById(4)',
+        '[System.Diagnostics.Process]::GetProcessesByName(''game'')',
+        '$p = $type::GetProcessById(4)'
+    ) '^snippet\.ps1:1: \.?(Get-Process|gps|ps|GetProcessById|GetProcessesByName), which gives Process objects: Get-ProcessIdAndName gives names$'
+}
+
+Test-Case 'R1 flags a getter, and a wildcard property argument, that read a banned member' {
+    Assert-ScanFlags $script:R1 @('$p.get_MainModule().FileName', '$p.get_Path()', '$p.GET_COMMANDLINE()') '(?i)^snippet\.ps1:1: \.get_(MainModule|Path|CommandLine)\(\)$'
+    Assert-ScanFlags $script:R1 @(
+        '$all | Select-Object *',
+        '$all | Select-Object P*',
+        '$all | Select-Object p*',
+        '$all | Format-List *',
+        '$all | Select-Object -Property Id, ''Pa?h''',
+        '$all | Sort-Object -Property [M]ainModule',
+        '$all | Format-Table Id, Comm*',
+        '$all | Select-Object ''[P'''
+    ) '^snippet\.ps1:1: (Select-Object|Format-List|Sort-Object|Format-Table) \S+, which matches [A-Za-z, ]+$'
 }
 
 Test-Case 'R1 flags a process''s Path, MainModule or CommandLine in every form' {
@@ -547,23 +740,18 @@ Test-Case 'R1 passes type literals, parameters named Path and other members' {
         'Get-ChildItem -Path x -Filter *.ps1',
         '$h[''Name'']',
         '$all | Select-Object -Property Id, Name',
+        '$all | Select-Object -Property Id, Na*',
+        '$p.get_Id(); $p.get_ProcessName()',
+        '[Environment]::get_CommandLine()',
         '# $p.Path in a comment',
-        '''$p.Path in a string'''
+        '''$p.Path in a string''',
+        $script:Helper
     )
 }
 
 # --- R2 --------------------------------------------------------------------------------------------
 
-$script:Helper = @'
-function Get-ProcessIdAndName {
-    $list = [Collections.Generic.List[object]]::new()
-    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
-        try { $list.Add([pscustomobject]@{ Id = [long]$process.Id; Name = [string]$process.ProcessName }) } finally { $process.Dispose() }
-    }
-    return ,$list.ToArray()
-}
-'@
-$script:R2 = { param($Text) (Find-ScanProcessLists @(ConvertTo-ScanSource $Text)).Findings }
+$script:R2 ={ param($Text) (Find-ScanProcessLists @(ConvertTo-ScanSource $Text)).Findings }
 
 Test-Case 'R2 every script lists processes only through the one helper, or by name or id' {
     $result = Find-ScanProcessLists $script:AllFiles
@@ -592,7 +780,9 @@ Test-Case 'R2 flags GetProcesses outside the helper, an unfiltered Get-Process a
         'gps',
         'Get-Process *',
         'Get-Process -Name ''*''',
-        'Get-Process @splat'
+        'Get-Process @splat',
+        'Microsoft.PowerShell.Management\Get-Process',
+        'Microsoft.PowerShell.Management\Get-Process -Name *'
     ) '^snippet\.ps1:1: (Get-Process|gps) '
     Assert-ScanFlags $script:R2 @('Get-Process -Name ''game'' -Module', 'Get-Process -Id 4 -FileVersionInfo') 'which lists modules'
     Assert-ScanFlags $script:R2 @(
@@ -630,7 +820,14 @@ Test-Case 'R3 no Add-Type or Import-Csv in the elevated scripts, no synthetic in
 }
 
 Test-Case 'R3 flags Add-Type, Import-Csv and synthetic input' {
-    Assert-ScanFlags $script:R3 @('Add-Type -TypeDefinition $code', 'Import-Csv -LiteralPath $file', 'ipcsv x.csv') '^snippet\.ps1:1: (Add-Type|Import-Csv|ipcsv)'
+    Assert-ScanFlags $script:R3 @(
+        'Add-Type -TypeDefinition $code',
+        'Import-Csv -LiteralPath $file',
+        'ipcsv x.csv',
+        'Microsoft.PowerShell.Utility\Add-Type -TypeDefinition $code',
+        'Microsoft.PowerShell.Utility\Import-Csv -LiteralPath $file'
+    ) '^snippet\.ps1:1: (Add-Type|Import-Csv|ipcsv)$'
+    Assert-ScanFlags $script:R3 @('Kairo.Input\SendInput 1 $inputs 40') '^snippet\.ps1:1: synthetic input: SendInput$'
     Assert-ScanFlags $script:R3 @(
         '[User32]::SendInput(1, $inputs, 40)',
         '[System.Windows.Forms.SendKeys]::SendWait(''x'')',
@@ -682,10 +879,71 @@ Test-Case 'R4 flags writes by cmdlet, redirection and .NET' {
         'New-Object -TypeName System.IO.FileStream -ArgumentList $f, 2',
         '$info.MoveTo($b)',
         '$info.Delete()',
-        '$key.SetValue(''x'', 1)',
-        'Write-TextFileAtomic $f $t',
-        'Write-TextFileAtomic -Path (Join-Path $Kairo.Jobs ''next.json'') -Text $t'
+        '$key.SetValue(''x'', 1)'
     ) '^snippet\.ps1:1: '
+    Assert-ScanFlags $script:R4 @(
+        'Microsoft.PowerShell.Management\Set-Content -LiteralPath $f -Value $t',
+        'Microsoft.PowerShell.Utility\Out-File -FilePath $f -InputObject $t'
+    ) '^snippet\.ps1:1: (Set-Content|Out-File)$'
+    Assert-ScanFlags $script:R4 @('using namespace System.IO' + "`n" + '[File]::WriteAllText($f, $t)') '^snippet\.ps1:2: \[File\]::WriteAllText$'
+}
+
+Test-Case 'R4 flags Start-Process sending a program''s output or errors to a file' {
+    Assert-ScanFlags $script:R4 @(
+        'Start-Process -FilePath $exe -RedirectStandardOutput (Join-Path $logs ''pm.out'') -Wait',
+        'Start-Process $exe -RedirectStandardError $err -NoNewWindow',
+        'Start-Process $exe -RedirectStandardOutput:$f',
+        'start $exe -RedirectStandardO $f',
+        'saps $exe -RSE $f',
+        'Start-Process $exe -rso $f',
+        'Microsoft.PowerShell.Management\Start-Process $exe -RedirectStandardOutput $f'
+    ) '^snippet\.ps1:1: (Start-Process|start|saps) -(RedirectStandard[A-Za-z]+|RSO|RSE|rso), a redirection to a file$'
+    Assert-ScanFlags $script:R4 @('Start-Process @splat') '^snippet\.ps1:1: Start-Process with splatted arguments'
+}
+
+Test-Case 'R4 flags Create, OpenWrite, an Open that can write, and the writer types in any form' {
+    Assert-ScanFlags $script:R4 @(
+        '[IO.FileInfo]::new($f).Create().Dispose()',
+        '$info.Create()',
+        '$info.OpenWrite()'
+    ) '^snippet\.ps1:1: \.(Create|OpenWrite)$'
+    Assert-ScanFlags $script:R4 @(
+        '$info.Open([IO.FileMode]::Create)',
+        '$info.Open([IO.FileMode]::Open)',
+        '$info.Open()',
+        '$info.Open(''Append'', ''Write'')',
+        '$info.Open([System.IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)',
+        '$info.Open([IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Read)',
+        '$info.Open([IO.FileMode]::Truncate, ''Write'')',
+        '$info.Open($mode, $access)',
+        '(Get-Item $f).open(''Open'', ''Write'')'
+    ) '^snippet\.ps1:1: \.Open that can write'
+    Assert-ScanFlags $script:R4 @(
+        '$w = [IO.StreamWriter]$f',
+        '$w = [System.IO.StreamWriter]($f)',
+        '$w = $f -as [IO.StreamWriter]',
+        '[IO.FileStream] $s = $f',
+        'function F([IO.BinaryWriter] $w) { $w }',
+        '$w = [IO.StreamWriter[]]@($f)',
+        '$w = [System.IO.BinaryWriter]::new($s)'
+    ) '^snippet\.ps1:1: \[[A-Za-z.]+(\[\])?\], a type that opens a file for writing$'
+    Assert-ScanFlags $script:R4 @('using namespace System.IO' + "`n" + '$w = [StreamWriter]$f') '^snippet\.ps1:2: \[StreamWriter\], a type that opens a file for writing$'
+}
+
+Test-Case 'R4 lets Write-TextFileAtomic write only the decision file, named by its path' {
+    Assert-ScanFlags $script:R4 @(
+        'Write-TextFileAtomic $f $t',
+        'Write-TextFileAtomic -Path (Join-Path $Kairo.Jobs ''next.json'') -Text $t',
+        'Write-TextFileAtomic (Join-Path $Kairo.Logs ''bench.json'') $decisionJson',
+        'Write-TextFileAtomic -Path (Join-Path $env:ProgramData ''x.ps1'') -Text ''# decision''',
+        'Write-TextFileAtomic -Text $decisionFile $f',
+        'Write-TextFileAtomic -Text $t -Path $decisionJson',
+        'Write-TextFileAtomic -Path (Join-Path $Kairo.Jobs ''decision.txt'') -Text $t',
+        'Write-TextFileAtomic -Path ($decisionFile + ''.ps1'') -Text $t',
+        'Write-TextFileAtomic @splat',
+        'Write-TextFileAtomic $decisionFile @rest',
+        'Write-TextFileAtomic -Text $t'
+    ) '^snippet\.ps1:1: Write-TextFileAtomic on a file other than the decision file$'
 }
 
 Test-Case 'R4 passes reads, console output and the decision file' {
@@ -694,6 +952,13 @@ Test-Case 'R4 passes reads, console output and the decision file' {
         '[IO.File]::Exists($f)',
         '[IO.FileInfo]::new($f).Length',
         '[IO.Path]::GetFullPath($f)',
+        '[IO.StreamReader]::new($f).ReadToEnd()',
+        '$info.OpenRead()',
+        '$info.Open([IO.FileMode]::Open, [IO.FileAccess]::Read)',
+        '$info.Open(''Open'', ''Read'', ''ReadWrite'')',
+        '$info.Open([IO.FileMode]''Open'', [System.IO.FileAccess]::Read)',
+        '$state.Open',
+        'Start-Process -FilePath $exe -ArgumentList $a -Wait -NoNewWindow -RedirectStandardInput $in',
         '[Console]::Out.WriteLine($t)',
         '[Console]::Error.WriteLine($t)',
         '$null = Get-Thing 2> $null',
@@ -701,7 +966,10 @@ Test-Case 'R4 passes reads, console output and the decision file' {
         '$t.Replace(''a'', ''b'')',
         '[scriptblock]::Create($text)',
         'Write-TextFileAtomic (Join-Path $Kairo.Jobs ($id + ''.decision.json'')) $json',
-        'Write-TextFileAtomic -Path $decisionFile -Text $json'
+        'Write-TextFileAtomic -Path $decisionFile -Text $json',
+        'Write-TextFileAtomic -Text $json -Path (Join-Path $Kairo.Jobs "$id.decision.json")',
+        'Write-TextFileAtomic -T $json $script:DecisionPath',
+        'Write-TextFileAtomic -P:$decisionFile -Text $json'
     )
 }
 
@@ -730,7 +998,10 @@ Test-Case 'R5 flags what dot-sourcing would run, exits and prompts' {
     Assert-ScanFlags $script:R5 @($script:Library.Replace('throw ''no name''', 'exit 2')) 'exit outside the guarded command line'
     Assert-ScanFlags $script:R5 @(('param([string] $Csv)' + "`n" + $script:Library)) 'a script param block'
     Assert-ScanFlags $script:R5 @($script:Library.Replace('function Get-Thing([string] $Name) {', 'function Get-Thing { param([Parameter(Mandatory)] [string] $Name)')) 'a Mandatory parameter'
-    Assert-ScanFlags $script:R5 @($script:Library.Replace('return $Name', 'return (Read-Host ''name'')')) 'Read-Host'
+    Assert-ScanFlags $script:R5 @(
+        $script:Library.Replace('return $Name', 'return (Read-Host ''name'')'),
+        $script:Library.Replace('return $Name', 'return (Microsoft.PowerShell.Utility\Read-Host ''name'')')
+    ) 'Read-Host, which would prompt$'
     Assert-ScanFlags $script:R5 @($script:Library.Replace('-ne ''.''', '-ne ''&''')) 'outside the guarded command line'
     Assert-ScanFlags $script:R5 @(($script:Library -split "`n")[0..3] -join "`n") 'no command line guarded'
 }
@@ -761,7 +1032,12 @@ Test-Case 'R6 flags PowerShell 7''s operators, escapes and number suffixes' {
         '$x = 10u',
         '$x = 5s',
         '$x = 1n',
-        '$x = 0x1Fuy'
+        '$x = 0x1Fuy',
+        '$x = 10ul',
+        '$x = 0xFFul',
+        '$x = 10UL',
+        '$x = 1ukb',
+        '$x = 1sKB'
     ) 'PowerShell 5.1'
 }
 
@@ -774,7 +1050,7 @@ Test-Case 'R6 passes the 5.1 forms' {
         '$a.Name; $a[0]',
         '& { 1 }; & $command',
         '"`n`t"',
-        '$x = 10; $y = 10L; $z = 1kb; $w = 0x1F; $v = 2.5d; $u = 1e5',
+        '$x = 10; $y = 10L; $z = 1kb; $w = 0x1F; $v = 2.5d; $u = 1e5; $t = 1PB; $s = 0x1b',
         '''$a ?? 1 in a string'''
     )
 }

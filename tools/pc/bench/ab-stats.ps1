@@ -25,8 +25,10 @@
 # join PASS before SP1; until then they are reported only, and null means not evaluated:
 # low1_le_5 (the same pairs on low1_fps, mean <= 5%) needs pm-stats lines, ir_plus_1pp (this loss
 # minus -Reference's <= 1 pp) needs -Reference, and present_mode isn't built yet. NOISE is ok at a
-# CV of 1.00% or less (sample SD, n - 1); low1_cv_pct (pm-stats lines only) and drift_pct_per_run
-# (the least-squares slope of avg_fps over the run order, as % of the mean) are diagnostics.
+# CV of 1.00% or less (sample SD, n - 1), the CV as computed, before rounding; a CV above 1.00 that
+# would print as 1.00 prints with 3 decimals, at least 1.001, so the text agrees with NOISE=high.
+# low1_cv_pct (pm-stats lines only) and drift_pct_per_run (the least-squares slope of avg_fps over
+# the run order, as % of the mean) are diagnostics.
 # Exit codes: 0 PASS or noise ok; 1 FAIL or noise high; 2 bad command line (unequal counts, n < 2,
 # mixed kinds); 3 can't evaluate (an A run's avg_fps <= 0, an unparsable line or number, an
 # unreadable file or one without runs).
@@ -91,6 +93,17 @@ function Format-AbStatsNumber([double] $Value) {
     $rounded = [Math]::Round($Value, 2, [MidpointRounding]::AwayFromZero)
     if ($rounded -eq 0) { $rounded = 0.0 }
     return $rounded.ToString('F2', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-AbStatsCv([double] $Cv) {
+    # A CV in the text. noise_ok compares the CV as computed with 1.00, so one above 1.00 that two
+    # decimals would print as 1.00 gets three, and at least 1.001: the text never reads
+    # "CV 1.00% NOISE=high". Any other CV gets two.
+    if ($Cv -gt 1.0 -and [Math]::Round($Cv, 2, [MidpointRounding]::AwayFromZero) -le 1.0) {
+        $three = [Math]::Max([Math]::Round($Cv, 3, [MidpointRounding]::AwayFromZero), 1.001)
+        return $three.ToString('F3', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return (Format-AbStatsNumber $Cv)
 }
 
 function Get-AbStatsField($Object, [string] $Name) {
@@ -333,7 +346,7 @@ function Get-AbStatsNoise($Runs) {
     $code = 1
     if ($ok) { $word = 'ok'; $code = 0 }
     $text = $n.ToString($inv) + ' runs: avg_fps ' + (Format-AbStatsNumber $mean) + ' sd ' + (Format-AbStatsNumber $sd) +
-        ' (CV ' + (Format-AbStatsNumber $cv) + '%) NOISE=' + $word
+        ' (CV ' + (Format-AbStatsCv $cv) + '%) NOISE=' + $word
     return [pscustomobject]@{
         Stats       = $stats
         Text        = $text

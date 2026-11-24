@@ -47,7 +47,9 @@
 #   6 valid runs and a CV of 1.00% or less: none; 6 valid runs and a CV above 1.00%: 6 more, the
 #   extension (n = 12); 3 to 5 valid runs: 6 - valid make-up runs, noting a CV above 1.00%; fewer
 #   than 3: none, and "insufficient data: fix the setup". The CV comes from ab-stats' A/A line over
-#   the same valid runs, needed at 6 or more; -Valid from this script's own "valid". Output:
+#   the same valid runs, needed at 6 or more; -Valid from this script's own "valid". The CV is
+#   compared as computed, before rounding, and the note prints it as ab-stats does: one above 1.00
+#   that would print as 1.00 gets 3 decimals, at least 1.001. Output:
 #   {"bench_rules":1,"mode":"decide","workload":"alu","valid":6,"cv_pct":0.59..,"cv_high":false,
 #    "extra":0,"kind":"none","note":"..."}   kind: none, extension, make_up or insufficient.
 #
@@ -201,6 +203,17 @@ function Get-BenchRulesRounded([double] $Value, [int] $Digits) {
     $rounded = [Math]::Round($Value, $Digits, [MidpointRounding]::AwayFromZero)
     if ($rounded -eq 0) { $rounded = 0.0 }
     return $rounded
+}
+
+function Format-BenchRulesCv([double] $Cv) {
+    # A CV in -Decide's note, as ab-stats prints it. cv_high compares the CV as computed with 1.00,
+    # so one above 1.00 that two decimals would print as 1.00 gets three, and at least 1.001: the
+    # note never calls 1.00% above 1.00%. Any other CV gets two.
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if ($Cv -gt 1.0 -and (Get-BenchRulesRounded $Cv 2) -le 1.0) {
+        return ([Math]::Max((Get-BenchRulesRounded $Cv 3), 1.001)).ToString('F3', $inv)
+    }
+    return (Get-BenchRulesRounded $Cv 2).ToString('F2', $inv)
 }
 
 function Test-BenchRulesTag($Value) {
@@ -613,7 +626,7 @@ function Get-BenchDecision {
     $cvText = 'unknown'
     if ($null -ne $cv) {
         $cvHigh = ($cv -gt 1.0)
-        $cvText = (Get-BenchRulesRounded $cv 2).ToString('F2', $inv) + '%'
+        $cvText = (Format-BenchRulesCv $cv) + '%'
     }
     $runsText = $n.ToString($inv) + ' valid runs'
     if ($n -ge 6) {

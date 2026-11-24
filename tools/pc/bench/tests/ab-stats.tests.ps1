@@ -7,7 +7,8 @@
 # Every vector runs both ways: through the functions, with the script dot-sourced under testlib's
 # Set-StrictMode -Version 3.0 and $ErrorActionPreference = 'Stop' (as the elevated session runs
 # it), and through pwsh -File with its exit codes. Vectors: AB1-AB5, AE1-AE3, AA1-AA2, L1 and S1-S2,
-# and the t table. Full-precision expectations were recomputed with IEEE doubles from research 17's
+# the t table, and each clause and the CV at its limit, where a value equal to the limit passes.
+# Full-precision expectations were recomputed with IEEE doubles from research 17's
 # formulas and agree with its [Mac] figures. Fixtures are written into temporary folders and use
 # synthetic names only.
 #
@@ -258,6 +259,32 @@ Test-Case 'AB1 through pwsh -File: runs as separate values, and separated by spa
     Assert-AbTestRun $run 0 $AB1.Text 'AB1 as words'
 }
 
+# --- The clauses at their edges (section 5.2): a value at its limit passes ------------------------
+
+$Hundred = @(100.0, 100.0, 100.0, 100.0, 100.0, 100.0)
+
+Test-Case 'edge: a loss of exactly 3% passes both clauses' {
+    # 100 (100 - 97) / 100 is 3 exactly and s is 0, so the interval is 3.00..3.00.
+    $text = '6 pairs: loss 3.00% (95% CI 3.00..3.00%) PASS=True'
+    $r = Get-AbStats -A $Hundred -B @(97.0, 97.0, 97.0, 97.0, 97.0, 97.0)
+    Assert-Equal 3.0 $r.Stats['loss_pct'] 'loss_pct'
+    Assert-Equal $true $r.Stats['clauses']['mean_le_3'] 'mean_le_3'
+    Assert-Equal $true $r.Stats['clauses']['upper_le_4'] 'upper_le_4'
+    Assert-Equal $true $r.Stats['pass'] 'pass'
+    Assert-Equal $text $r.Text 'text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $Hundred), '-B', '97,97,97,97,97,97')) 0 $text 'through pwsh -File'
+}
+
+Test-Case 'edge: an upper bound of exactly 4% holds, while a mean of 4% fails' {
+    $r = Get-AbStats -A $Hundred -B @(96.0, 96.0, 96.0, 96.0, 96.0, 96.0)
+    Assert-Equal 4.0 $r.Stats['ci_hi'] 'ci_hi'
+    Assert-Equal $false $r.Stats['clauses']['mean_le_3'] 'mean_le_3'
+    Assert-Equal $true $r.Stats['clauses']['upper_le_4'] 'upper_le_4'
+    Assert-Equal $false $r.Stats['pass'] 'pass'
+    Assert-Equal 1 $r.ExitCode 'exit code'
+    Assert-Equal '6 pairs: loss 4.00% (95% CI 4.00..4.00%) PASS=False' $r.Text 'text'
+}
+
 # --- AE1-AE3: refusals ---------------------------------------------------------------------------
 
 $SixA = @(100.0, 100.0, 100.0, 100.0, 100.0, 100.0)
@@ -349,6 +376,32 @@ Test-Case 'AA2 through pwsh -File: exit 1' {
     Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $AA2))) 1 $AA2Text 'AA2'
 }
 
+Test-Case 'AA edge: a CV of exactly 1.00% is ok' {
+    # Mean 100 and sample SD 1, both exact.
+    $text = '3 runs: avg_fps 100.00 sd 1.00 (CV 1.00%) NOISE=ok'
+    $r = Get-AbStats -A @(99.0, 100.0, 101.0)
+    Assert-Equal 1.0 $r.Stats['cv_pct'] 'cv_pct'
+    Assert-Equal $true $r.Stats['noise_ok'] 'noise_ok'
+    Assert-Equal 0 $r.ExitCode 'exit code'
+    Assert-Equal $text $r.Text 'text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', '99,100,101')) 0 $text 'through pwsh -File'
+}
+
+Test-Case 'AA: a CV just above 1% prints 3 decimals, so the text agrees with NOISE=high' {
+    # CV 1.0030%: high, since noise_ok compares the CV as computed; 2 decimals would print 1.00.
+    $fps = @(119.768, 121.803, 118.751, 120.785, 119.429, 121.464)
+    $text = '6 runs: avg_fps 120.33 sd 1.21 (CV 1.003%) NOISE=high'
+    $r = Get-AbStats -A $fps
+    Assert-Near 1.002997816230401 $r.Stats['cv_pct'] 1e-12 'cv_pct'
+    Assert-Equal $false $r.Stats['noise_ok'] 'noise_ok'
+    Assert-Equal $text $r.Text 'text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $fps))) 1 $text 'through pwsh -File'
+    # Two decimals, unless a CV above 1.00 would print as 1.00: then three, and never 1.000.
+    $cases = @(@(0.59, '0.59'), @(0.9999, '1.00'), @(1.0, '1.00'), @(1.0000001, '1.001'), @(1.0004, '1.001'),
+        @(1.003, '1.003'), @(1.0049, '1.005'), @(1.0051, '1.01'), @(1.6493, '1.65'))
+    foreach ($case in $cases) { Assert-Equal $case[1] (Format-AbStatsCv $case[0]) ('CV ' + $case[0]) }
+}
+
 Test-Case 'A/A on pm-stats lines adds the CV of low1_fps' {
     $r = Get-AbStats -A (New-AbTestPmLines 'aa-alu' $AA1 $L1A)
     Assert-Equal $AA1Text $r.Text 'text'
@@ -387,6 +440,14 @@ Test-Case 'L1 variant: a 1%-low loss of 6.20% sets low1_le_5 false and leaves PA
     Assert-Equal $false $r.Stats['clauses']['low1_le_5'] 'low1_le_5'
     Assert-Equal $true $r.Stats['pass'] 'pass'
     Assert-Equal 0 $r.ExitCode 'exit code'
+}
+
+Test-Case 'L1 edge: a 1%-low loss of exactly 5% holds low1_le_5' {
+    $a = New-AbTestPmLines 'ab-alu-a' $Hundred $Hundred
+    $b = New-AbTestPmLines 'ab-alu-b' $Paired[2].B @(95.0, 95.0, 95.0, 95.0, 95.0, 95.0)
+    $r = Get-AbStats -A $a -B $b
+    Assert-Equal 5.0 $r.Low1LossPct 'the mean 1%-low loss'
+    Assert-Equal $true $r.Stats['clauses']['low1_le_5'] 'low1_le_5'
 }
 
 Test-Case 'L1 through pwsh -File: files of pm-stats lines (UTF-8 BOM, CRLF), -Json' {
@@ -525,6 +586,14 @@ Test-Case '-Reference through the functions: ir_plus_1pp, and PASS unchanged' {
     $aa = Get-AbStats -A $AA1
     Assert-Equal 3 (Get-AbTestError { Get-AbStats -A $AB1.A -B $AB1.B -Reference $aa.Json }) 'an A/A line'
     Assert-Equal 3 (Get-AbTestError { Get-AbStats -A $AB1.A -B $AB1.B -Reference '2.0' }) 'not a line'
+}
+
+Test-Case '-Reference edge: AB3''s 2.00% against a reference loss of exactly 1.00% holds ir_plus_1pp' {
+    $reference = Get-AbStats -A $Hundred -B @(99.0, 99.0, 99.0, 99.0, 99.0, 99.0)
+    Assert-Equal 1.0 $reference.Stats['loss_pct'] 'the reference''s loss'
+    $r = Get-AbStats -A $Paired[2].A -B $Paired[2].B -Reference $reference.Json
+    Assert-Equal 2.0 $r.Stats['loss_pct'] 'AB3''s loss'
+    Assert-Equal $true $r.Stats['clauses']['ir_plus_1pp'] '2.00 - 1.00 <= 1'
 }
 
 Test-Case '-Reference through pwsh -File' {

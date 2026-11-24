@@ -45,10 +45,13 @@ function Assert-True($Condition, [string] $What) {
 
 function Assert-Equal($Expected, $Actual, [string] $What) {
     # Exact equality; strings compare case-sensitively. Numbers of different types (40 and 40.0)
-    # are equal when their values are.
+    # are equal when their values are. A bool equals only a bool: PowerShell's -eq would make
+    # $true equal 1 (or any number but 0), so a JSON boolean printed as a number would pass.
     $same = $false
     if ($null -eq $Expected -or $null -eq $Actual) {
         $same = ($null -eq $Expected -and $null -eq $Actual)
+    } elseif ($Expected -is [bool] -or $Actual -is [bool]) {
+        $same = ($Expected -is [bool] -and $Actual -is [bool] -and $Expected -eq $Actual)
     } elseif ($Expected -is [string] -or $Actual -is [string]) {
         $same = ([string]$Expected -ceq [string]$Actual)
     } elseif ((Test-BenchNumber $Expected) -and (Test-BenchNumber $Actual)) {
@@ -83,7 +86,12 @@ function Test-BenchNumber($Value) {
 }
 
 function Format-BenchValue($Value) {
+    # A bool prints as $true or $false, so a failure tells it from the text 'True' and from 1.
     if ($null -eq $Value) { return '$null' }
+    if ($Value -is [bool]) {
+        if ($Value) { return '$true' }
+        return '$false'
+    }
     if (Test-BenchNumber $Value) { return ([double]$Value).ToString('R', [Globalization.CultureInfo]::InvariantCulture) }
     return [string]$Value
 }

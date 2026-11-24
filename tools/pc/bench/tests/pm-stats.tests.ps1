@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# tools/pc/bench/tests/pm-stats.tests.ps1 - pm-stats.ps1's vectors P1-P13 and E1-E6.
+# tools/pc/bench/tests/pm-stats.tests.ps1 - pm-stats.ps1's vectors P1-P13 and E1-E6, and the edges
+# of section 5.1's rules that no vector sits on.
 # Project: https://github.com/Maty3k/Kairo
 # Design: docs/research/17-loadgen-bench/README.md sections 5.1 and 6.
 #
@@ -350,6 +351,9 @@ Test-Case 'P10 nearest rank: 200 presents of 1 to 200 ms' {
     for ($i = 0; $i -lt 200; $i++) { $rows.Add((New-PmRow -I $i -Ms ([double]($i + 1)))) }
     $r = Invoke-PmStats (Write-PmCsv 'p10.csv' (ConvertTo-PmLines $rows))
     Assert-PmSubset '{"frames":200,"avg_fps":9.95,"low1_fps":5.05,"low01_fps":5.0,"duration_s":20.1}' $r.Stats 'P10'
+    # The display cadence's P99 is rank 198 too, below the largest value: at 100 frames or more a
+    # P99 is not the maximum.
+    Assert-PmSubset '{"display_change_ms":100.5,"display_change_p99_ms":198.0,"max_frame_ms":200.0}' $r.Stats 'P10 display cadence'
 }
 
 Test-Case 'P11 7,500 presents: the 30 hitches miss the 1% low and set the 0.1% low' {
@@ -391,6 +395,73 @@ Test-Case 'P13 SyncInterval, AllowsTearing and PresentFlags counted per present'
     $expected = $expected.Replace('"allows_tearing":{"1":10}', '"allows_tearing":{"0":2,"1":8}')
     $expected = $expected.Replace('"present_flags":{"512":10}', '"present_flags":{"0":2,"512":8}')
     Assert-PmSame (ConvertFrom-Json $expected) $r.Stats 'P13'
+}
+
+# --- Section 5.1's edges and refusals, beyond section 6's vectors ---------------------------------
+
+Test-Case 'A present of 0 ms is a bad row, not a frame' {
+    $rows = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 6; $i++) { $rows.Add((New-PmRow -I $i -Ms 10.0)) }
+    $rows.Add((New-PmRow -I 6 -Ms 0.0))
+    $r = Invoke-PmStats (Write-PmCsv 'zero-ms.csv' (ConvertTo-PmLines $rows))
+    Assert-PmSubset '{"frames":6,"avg_fps":100.0,"duration_s":0.06,"rows":7,"bad_rows":1}' $r.Stats 'a 0 ms present'
+    Assert-Equal 1 (Get-PmWarnings $r '^bad rows: 1$').Count ('the bad-row warning: ' + ($r.Warnings -join ' | '))
+}
+
+Test-Case 'A frame of exactly 250 ms is not a long frame' {
+    $rows = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 4; $i++) { $rows.Add((New-PmRow -I $i -Ms 250.0)) }
+    $r = Invoke-PmStats (Write-PmCsv 'frames-250.csv' (ConvertTo-PmLines $rows))
+    Assert-PmSubset '{"frames":4,"avg_fps":4.0,"max_frame_ms":250.0,"long_frames":0,"duration_s":1.0}' $r.Stats '250 ms frames'
+    Assert-Equal 0 (Get-PmWarnings $r '^frames over 250 ms').Count ('no long-frame warning: ' + ($r.Warnings -join ' | '))
+}
+
+Test-Case 'dropped_pct rounds away from zero: 1 dropped present of 800 is 0.13' {
+    # 100 / 800 = 0.125 exactly, which rounding to even would print as 0.12.
+    $rows = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 800; $i++) { $rows.Add((New-PmRow -I $i -Ms 8.0 -Dropped:($i -eq 400))) }
+    $r = Invoke-PmStats (Write-PmCsv 'dropped-800.csv' (ConvertTo-PmLines $rows))
+    Assert-PmSubset '{"frames":800,"avg_fps":125.0,"duration_s":6.4,"dropped_pct":0.13,"rows":800,"bad_rows":0}' $r.Stats '800 presents'
+}
+
+Test-Case 'dropped_pct counts MsUntilDisplayed over frames: a dropped present beside a bad one' {
+    # 9 frames of 10 ms and a present with no frame time, a bad row: 1 dropped of 9 frames, not of
+    # 10 presents. The dropped present keeps its MsBetweenDisplayChange here (PresentMon writes NA
+    # in both), so only section 5.1's column, MsUntilDisplayed, counts it.
+    $rows = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 9; $i++) {
+        $set = @{}
+        if ($i -eq 2) { $set = @{ MsUntilDisplayed = 'NA' } }
+        $rows.Add((New-PmRow -I $i -Ms 10.0 -Set $set))
+    }
+    $rows.Add((New-PmRow -I 9 -Ms 10.0 -Set @{ MsBetweenPresents = 'NA'; MsBetweenDisplayChange = 'NA' }))
+    $r = Invoke-PmStats (Write-PmCsv 'dropped-bad.csv' (ConvertTo-PmLines $rows))
+    Assert-PmSubset '{"frames":9,"avg_fps":100.0,"display_change_ms":10.0,"dropped_pct":11.11,"rows":10,"bad_rows":1}' $r.Stats 'a dropped present beside a bad one'
+}
+
+Test-Case '-Strict refuses a CSV made without --qpc_time (TimeInMs): exit 3' {
+    $lines = ConvertTo-PmLines (New-PmP1Rows)
+    $lines[0] = $lines[0].Replace('TimeInQPC', 'TimeInMs')
+    $file = Write-PmCsv 'time-in-ms.csv' $lines
+    $r = Invoke-PmStats $file
+    Assert-PmSame (ConvertFrom-Json $script:P1Line) $r.Stats 'without -Strict: as P1'
+    [void](Assert-PmFails -Code 3 -Pattern '^missing TimeInQPC \(-Strict\)\z' -File $file -Strict)
+}
+
+Test-Case '-Strict refuses a CSV made without --track_gpu_video (no MsVideoBusy): exit 3' {
+    $file = Write-PmCsv 'no-video-busy.csv' (ConvertTo-PmLines (New-PmP1Rows) @($script:PmColumns | Where-Object { $_ -ne 'MsVideoBusy' }))
+    $r = Invoke-PmStats $file
+    Assert-PmSame (ConvertFrom-Json $script:P1Line) $r.Stats 'without -Strict: as P1'
+    [void](Assert-PmFails -Code 3 -Pattern '^missing MsVideoBusy \(-Strict\)\z' -File $file -Strict)
+}
+
+Test-Case 'Each required column, and a time column, is required: exit 3, naming it' {
+    foreach ($name in @('Application', 'ProcessID', 'SwapChainAddress', 'PresentMode', 'MsUntilDisplayed', 'MsGPUBusy', 'MsGPUWait')) {
+        $file = Write-PmCsv ('no-' + $name + '.csv') (ConvertTo-PmLines (New-PmP1Rows) @($script:PmColumns | Where-Object { $_ -ne $name }))
+        [void](Assert-PmFails -Code 3 -Pattern ('^missing ' + $name + '\z') -File $file)
+    }
+    $file = Write-PmCsv 'no-time.csv' (ConvertTo-PmLines (New-PmP1Rows) @($script:PmColumns | Where-Object { $_ -ne 'TimeInQPC' }))
+    [void](Assert-PmFails -Code 3 -Pattern '^missing a time column \(TimeInQPC, TimeInMs, TimeInSeconds or TimeInDateTime\)\z' -File $file)
 }
 
 # --- pm-stats error vectors (section 6) -----------------------------------------------------

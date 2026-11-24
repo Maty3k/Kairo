@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# tools/pc/bench/tests/bench-rules.tests.ps1 - bench-rules.ps1's vectors V1-V8 and D1-D5 and the
-# before/after comparison.
+# tools/pc/bench/tests/bench-rules.tests.ps1 - bench-rules.ps1's vectors V1-V8 and D1-D5, the rules'
+# and flags' edges, and the before/after comparison.
 # Project: https://github.com/Maty3k/Kairo
 # Design: docs/research/17-loadgen-bench/README.md sections 4.7, 5.4 and 6.
 #
@@ -483,6 +483,23 @@ Test-Case 'flags are reported and never invalidate a run' {
     Assert-Equal '' (Get-BrList $r['flags']) 'avg_fps 178.1 at 180 Hz'
 }
 
+Test-Case 'flags at their edges: near_refresh includes 1%, not_gpu_limited and few_frames exclude theirs' {
+    # |99.0 - 100| is 1.0, exactly 1% of 100 Hz: a cap. At 98.99 it is 1.01. Both are GPU-limited
+    # (9.5 ms x 99 fps / 1000 = 0.94).
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats (New-BrStats 'alu-01' -Set @{ avg_fps = 99.0; gpu_busy_ms = 9.5 }) -TimedS 60 -RefreshMhz 100000
+    Assert-Equal 'near_refresh' (Get-BrList $r['flags']) 'avg_fps 99.0 at 100 Hz'
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats (New-BrStats 'alu-01' -Set @{ avg_fps = 98.99; gpu_busy_ms = 9.5 }) -TimedS 60 -RefreshMhz 100000
+    Assert-Equal '' (Get-BrList $r['flags']) 'avg_fps 98.99 at 100 Hz'
+    # 7.2 ms x 125 fps / 1000 is 0.9 exactly: still GPU-limited.
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats (New-BrStats 'alu-01' -Set @{ gpu_busy_ms = 7.2 }) -TimedS 60 -RefreshMhz 180000
+    Assert-Equal '' (Get-BrList $r['flags']) 'gpu_busy_ms 7.2 at 125 fps'
+    # 1,000 frames are enough; 999 are few.
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats (New-BrStats 'alu-01' -Set @{ frames = 1000 }) -TimedS 60 -RefreshMhz 180000
+    Assert-Equal '' (Get-BrList $r['flags']) 'frames 1000'
+    $r = Test-BenchRun -Run (New-BrRun 'alu-01') -Stats (New-BrStats 'alu-01' -Set @{ frames = 999 }) -TimedS 60 -RefreshMhz 180000
+    Assert-Equal 'few_frames' (Get-BrList $r['flags']) 'frames 999'
+}
+
 Test-Case 'a workload reports its valid runs'' flags; the session counts other encoders, never naming them' {
     $runs = @((New-BrRun 'alu-01' -N 1), (New-BrRun 'alu-02' -N 2), (New-BrRun 'alu-03' -N 3))
     $lines = @(
@@ -652,9 +669,31 @@ Test-Case 'a CV of exactly 1.00% needs no extra runs' {
     $line = '{"ab_stats":1,"mode":"aa","n":6,"mean_fps":120.0,"sd_fps":1.2,"cv_pct":1.0,"low1_cv_pct":null,"drift_pct_per_run":0.0,"noise_ok":true}'
     $d = (Get-BenchDecision -Valid 6 -AaStats $line).Decision
     Assert-Equal 'none' $d['kind'] 'kind'
+    Assert-Equal 'CV 1.00% over 6 valid runs is 1.00% or less: no extra runs' $d['note'] 'note'
     $line = $line.Replace('"cv_pct":1.0', '"cv_pct":1.0000001').Replace('"noise_ok":true', '"noise_ok":false')
     $d = (Get-BenchDecision -Valid 6 -AaStats $line).Decision
     Assert-Equal 'extension' $d['kind'] 'kind just above 1%'
+    # Three decimals, at least 1.001, where two would print 1.00 beside "above 1.00%".
+    Assert-Equal 'CV 1.001% over 6 valid runs is above 1.00%: 6 more runs, then the CV over all of them' $d['note'] 'note just above 1%'
+}
+
+Test-Case 'the note prints a CV just above 1% with 3 decimals, as ab-stats does' {
+    # ab-stats' A/A line for a CV of 1.0030%, built here: 6 more runs, and the note says 1.003%.
+    $line = New-BrAaLine ([double[]]@(119.768, 121.803, 118.751, 120.785, 119.429, 121.464))
+    $d = (Get-BenchDecision -Valid 6 -AaStats $line -Workload 'alu').Decision
+    Assert-Equal 'extension' $d['kind'] 'kind'
+    Assert-Equal $true $d['cv_high'] 'cv_high'
+    Assert-Match '^CV 1\.003% over 6 valid runs is above 1\.00%: 6 more runs' $d['note'] 'note'
+    $run = Invoke-BrTool @('-Decide', '-Valid', '6', '-AaStats', $line, '-Workload', 'alu')
+    Assert-BrExit 0 $run 'through pwsh -File'
+    Assert-Match '^CV 1\.003% over 6 valid runs is above 1\.00%: 6 more runs' $run.Json.note 'note through pwsh -File'
+    # The make-up note too.
+    $line = '{"ab_stats":1,"mode":"aa","n":4,"mean_fps":120.0,"sd_fps":1.2,"cv_pct":1.0042,"low1_cv_pct":null,"drift_pct_per_run":0.0,"noise_ok":false}'
+    $d = (Get-BenchDecision -Valid 4 -AaStats $line).Decision
+    Assert-Match '^2 make-up runs to reach 6 valid runs; CV 1\.004% over the 4 valid runs is above 1\.00%' $d['note'] 'make-up note'
+    # The rule alone: two decimals unless a CV above 1.00 would print as 1.00.
+    $cases = @(@(0.59, '0.59'), @(1.0, '1.00'), @(1.0000001, '1.001'), @(1.0049, '1.005'), @(1.0051, '1.01'), @(1.65, '1.65'))
+    foreach ($case in $cases) { Assert-Equal $case[1] (Format-BenchRulesCv $case[0]) ('CV ' + $case[0]) }
 }
 
 Test-Case '-Decide refuses what it can''t decide' {
