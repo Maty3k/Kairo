@@ -49,8 +49,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// Set when the window gets `WM_CLOSE`.
 static CLOSE: AtomicBool = AtomicBool::new(false);
 
-/// QPC's frequency, read once.
-fn frequency() -> i64 {
+/// QPC's frequency in counts per second, read once: the logs' `qpc_hz`.
+pub fn qpc_frequency() -> i64 {
     static FREQUENCY: OnceLock<i64> = OnceLock::new();
     *FREQUENCY.get_or_init(|| {
         let mut f = 0_i64;
@@ -62,7 +62,7 @@ fn frequency() -> i64 {
 
 /// A QPC reading in 100 ns, the unit of every time in the logs.
 pub fn qpc_to_hns(counter: i64) -> i64 {
-    timeline::hns_from_qpc(counter, frequency()).unwrap_or(0)
+    timeline::hns_from_qpc(counter, qpc_frequency()).unwrap_or(0)
 }
 
 /// Now, in QPC 100 ns.
@@ -724,7 +724,7 @@ mod tests {
         // At least the 20 ms slept (a busy runner may take far longer).
         assert!((200_000..100_000_000).contains(&(b - a)), "{}", b - a);
         // One second of counts is 10,000,000 units of 100 ns.
-        assert_eq!(qpc_to_hns(frequency()), 10_000_000);
+        assert_eq!(qpc_to_hns(qpc_frequency()), 10_000_000);
     }
 
     // Moved from kairo-harness with its copy of KeepDisplayOn.

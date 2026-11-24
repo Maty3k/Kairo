@@ -2,7 +2,8 @@
 # Crates: kairo-core (shared contract and media maths, tested everywhere), the PC-side dev-loop tools,
 # the Mac's mock engine, and M1's kairo-verify (the clip checker, research 16), kairo-display
 # (monitor by device path, adapter by LUID), kairo-window (the Windows code M1's instruments share,
-# research 17 §3.1), kairo-harness and kairo-testbed (testbed.exe).
+# research 17 §3.1), kairo-harness, kairo-testbed (testbed.exe) and kairo-loadgen (the bench's GPU
+# load, research 17 §3).
 # The research prototypes under docs/research/prototypes/ are standalone and not members.
 
 [workspace]
@@ -18,6 +19,7 @@ members = [
     "crates/kairo-window",
     "crates/kairo-harness",
     "crates/kairo-testbed",
+    "crates/kairo-loadgen",
 ]
 
 [workspace.package]

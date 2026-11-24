@@ -506,15 +506,15 @@ impl Ctx<'_> {
     fn present(&mut self, interval: u32) -> Result<bool, Stop> {
         match self.chain.present(interval) {
             Ok(()) => Ok(true),
-            Err(PresentError::DeviceLost(why)) => {
+            Err(lost @ PresentError::DeviceLost { .. }) => {
                 self.log.event("device_lost", &[]);
-                Err(Stop(exit::DEVICE, format!("the device was lost: {why}")))
+                Err(Stop(exit::DEVICE, format!("the device was lost: {lost}")))
             }
-            Err(PresentError::Other(why)) => {
+            Err(failed @ PresentError::Other(_)) => {
                 if self.fullscreen_lost()? {
                     Ok(false)
                 } else {
-                    Err(Stop(exit::DEVICE, why))
+                    Err(Stop(exit::DEVICE, failed.to_string()))
                 }
             }
         }

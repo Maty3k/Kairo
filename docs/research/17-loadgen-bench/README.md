@@ -579,6 +579,7 @@ devrun's own stop gives a job exit code 1 (core/job.rs:17), so loadgen leaves 1 
   - no luminance difference >0.08 inside any window of 20% of the screen.
 
   The WARP test (§6) checks that the GPU draws what `visual.rs` describes.
+- **[Corrected] 2026-11-24** (PR #43's first review): not all of these limits are half of XAG's. The changes within 1/3 s are (0.05 and 0.005 against 0.10); the span and the window are 0.08 against 0.10, and the red ratio 0.5 against 0.8, since the picture itself spans 0.054 and reaches a red ratio of 0.46. Each limit is stated beside XAG's in `visual.rs` and the CHANGELOG.
 - **The OLED** isn't involved in M1 (M1:40, M1:99). The picture is moving SDR content, so M2's OLED chunks of at most 10 minutes need no other picture (CL:26).
 
 ### 3.12 Rules, call by call

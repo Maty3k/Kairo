@@ -512,7 +512,7 @@ R13:713–724's output isn't fit for many minutes on screen: `0.5 + 0.5 * cos(6.
 **More rules** [proposed]:
 - No flashes anywhere by construction: nothing in `visual()` is a step in time. The ramp, the run and the end draw the same picture; the window's black background and the desktop around a run are single transitions, one per run (≥75 s apart).
 - No high-contrast element ever, so tearing (VRR off) shows at most a one-pixel offset in low-contrast noise.
-- **Tests make it a contract** (`visual.rs`, Mac and Linux CI), over a grid and a full cycle [proposed limits, half of XAG's or tighter]: luminance span < 0.08; every 1/3 s change < 0.05 per pixel and < 0.005 for the screen average; red ratio < 0.5; no luminance difference > 0.08 inside any window of 20% of the screen. The WARP test (§10) checks that the GPU draws what `visual.rs` describes.
+- **Tests make it a contract** (`visual.rs`, Mac and Linux CI), over a grid and a full cycle [proposed limits, inside XAG's; README §3.11's 2026-11-24 correction gives each beside XAG's]: luminance span < 0.08; every 1/3 s change < 0.05 per pixel and < 0.005 for the screen average; red ratio < 0.5; no luminance difference > 0.08 inside any window of 20% of the screen. The WARP test (§10) checks that the GPU draws what `visual.rs` describes.
 - The OLED isn't involved in M1 (M1:40, M1:99). The picture is moving content at SDR level, so M2's ≤10-minute OLED chunks with the cover between them (CL:26) need no other picture.
 
 ---

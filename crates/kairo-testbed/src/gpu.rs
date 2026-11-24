@@ -309,9 +309,9 @@ impl Chain {
     }
 
     /// `Present(interval, 0)`. A failure is a lost device when the device says it was removed
-    /// or reset, whatever code `Present` gave.
+    /// or reset, whatever code `Present` gave. An occluded window's frame counts like any other.
     pub fn present(&self, interval: u32) -> Result<(), PresentError> {
-        kairo_window::gpu::present(&self.device, &self.swap, interval, DXGI_PRESENT(0))
+        kairo_window::gpu::present(&self.device, &self.swap, interval, DXGI_PRESENT(0)).map(|_| ())
     }
 
     /// The number of `Present` calls so far (`GetLastPresentCount`).
