@@ -21,12 +21,15 @@
 #    {"mean_le_3":..,"upper_le_4":..,"low1_le_5":..,"present_mode":null,"ir_plus_1pp":..},"pass":..}
 #   {"ab_stats":1,"mode":"aa","n":6,"mean_fps":..,"sd_fps":..,"cv_pct":..,"low1_cv_pct":..,
 #    "drift_pct_per_run":..,"noise_ok":..}
-# PASS is M1's two clauses: mean loss <= 3% and upper 95% bound <= 4%. The plan's other clauses
-# join PASS before SP1; until then they are reported only, and null means not evaluated:
-# low1_le_5 (the same pairs on low1_fps, mean <= 5%) needs pm-stats lines, ir_plus_1pp (this loss
-# minus -Reference's <= 1 pp) needs -Reference, and present_mode isn't built yet. NOISE is ok at a
-# CV of 1.00% or less (sample SD, n - 1), the CV as computed, before rounding; a CV above 1.00 that
-# would print as 1.00 prints with 3 decimals, at least 1.001, so the text agrees with NOISE=high.
+# PASS is M1's two clauses: mean loss <= 3% and upper 95% bound <= 4%, each value as computed,
+# before rounding; a loss above 3.00 or a bound above 4.00 that would print as the limit prints with
+# 3 decimals, at least 3.001 or 4.001, so the text agrees with PASS=False (the -SelfTest line too).
+# The plan's other clauses join PASS before SP1; until then they are reported only, and null means
+# not evaluated: low1_le_5 (the same pairs on low1_fps, mean <= 5%) needs pm-stats lines,
+# ir_plus_1pp (this loss minus -Reference's <= 1 pp) needs -Reference, and present_mode isn't
+# built yet. NOISE is ok at a CV of 1.00% or less (sample SD, n - 1), the CV as computed, before
+# rounding; a CV above 1.00 that would print as 1.00 prints with 3 decimals, at least 1.001, so the
+# text agrees with NOISE=high.
 # low1_cv_pct (pm-stats lines only) and drift_pct_per_run (the least-squares slope of avg_fps over
 # the run order, as % of the mean) are diagnostics.
 # Exit codes: 0 PASS or noise ok; 1 FAIL or noise high; 2 bad command line (unequal counts, n < 2,
@@ -95,15 +98,21 @@ function Format-AbStatsNumber([double] $Value) {
     return $rounded.ToString('F2', [Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Format-AbStatsCv([double] $Cv) {
-    # A CV in the text. noise_ok compares the CV as computed with 1.00, so one above 1.00 that two
-    # decimals would print as 1.00 gets three, and at least 1.001: the text never reads
-    # "CV 1.00% NOISE=high". Any other CV gets two.
-    if ($Cv -gt 1.0 -and [Math]::Round($Cv, 2, [MidpointRounding]::AwayFromZero) -le 1.0) {
-        $three = [Math]::Max([Math]::Round($Cv, 3, [MidpointRounding]::AwayFromZero), 1.001)
+function Format-AbStatsLimit([double] $Value, [double] $Limit) {
+    # A value the text prints beside a verdict that compares it, as computed, with a limit: the
+    # mean loss with 3, the upper bound with 4, the CV with 1. One above the limit that two decimals
+    # would print as the limit gets three, and at least the limit + 0.001, so the text never reads
+    # "loss 3.00% ... PASS=False" or "CV 1.00% NOISE=high". Any other value gets two.
+    if ($Value -gt $Limit -and [Math]::Round($Value, 2, [MidpointRounding]::AwayFromZero) -le $Limit) {
+        $three = [Math]::Max([Math]::Round($Value, 3, [MidpointRounding]::AwayFromZero), $Limit + 0.001)
         return $three.ToString('F3', [Globalization.CultureInfo]::InvariantCulture)
     }
-    return (Format-AbStatsNumber $Cv)
+    return (Format-AbStatsNumber $Value)
+}
+
+function Format-AbStatsCv([double] $Cv) {
+    # A CV in the text: noise_ok compares the CV as computed with 1.00.
+    return (Format-AbStatsLimit $Cv 1.0)
 }
 
 function Get-AbStatsField($Object, [string] $Name) {
@@ -284,8 +293,9 @@ function Get-AbStatsPaired($RunsA, $RunsB, $ReferenceLoss) {
     $stats['ci_hi'] = $m + $h
     $stats['clauses'] = $clauses
     $stats['pass'] = $pass
-    $text = $n.ToString($inv) + ' pairs: loss ' + (Format-AbStatsNumber $m) + '% (95% CI ' + (Format-AbStatsNumber ($m - $h)) +
-        '..' + (Format-AbStatsNumber ($m + $h)) + '%) PASS=' + $pass
+    # The mean and the upper bound as their clauses compare them, so the text agrees with PASS.
+    $text = $n.ToString($inv) + ' pairs: loss ' + (Format-AbStatsLimit $m 3.0) + '% (95% CI ' + (Format-AbStatsNumber ($m - $h)) +
+        '..' + (Format-AbStatsLimit ($m + $h) 4.0) + '%) PASS=' + $pass
     $code = 1
     if ($pass) { $code = 0 }
     return [pscustomobject]@{

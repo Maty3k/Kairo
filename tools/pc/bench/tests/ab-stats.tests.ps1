@@ -7,7 +7,8 @@
 # Every vector runs both ways: through the functions, with the script dot-sourced under testlib's
 # Set-StrictMode -Version 3.0 and $ErrorActionPreference = 'Stop' (as the elevated session runs
 # it), and through pwsh -File with its exit codes. Vectors: AB1-AB5, AE1-AE3, AA1-AA2, L1 and S1-S2,
-# the t table, and each clause and the CV at its limit, where a value equal to the limit passes.
+# the t table, and each clause and the CV at its limit, where a value equal to the limit passes,
+# and just above it, where the text prints 3 decimals.
 # Full-precision expectations were recomputed with IEEE doubles from research 17's
 # formulas and agree with its [Mac] figures. Fixtures are written into temporary folders and use
 # synthetic names only.
@@ -283,6 +284,48 @@ Test-Case 'edge: an upper bound of exactly 4% holds, while a mean of 4% fails' {
     Assert-Equal $false $r.Stats['pass'] 'pass'
     Assert-Equal 1 $r.ExitCode 'exit code'
     Assert-Equal '6 pairs: loss 4.00% (95% CI 4.00..4.00%) PASS=False' $r.Text 'text'
+}
+
+function Join-AbTestPairs([double[]] $A, [double[]] $B) {
+    # A and B interleaved, A1, B1, A2, B2..., which -SelfTest pairs as (1,2), (3,4) and so on.
+    return [double[]]@(for ($i = 0; $i -lt $A.Length; $i++) { $A[$i]; $B[$i] })
+}
+
+Test-Case 'edge: a loss just above 3% prints 3 decimals, so the text agrees with PASS=False' {
+    # loss_pct 3.0029..., which two decimals would print as 3.00 beside PASS=False.
+    $b = @(96.9, 97.1, 96.95, 97.05, 96.99, 96.9925)
+    $text = '6 pairs: loss 3.003% (95% CI 2.93..3.08%) PASS=False'
+    $r = Get-AbStats -A $Hundred -B $b
+    Assert-Near 3.0029166666666662 $r.Stats['loss_pct'] 1e-12 'loss_pct'
+    Assert-Equal $false $r.Stats['clauses']['mean_le_3'] 'mean_le_3'
+    Assert-Equal $true $r.Stats['clauses']['upper_le_4'] 'upper_le_4'
+    Assert-Equal $text $r.Text 'text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $Hundred), '-B', (Join-AbTestNumbers $b))) 1 $text 'through pwsh -File'
+    # The self-test on the same runs, interleaved, prints the same line.
+    $runs = Join-AbTestPairs $Hundred $b
+    Assert-Equal $text (Get-AbStatsSelfTest -Runs $runs).Text 'the self-test''s text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $runs), '-SelfTest')) 1 $text '-SelfTest through pwsh -File'
+}
+
+Test-Case 'edge: an upper bound just above 4% prints 3 decimals, so the text agrees with PASS=False' {
+    # ci_hi 4.0029..., which two decimals would print as 4.00 beside PASS=False.
+    $b = @(95.75, 98.75, 96.25, 98.25, 96.69, 97.81)
+    $text = '6 pairs: loss 2.75% (95% CI 1.50..4.003%) PASS=False'
+    $r = Get-AbStats -A $Hundred -B $b
+    Assert-Near 4.002948870074008 $r.Stats['ci_hi'] 1e-12 'ci_hi'
+    Assert-Equal $true $r.Stats['clauses']['mean_le_3'] 'mean_le_3'
+    Assert-Equal $false $r.Stats['clauses']['upper_le_4'] 'upper_le_4'
+    Assert-Equal $text $r.Text 'text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $Hundred), '-B', (Join-AbTestNumbers $b))) 1 $text 'through pwsh -File'
+    $runs = Join-AbTestPairs $Hundred $b
+    Assert-Equal $text (Get-AbStatsSelfTest -Runs $runs).Text 'the self-test''s text'
+    Assert-AbTestRun (Invoke-BenchTool 'ab-stats.ps1' @('-A', (Join-AbTestNumbers $runs), '-SelfTest')) 1 $text '-SelfTest through pwsh -File'
+    # Two decimals, unless a value above its limit would print as the limit: then three, and never
+    # 3.000 or 4.000. Each limit applies to its own value only.
+    $cases = @(@(3.0, 3.0, '3.00'), @(2.9999, 3.0, '3.00'), @(3.0000001, 3.0, '3.001'), @(3.0049, 3.0, '3.005'),
+        @(3.0051, 3.0, '3.01'), @(4.0, 4.0, '4.00'), @(4.0004, 4.0, '4.001'), @(4.0029, 4.0, '4.003'), @(4.003, 3.0, '4.00'),
+        @(3.003, 4.0, '3.00'), @(-0.001, 3.0, '0.00'))
+    foreach ($case in $cases) { Assert-Equal $case[2] (Format-AbStatsLimit $case[0] $case[1]) ('value ' + $case[0] + ' at limit ' + $case[1]) }
 }
 
 # --- AE1-AE3: refusals ---------------------------------------------------------------------------
